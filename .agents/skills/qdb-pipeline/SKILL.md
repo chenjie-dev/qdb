@@ -16,6 +16,7 @@ description: >-
 - 角色卡：[`../../team/README.md`](../../team/README.md)
 - 硬约束：[`AGENTS.md`](../../../AGENTS.md)
 - 设计正文：[`docs/design.md`](../../../docs/design.md)
+- 使用者手册：[`docs/manual/index.md`](../../../docs/manual/index.md)。行为变化时同一变更更新对应章节。
 
 ## 过程
 

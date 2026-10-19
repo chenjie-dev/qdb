@@ -74,7 +74,7 @@ pub enum Period {
     D1,
 }
 
-/// 86400 放不进帧头里的 `u16`，日线用 `u16::MAX`。日界由调用方给出的时区偏移决定。
+/// 86400 放不进帧头里的 `u16`，日线用 `u16::MAX`。桶按 UTC 对齐。
 pub const PERIOD_D1_ID: u16 = u16::MAX;
 
 pub const PERIODS: [Period; ACTIVE_PERIODS] = [

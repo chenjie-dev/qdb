@@ -55,6 +55,7 @@ description: >-
 
 ## 收尾
 
+- 使用者能看见的行为变了，就地更新 [`docs/manual/`](../../../docs/manual/index.md) 里对应章节。未实现的能力不写进手册。
 - 新术语写进 `CONTEXT.md`（skill `domain-modeling`）。难反转的新决策才写 ADR；已在 `docs/design.md` 第 14 节的决定不另抄一份。
 - 用户要求提交时走 skill `commit`。
 - 大设计分歧先用 `grill-with-docs`，再改设计正文。
