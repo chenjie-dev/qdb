@@ -4,6 +4,16 @@
 
 本版本没有 `INSERT`、`UPDATE`、`DELETE`、`JOIN`、子查询和函数嵌套。写入走 [库接口](library.md)。
 
+## 目录
+
+```sql
+SHOW TABLES;
+DESCRIBE klines;
+DESC ticks;
+```
+
+`SHOW TABLES` 返回 `table` 和 `filter`。`filter` 是查询该表时必须写的条件。`DESCRIBE` 和 `DESC` 返回 `column` 和 `note`，列出当前查询实际能返回的列。未知表名是语法错误。
+
 ## 语法
 
 ```text

@@ -35,6 +35,19 @@ impl<'a> SqlEngine<'a> {
     }
 
     pub fn query(&self, sql: &str) -> Result<QueryResult, SqlError> {
+        let sql = sql.trim().trim_end_matches(';').trim();
+        let tokens = tokenize(sql);
+        if tokens
+            .first()
+            .is_some_and(|token| token.eq_ignore_ascii_case("show"))
+        {
+            return query_show(&tokens);
+        }
+        if tokens.first().is_some_and(|token| {
+            token.eq_ignore_ascii_case("describe") || token.eq_ignore_ascii_case("desc")
+        }) {
+            return query_describe(&tokens);
+        }
         let stmt = parse(sql)?;
         if stmt.limit > 100_000 {
             return Err(SqlError::Limit(stmt.limit));
@@ -76,18 +89,28 @@ fn parse(sql: &str) -> Result<Stmt, SqlError> {
         index += 1;
     } else {
         loop {
-            let name = tokens.get(index).ok_or_else(|| SqlError::Syntax("column".into()))?.clone();
+            let name = tokens
+                .get(index)
+                .ok_or_else(|| SqlError::Syntax("column".into()))?
+                .clone();
             index += 1;
             if tokens.get(index).map(|t| t.as_str()) == Some("(") {
                 index += 1;
-                let column = tokens.get(index).ok_or_else(|| SqlError::Syntax("agg arg".into()))?.clone();
+                let column = tokens
+                    .get(index)
+                    .ok_or_else(|| SqlError::Syntax("agg arg".into()))?
+                    .clone();
                 index += 1;
                 expect(&tokens, &mut index, ")")?;
                 aggregates.push(Agg {
                     func: name.to_ascii_lowercase(),
                     column,
                 });
-                columns.push(format!("{}({})", aggregates.last().unwrap().func, aggregates.last().unwrap().column));
+                columns.push(format!(
+                    "{}({})",
+                    aggregates.last().unwrap().func,
+                    aggregates.last().unwrap().column
+                ));
             } else {
                 columns.push(name);
             }
@@ -99,23 +122,49 @@ fn parse(sql: &str) -> Result<Stmt, SqlError> {
         }
     }
     expect(&tokens, &mut index, "from")?;
-    let table = tokens.get(index).ok_or_else(|| SqlError::Syntax("table".into()))?.to_ascii_lowercase();
+    let table = tokens
+        .get(index)
+        .ok_or_else(|| SqlError::Syntax("table".into()))?
+        .to_ascii_lowercase();
     index += 1;
     let mut symbol = None;
     let mut period = None;
     let mut ts_from = None;
     let mut ts_to = None;
-    if tokens.get(index).map(|t| t.eq_ignore_ascii_case("where")).unwrap_or(false) {
+    if tokens
+        .get(index)
+        .map(|t| t.eq_ignore_ascii_case("where"))
+        .unwrap_or(false)
+    {
         index += 1;
-        while index < tokens.len() && !tokens[index].eq_ignore_ascii_case("order") && !tokens[index].eq_ignore_ascii_case("limit") && !tokens[index].eq_ignore_ascii_case("group") {
-            let field = tokens.get(index).ok_or_else(|| SqlError::Syntax("where".into()))?.to_ascii_lowercase();
+        while index < tokens.len()
+            && !tokens[index].eq_ignore_ascii_case("order")
+            && !tokens[index].eq_ignore_ascii_case("limit")
+            && !tokens[index].eq_ignore_ascii_case("group")
+        {
+            let field = tokens
+                .get(index)
+                .ok_or_else(|| SqlError::Syntax("where".into()))?
+                .to_ascii_lowercase();
             index += 1;
-            if tokens.get(index).map(|t| t.eq_ignore_ascii_case("between")).unwrap_or(false) {
+            if tokens
+                .get(index)
+                .map(|t| t.eq_ignore_ascii_case("between"))
+                .unwrap_or(false)
+            {
                 index += 1;
-                let from = parse_i64(tokens.get(index).ok_or_else(|| SqlError::Syntax("between".into()))?)?;
+                let from = parse_i64(
+                    tokens
+                        .get(index)
+                        .ok_or_else(|| SqlError::Syntax("between".into()))?,
+                )?;
                 index += 1;
                 expect(&tokens, &mut index, "and")?;
-                let to = parse_i64(tokens.get(index).ok_or_else(|| SqlError::Syntax("between".into()))?)?;
+                let to = parse_i64(
+                    tokens
+                        .get(index)
+                        .ok_or_else(|| SqlError::Syntax("between".into()))?,
+                )?;
                 index += 1;
                 if field == "ts" {
                     ts_from = Some(from);
@@ -123,7 +172,10 @@ fn parse(sql: &str) -> Result<Stmt, SqlError> {
                 }
             } else {
                 expect(&tokens, &mut index, "=")?;
-                let value = tokens.get(index).ok_or_else(|| SqlError::Syntax("value".into()))?.clone();
+                let value = tokens
+                    .get(index)
+                    .ok_or_else(|| SqlError::Syntax("value".into()))?
+                    .clone();
                 index += 1;
                 if field == "symbol" {
                     symbol = Some(unquote(&value));
@@ -131,14 +183,22 @@ fn parse(sql: &str) -> Result<Stmt, SqlError> {
                     period = Period::parse(&unquote(&value));
                 }
             }
-            if tokens.get(index).map(|t| t.eq_ignore_ascii_case("and")).unwrap_or(false) {
+            if tokens
+                .get(index)
+                .map(|t| t.eq_ignore_ascii_case("and"))
+                .unwrap_or(false)
+            {
                 index += 1;
             }
         }
     }
     let mut limit = 1000;
     if let Some(pos) = tokens.iter().position(|t| t.eq_ignore_ascii_case("limit")) {
-        limit = tokens.get(pos + 1).ok_or_else(|| SqlError::Syntax("limit".into()))?.parse().map_err(|_| SqlError::Syntax("limit".into()))?;
+        limit = tokens
+            .get(pos + 1)
+            .ok_or_else(|| SqlError::Syntax("limit".into()))?
+            .parse()
+            .map_err(|_| SqlError::Syntax("limit".into()))?;
     }
     Ok(Stmt {
         columns,
@@ -154,9 +214,14 @@ fn parse(sql: &str) -> Result<Stmt, SqlError> {
 
 impl<'a> SqlEngine<'a> {
     fn query_klines(&self, stmt: &Stmt) -> Result<QueryResult, SqlError> {
-        let symbol = stmt.symbol.clone().ok_or_else(|| SqlError::Syntax("symbol required".into()))?;
+        let symbol = stmt
+            .symbol
+            .clone()
+            .ok_or_else(|| SqlError::Syntax("symbol required".into()))?;
         let symbol_id = map_resolve(self.engine.resolve(&symbol))?;
-        let period = stmt.period.ok_or_else(|| SqlError::Syntax("period required".into()))?;
+        let period = stmt
+            .period
+            .ok_or_else(|| SqlError::Syntax("period required".into()))?;
         let mut rows = self.engine.klines(symbol_id, period);
         if let Some(from) = stmt.ts_from {
             rows.retain(|row| row.bucket_start_ns >= from);
@@ -167,7 +232,16 @@ impl<'a> SqlEngine<'a> {
         rows.truncate(stmt.limit as usize);
         if stmt.aggregates.is_empty() {
             let columns = if stmt.columns == ["*"] {
-                vec!["ts".into(), "open".into(), "high".into(), "low".into(), "close".into(), "volume".into(), "amount".into(), "seq".into()]
+                vec![
+                    "ts".into(),
+                    "open".into(),
+                    "high".into(),
+                    "low".into(),
+                    "close".into(),
+                    "volume".into(),
+                    "amount".into(),
+                    "seq".into(),
+                ]
             } else {
                 stmt.columns.clone()
             };
@@ -177,8 +251,16 @@ impl<'a> SqlEngine<'a> {
                 .collect();
             Ok(QueryResult { columns, rows: out })
         } else {
-            let columns = stmt.aggregates.iter().map(|agg| format!("{}({})", agg.func, agg.column)).collect();
-            let values = stmt.aggregates.iter().map(|agg| aggregate(&rows, agg)).collect::<Result<Vec<_>, _>>()?;
+            let columns = stmt
+                .aggregates
+                .iter()
+                .map(|agg| format!("{}({})", agg.func, agg.column))
+                .collect();
+            let values = stmt
+                .aggregates
+                .iter()
+                .map(|agg| aggregate(&rows, agg))
+                .collect::<Result<Vec<_>, _>>()?;
             Ok(QueryResult {
                 columns,
                 rows: vec![values],
@@ -187,11 +269,19 @@ impl<'a> SqlEngine<'a> {
     }
 
     fn query_snapshots(&self, stmt: &Stmt) -> Result<QueryResult, SqlError> {
-        let symbol = stmt.symbol.clone().ok_or_else(|| SqlError::Syntax("symbol required".into()))?;
+        let symbol = stmt
+            .symbol
+            .clone()
+            .ok_or_else(|| SqlError::Syntax("symbol required".into()))?;
         let symbol_id = map_resolve(self.engine.resolve(&symbol))?;
         let quote = self.engine.quote(symbol_id).ok_or(SqlError::NotFound)?;
         let columns = if stmt.columns == ["*"] {
-            vec!["last".into(), "bid_px1".into(), "ask_px1".into(), "seq".into()]
+            vec![
+                "last".into(),
+                "bid_px1".into(),
+                "ask_px1".into(),
+                "seq".into(),
+            ]
         } else {
             stmt.columns.clone()
         };
@@ -205,7 +295,10 @@ impl<'a> SqlEngine<'a> {
                 _ => String::new(),
             })
             .collect();
-        Ok(QueryResult { columns, rows: vec![row] })
+        Ok(QueryResult {
+            columns,
+            rows: vec![row],
+        })
     }
 
     fn query_symbols(&self, stmt: &Stmt) -> Result<QueryResult, SqlError> {
@@ -220,15 +313,25 @@ impl<'a> SqlEngine<'a> {
     }
 
     fn query_ticks(&self, stmt: &Stmt) -> Result<QueryResult, SqlError> {
-        let symbol = stmt.symbol.clone().ok_or_else(|| SqlError::Syntax("symbol required".into()))?;
+        let symbol = stmt
+            .symbol
+            .clone()
+            .ok_or_else(|| SqlError::Syntax("symbol required".into()))?;
         let symbol_id = map_resolve(self.engine.resolve(&symbol))?;
         let columns = vec!["ts".into(), "price".into(), "volume".into(), "seq".into()];
         let mut rows = Vec::new();
         for tick in self.engine.ticks(symbol_id) {
-            if stmt.ts_from.is_some_and(|from| tick.ts < from) || stmt.ts_to.is_some_and(|to| tick.ts > to) {
+            if stmt.ts_from.is_some_and(|from| tick.ts < from)
+                || stmt.ts_to.is_some_and(|to| tick.ts > to)
+            {
                 continue;
             }
-            rows.push(vec![tick.ts.to_string(), tick.price.to_string(), tick.volume.to_string(), tick.seq.to_string()]);
+            rows.push(vec![
+                tick.ts.to_string(),
+                tick.price.to_string(),
+                tick.volume.to_string(),
+                tick.seq.to_string(),
+            ]);
         }
         rows.truncate(stmt.limit as usize);
         Ok(QueryResult { columns, rows })
@@ -239,7 +342,10 @@ fn aggregate(rows: &[KlineBody], agg: &Agg) -> Result<String, SqlError> {
     if rows.is_empty() {
         return Ok(String::new());
     }
-    let nums: Vec<i128> = rows.iter().map(|row| kline_i128(row, &agg.column)).collect();
+    let nums: Vec<i128> = rows
+        .iter()
+        .map(|row| kline_i128(row, &agg.column))
+        .collect();
     let ordered = rows;
     match agg.func.as_str() {
         "max" => Ok(nums.iter().copied().max().unwrap_or(0).to_string()),
@@ -305,6 +411,65 @@ fn kline_i128(row: &KlineBody, column: &str) -> i128 {
     }
 }
 
+fn query_show(tokens: &[String]) -> Result<QueryResult, SqlError> {
+    if tokens.len() != 2 || !tokens[1].eq_ignore_ascii_case("tables") {
+        return Err(SqlError::Syntax("show tables".into()));
+    }
+    Ok(QueryResult {
+        columns: vec!["table".into(), "filter".into()],
+        rows: vec![
+            vec!["symbols".into(), String::new()],
+            vec!["ticks".into(), "symbol".into()],
+            vec!["snapshots".into(), "symbol".into()],
+            vec!["klines".into(), "symbol, period".into()],
+        ],
+    })
+}
+
+fn query_describe(tokens: &[String]) -> Result<QueryResult, SqlError> {
+    if tokens.len() != 2 {
+        return Err(SqlError::Syntax("describe table".into()));
+    }
+    let table = tokens[1].trim_matches('\'').to_ascii_lowercase();
+    let rows = match table.as_str() {
+        "symbols" => vec![
+            row("symbol", "交易所:代码"),
+            row("exchange", "内部交易所编号"),
+        ],
+        "ticks" => vec![
+            row("ts", "事件时间，UTC 纳秒"),
+            row("price", "成交价，定点整数"),
+            row("volume", "成交量"),
+            row("seq", "成交序号"),
+        ],
+        "snapshots" => vec![
+            row("last", "最新价"),
+            row("bid_px1", "买一价"),
+            row("ask_px1", "卖一价"),
+            row("seq", "报价序号"),
+        ],
+        "klines" => vec![
+            row("ts", "桶起点，UTC 纳秒"),
+            row("open", "开盘价"),
+            row("high", "最高价"),
+            row("low", "最低价"),
+            row("close", "收盘价"),
+            row("volume", "成交量"),
+            row("amount", "成交额"),
+            row("seq", "当前查询恒为 0"),
+        ],
+        _ => return Err(SqlError::Syntax(format!("unknown table {table}"))),
+    };
+    Ok(QueryResult {
+        columns: vec!["column".into(), "note".into()],
+        rows,
+    })
+}
+
+fn row(column: &str, note: &str) -> Vec<String> {
+    vec![column.into(), note.into()]
+}
+
 fn map_resolve(result: Result<u32, StoreError>) -> Result<u32, SqlError> {
     match result {
         Ok(id) => Ok(id),
@@ -338,7 +503,8 @@ fn tokenize(sql: &str) -> Vec<String> {
         }
         let mut word = String::from(ch);
         while let Some(next) = chars.peek() {
-            if next.is_whitespace() || *next == ',' || *next == '(' || *next == ')' || *next == '=' {
+            if next.is_whitespace() || *next == ',' || *next == '(' || *next == ')' || *next == '='
+            {
                 break;
             }
             word.push(chars.next().unwrap());
@@ -349,7 +515,9 @@ fn tokenize(sql: &str) -> Vec<String> {
 }
 
 fn expect(tokens: &[String], index: &mut usize, word: &str) -> Result<(), SqlError> {
-    let got = tokens.get(*index).ok_or_else(|| SqlError::Syntax(word.into()))?;
+    let got = tokens
+        .get(*index)
+        .ok_or_else(|| SqlError::Syntax(word.into()))?;
     if !got.eq_ignore_ascii_case(word) {
         return Err(SqlError::Syntax(format!("expected {word}, got {got}")));
     }
@@ -362,7 +530,9 @@ fn unquote(value: &str) -> String {
 }
 
 fn parse_i64(value: &str) -> Result<i64, SqlError> {
-    unquote(value).parse().map_err(|_| SqlError::Syntax(value.into()))
+    unquote(value)
+        .parse()
+        .map_err(|_| SqlError::Syntax(value.into()))
 }
 
 #[cfg(test)]
@@ -371,15 +541,21 @@ mod tests {
     use qdb_abi::TickQuote;
 
     fn engine() -> (std::path::PathBuf, Engine) {
-        let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("qdb-sql-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut engine = Engine::open(&dir).unwrap();
         let base = ts(100_000_000);
         engine.write_trade("SZSE", "000001", base, 10, 100).unwrap();
-        engine.write_trade("SZSE", "000001", base + 100_000_000, 12, 50).unwrap();
-        engine.write_trade("SZSE", "000001", base + 900_000_000, 11, 10).unwrap();
+        engine
+            .write_trade("SZSE", "000001", base + 100_000_000, 12, 50)
+            .unwrap();
+        engine
+            .write_trade("SZSE", "000001", base + 900_000_000, 11, 10)
+            .unwrap();
         engine.write_trade("SSE", "000001", base, 9, 1).unwrap();
         engine
             .write_quote(
@@ -438,6 +614,22 @@ mod tests {
         assert_eq!(agg.rows[0][2], "160");
         assert_eq!(agg.rows[0][4], "10");
         assert_eq!(agg.rows[0][5], "11");
-        assert!(sql.query("SELECT last FROM snapshots WHERE symbol = '000001'").is_err());
+        assert!(sql
+            .query("SELECT last FROM snapshots WHERE symbol = '000001'")
+            .is_err());
+    }
+
+    #[test]
+    fn show_tables_and_describe_list_the_query_catalog() {
+        let (_dir, engine) = engine();
+        let sql = SqlEngine::new(&engine);
+        let tables = sql.query("SHOW TABLES").unwrap();
+        assert_eq!(tables.columns, ["table", "filter"]);
+        assert_eq!(tables.rows.len(), 4);
+        assert_eq!(tables.rows[3][0], "klines");
+        let described = sql.query("DESCRIBE klines;").unwrap();
+        assert_eq!(described.rows[0][0], "ts");
+        assert_eq!(described.rows.len(), 8);
+        assert!(sql.query("DESC nope").is_err());
     }
 }

@@ -1,7 +1,7 @@
 //! 追加 WAL。坏 CRC 停在最后一条完好记录之前。
 
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use qdb_abi::MsgType;
@@ -32,6 +32,8 @@ pub struct WalRead {
     pub records: Vec<WalRecord>,
     pub crc_failed: bool,
     pub last_good_seq: u64,
+    /// 下一次读取的起点。短尾停在不完整记录之前。
+    pub consumed: u64,
 }
 
 impl WalAppender {
@@ -67,8 +69,12 @@ impl WalAppender {
     }
 
     pub fn flush(&mut self) -> Result<(), WalError> {
-        self.file.flush().map_err(|err| WalError::Io(err.to_string()))?;
-        self.file.sync_all().map_err(|err| WalError::Io(err.to_string()))?;
+        self.file
+            .flush()
+            .map_err(|err| WalError::Io(err.to_string()))?;
+        self.file
+            .sync_all()
+            .map_err(|err| WalError::Io(err.to_string()))?;
         Ok(())
     }
 
@@ -78,16 +84,38 @@ impl WalAppender {
 }
 
 pub fn read_path(path: &Path) -> Result<WalRead, WalError> {
+    read_from(path, 0)
+}
+
+/// 从 `from` 读取新写完的记录。文件后部不足一条时不前进 `consumed`。
+pub fn read_from(path: &Path, from: u64) -> Result<WalRead, WalError> {
     if !path.exists() {
         return Ok(WalRead {
             records: Vec::new(),
             crc_failed: false,
             last_good_seq: 0,
+            consumed: from,
         });
     }
     let mut file = File::open(path).map_err(|err| WalError::Io(err.to_string()))?;
+    let len = file
+        .metadata()
+        .map_err(|err| WalError::Io(err.to_string()))?
+        .len();
+    if from > len {
+        return Err(WalError::Io(format!(
+            "wal truncated at {len}, reader was at {from}"
+        )));
+    }
+    file.seek(SeekFrom::Start(from))
+        .map_err(|err| WalError::Io(err.to_string()))?;
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(|err| WalError::Io(err.to_string()))?;
+    file.read_to_end(&mut bytes)
+        .map_err(|err| WalError::Io(err.to_string()))?;
+    parse_bytes(&bytes, from)
+}
+
+fn parse_bytes(bytes: &[u8], base: u64) -> Result<WalRead, WalError> {
     let mut records = Vec::new();
     let mut offset = 0;
     let mut last_good_seq = 0;
@@ -104,6 +132,7 @@ pub fn read_path(path: &Path) -> Result<WalRead, WalError> {
                 records,
                 crc_failed: true,
                 last_good_seq,
+                consumed: base + offset as u64,
             });
         }
         let record = decode_body(body).ok_or_else(|| WalError::Crc { last_good_seq })?;
@@ -115,6 +144,7 @@ pub fn read_path(path: &Path) -> Result<WalRead, WalError> {
         records,
         crc_failed: false,
         last_good_seq,
+        consumed: base + offset as u64,
     })
 }
 
@@ -184,6 +214,38 @@ mod tests {
         assert!(read.crc_failed);
         assert_eq!(read.records.len(), 2);
         assert_eq!(read.last_good_seq, 2);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn read_from_returns_only_records_appended_after_the_cursor() {
+        let dir = std::env::temp_dir().join(format!("qdb-wal-tail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("wal.qwal");
+        let mut wal = WalAppender::open(&path).unwrap();
+        wal.append(&WalRecord {
+            seq: 1,
+            msg_type: 1,
+            flags: 0,
+            payload: vec![1],
+        })
+        .unwrap();
+        wal.flush().unwrap();
+        let first = read_path(&path).unwrap();
+        assert_eq!(first.records.len(), 1);
+        wal.append(&WalRecord {
+            seq: 2,
+            msg_type: 1,
+            flags: 0,
+            payload: vec![2],
+        })
+        .unwrap();
+        wal.flush().unwrap();
+        let next = read_from(&path, first.consumed).unwrap();
+        assert_eq!(next.records.len(), 1);
+        assert_eq!(next.records[0].seq, 2);
+        assert!(next.consumed > first.consumed);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

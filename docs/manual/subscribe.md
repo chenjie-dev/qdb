@@ -1,6 +1,6 @@
 # 订阅
 
-`qdb_sub::catch_up` 是进程内的一次拉取。它按证券和可选周期过滤帧，并用客户端已经确认的序号续传。本版本没有 TCP、WebSocket 或 gRPC 推送。
+`qdb_sub::catch_up` 是进程内的一次拉取。它按证券和可选周期过滤帧，并用客户端已经确认的序号续传。命令行上的持续监控是 [客户端](client.md) 的 `.watch`，它跟随新写入的 WAL。本版本没有 TCP、WebSocket 或 gRPC 推送。
 
 ```rust
 pub struct SubFilter {

@@ -28,6 +28,7 @@ description: >-
 | SQL 子集 | `qdb-sql` |
 | 过滤、`from_seq`、快照加增量、TCP | `qdb-sub` |
 | 写入线程、`/health`、`/metrics`、进程入口 | `qdb-server` |
+| 只读命令行查询、表结构 | `qdb-server` 的 `qdb-client` |
 | 行为或布局变化 | 先改 `docs/design.md` |
 
 依赖只能自下而上：`abi ← shm / wal / agg ← store ← sql / sub ← server`。热路径上的帧和行情结构不用 serde。

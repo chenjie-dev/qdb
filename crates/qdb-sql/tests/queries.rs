@@ -31,15 +31,35 @@ fn between_is_inclusive_and_limit_keeps_the_first_rows() {
 fn rejects_missing_filters_unknown_tables_and_oversized_limits() {
     let (dir, engine) = sample();
     let sql = SqlEngine::new(&engine);
-    assert!(matches!(sql.query("SELECT close FROM klines").unwrap_err(), SqlError::Syntax(_)));
-    assert!(matches!(sql.query("SELECT close FROM klines WHERE symbol = 'SZSE:000001'").unwrap_err(), SqlError::Syntax(_)));
-    assert!(matches!(sql.query("SELECT close FROM books WHERE symbol = 'SZSE:000001'").unwrap_err(), SqlError::Syntax(_)));
     assert!(matches!(
-        sql.query("SELECT close FROM klines WHERE symbol = 'SZSE:000001' AND period = '1m' LIMIT 100001").unwrap_err(),
+        sql.query("SELECT close FROM klines").unwrap_err(),
+        SqlError::Syntax(_)
+    ));
+    assert!(matches!(
+        sql.query("SELECT close FROM klines WHERE symbol = 'SZSE:000001'")
+            .unwrap_err(),
+        SqlError::Syntax(_)
+    ));
+    assert!(matches!(
+        sql.query("SELECT close FROM books WHERE symbol = 'SZSE:000001'")
+            .unwrap_err(),
+        SqlError::Syntax(_)
+    ));
+    assert!(matches!(
+        sql.query(
+            "SELECT close FROM klines WHERE symbol = 'SZSE:000001' AND period = '1m' LIMIT 100001"
+        )
+        .unwrap_err(),
         SqlError::Limit(100001)
     ));
-    assert!(matches!(sql.query("SELECT last FROM snapshots WHERE symbol = 'NOTEXIST'").unwrap_err(), SqlError::NotFound));
-    let ticks = sql.query("SELECT ts, price, volume, seq FROM ticks WHERE symbol = 'SZSE:000001'").unwrap();
+    assert!(matches!(
+        sql.query("SELECT last FROM snapshots WHERE symbol = 'NOTEXIST'")
+            .unwrap_err(),
+        SqlError::NotFound
+    ));
+    let ticks = sql
+        .query("SELECT ts, price, volume, seq FROM ticks WHERE symbol = 'SZSE:000001'")
+        .unwrap();
     assert_eq!(ticks.rows.len(), 2);
     assert_eq!(ticks.rows[0][1], "10");
     let names = sql.query("SELECT symbol, exchange FROM symbols").unwrap();
@@ -61,13 +81,17 @@ fn sample() -> (std::path::PathBuf, Engine) {
     let mut engine = Engine::open(&dir).unwrap();
     let base = shanghai(9, 30, 0, 100_000_000);
     engine.write_trade("SZSE", "000001", base, 10, 100).unwrap();
-    engine.write_trade("SZSE", "000001", base + 1_000_000_000, 11, 10).unwrap();
+    engine
+        .write_trade("SZSE", "000001", base + 1_000_000_000, 11, 10)
+        .unwrap();
     (dir, engine)
 }
 
 fn shanghai(h: u32, m: u32, s: u32, nanos: i64) -> i64 {
     let days = days(2024, 1, 2);
-    (days * 86_400 + i64::from(h) * 3600 + i64::from(m) * 60 + i64::from(s) - 8 * 3600) * 1_000_000_000 + nanos
+    (days * 86_400 + i64::from(h) * 3600 + i64::from(m) * 60 + i64::from(s) - 8 * 3600)
+        * 1_000_000_000
+        + nanos
 }
 
 fn days(mut y: i32, m: u32, d: u32) -> i64 {

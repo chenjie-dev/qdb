@@ -26,7 +26,13 @@ fn records_roundtrip_in_order() {
     }
     wal.flush().unwrap();
     let read = wal.read().unwrap();
-    assert_eq!(read.records.iter().map(|record| record.seq).collect::<Vec<_>>(), vec![1, 2, 3]);
+    assert_eq!(
+        read.records
+            .iter()
+            .map(|record| record.seq)
+            .collect::<Vec<_>>(),
+        vec![1, 2, 3]
+    );
     assert_eq!(read.records[2].payload, vec![3]);
     let _ = std::fs::remove_dir_all(dir);
 }

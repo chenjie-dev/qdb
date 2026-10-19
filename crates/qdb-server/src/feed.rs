@@ -152,8 +152,12 @@ fn parse_sina_body(body: &str) -> Vec<Parsed> {
             continue;
         }
         let code = &code[..6];
-        let Some(start) = quoted.find('"') else { continue };
-        let Some(end) = quoted[start + 1..].find('"') else { continue };
+        let Some(start) = quoted.find('"') else {
+            continue;
+        };
+        let Some(end) = quoted[start + 1..].find('"') else {
+            continue;
+        };
         let payload = &quoted[start + 1..start + 1 + end];
         if payload.is_empty() {
             continue;
@@ -184,8 +188,15 @@ fn sina_list(codes: &str) -> String {
         .split(|c: char| c == ',' || c.is_whitespace())
         .filter(|c| !c.is_empty())
         .map(|raw| {
-            let code = raw.chars().filter(|ch| ch.is_ascii_digit()).collect::<String>();
-            let code = if code.len() >= 6 { code[code.len() - 6..].to_string() } else { return String::new(); };
+            let code = raw
+                .chars()
+                .filter(|ch| ch.is_ascii_digit())
+                .collect::<String>();
+            let code = if code.len() >= 6 {
+                code[code.len() - 6..].to_string()
+            } else {
+                return String::new();
+            };
             if code.starts_with(['5', '6', '9']) {
                 format!("sh{code}")
             } else {
@@ -221,7 +232,12 @@ fn http_get(url: &str) -> Result<String, String> {
         .stdout(Stdio::piped())
         .spawn()
         .map_err(|e| format!("iconv: {e}"))?;
-    child.stdin.take().unwrap().write_all(&out.stdout).map_err(|e| e.to_string())?;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&out.stdout)
+        .map_err(|e| e.to_string())?;
     let converted = child.wait_with_output().map_err(|e| e.to_string())?;
     if !converted.status.success() {
         return Err(format!("iconv status {}", converted.status));
@@ -278,7 +294,9 @@ fn json_escape(s: &str) -> String {
 
 pub fn query_param(query: &str, key: &str) -> Vec<String> {
     for pair in query.split('&') {
-        let Some((k, v)) = pair.split_once('=') else { continue };
+        let Some((k, v)) = pair.split_once('=') else {
+            continue;
+        };
         if k == key {
             return url_decode(v)
                 .split(',')
@@ -296,7 +314,9 @@ fn url_decode(s: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(v) = u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16) {
+            if let Ok(v) =
+                u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
+            {
                 out.push(v);
                 i += 3;
                 continue;
@@ -308,7 +328,12 @@ fn url_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-pub fn write_http(stream: &mut TcpStream, status: u16, content_type: &str, body: &str) -> std::io::Result<()> {
+pub fn write_http(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &str,
+) -> std::io::Result<()> {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
@@ -363,7 +388,10 @@ pub fn read_request(stream: &mut TcpStream) -> std::io::Result<HttpRequest> {
             break;
         }
     }
-    Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "incomplete http request"))
+    Err(std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        "incomplete http request",
+    ))
 }
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
@@ -372,7 +400,9 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
 
 fn content_length(header: &str) -> usize {
     for line in header.lines() {
-        let Some((k, v)) = line.split_once(':') else { continue };
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
         if k.eq_ignore_ascii_case("content-length") {
             return v.trim().parse().unwrap_or(0);
         }
@@ -432,14 +462,24 @@ pub fn apply_trades(engine: &Mutex<Engine>, body: &[u8]) -> Result<String, Strin
     let mut n = 0u64;
     for item in &batch.items {
         guard
-            .write_trade(&item.exchange, &item.code, item.ts_ns, item.price, item.volume)
+            .write_trade(
+                &item.exchange,
+                &item.code,
+                item.ts_ns,
+                item.price,
+                item.volume,
+            )
             .map_err(|e| e.to_string())?;
         n += 1;
     }
     Ok(format!("{{\"written\":{n}}}"))
 }
 
-pub fn apply_quotes(engine: &Mutex<Engine>, live: &Mutex<HashMap<String, LiveQuote>>, body: &[u8]) -> Result<String, String> {
+pub fn apply_quotes(
+    engine: &Mutex<Engine>,
+    live: &Mutex<HashMap<String, LiveQuote>>,
+    body: &[u8],
+) -> Result<String, String> {
     let batch: QuoteBatch = serde_json::from_slice(body).map_err(|e| e.to_string())?;
     let mut guard = engine.lock().map_err(|_| "engine lock".to_string())?;
     let mut book = live.lock().map_err(|_| "live lock".to_string())?;
@@ -458,7 +498,11 @@ pub fn apply_quotes(engine: &Mutex<Engine>, live: &Mutex<HashMap<String, LiveQuo
             .write_quote(&item.exchange, &item.code, item.ts_ns, &quote)
             .map_err(|e| e.to_string())?;
         let symbol = format!("{}:{}", item.exchange, item.code);
-        let price = if item.price > 0.0 { item.price } else { item.last as f64 / PRICE_SCALE as f64 };
+        let price = if item.price > 0.0 {
+            item.price
+        } else {
+            item.last as f64 / PRICE_SCALE as f64
+        };
         book.insert(
             symbol.clone(),
             LiveQuote {
@@ -506,8 +550,13 @@ pub fn doc_json(docs: &HashMap<String, Value>, key: &str) -> Option<String> {
     docs.get(key).map(|v| v.to_string())
 }
 
-pub fn klines_json(engine: &Mutex<Engine>, symbol: &str, period_name: &str) -> Result<String, String> {
-    let period = Period::parse(period_name).ok_or_else(|| format!("unknown period {period_name}"))?;
+pub fn klines_json(
+    engine: &Mutex<Engine>,
+    symbol: &str,
+    period_name: &str,
+) -> Result<String, String> {
+    let period =
+        Period::parse(period_name).ok_or_else(|| format!("unknown period {period_name}"))?;
     let guard = engine.lock().map_err(|_| "engine lock".to_string())?;
     let id = guard.resolve(symbol).map_err(|e| e.to_string())?;
     let rows = guard.klines(id, period);
@@ -545,7 +594,10 @@ fn px(v: i64) -> String {
 }
 
 fn now_ns() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

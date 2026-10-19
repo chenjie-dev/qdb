@@ -120,7 +120,13 @@ fn bench_sql(n: u64) -> Summary {
         let base = 1_704_153_600_000_000_000_i64;
         for i in 0..n {
             engine
-                .write_trade("BINANCE", "BTCUSDT", base + i as i64 * 60_000_000_000, 100 + (i % 5) as i64, 1)
+                .write_trade(
+                    "BINANCE",
+                    "BTCUSDT",
+                    base + i as i64 * 60_000_000_000,
+                    100 + (i % 5) as i64,
+                    1,
+                )
                 .unwrap();
         }
         (engine, dir)

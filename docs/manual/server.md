@@ -1,6 +1,6 @@
 # 服务进程
 
-`qdb` 打开一个数据目录。HTTP 接收成交和报价写入，并提供快照与 K 线读取。它不接收 SQL。进程内采集默认开启，EquityLab Compose 设 `QDB_FEED=0`，改由外部采集进程写入。
+`qdb` 打开一个数据目录。HTTP 接收成交和报价写入，并提供快照与 K 线读取。它不接收 SQL。查询用 [客户端](client.md)。进程内采集默认开启，EquityLab Compose 设 `QDB_FEED=0`，改由外部采集进程写入。
 
 ## 启动
 

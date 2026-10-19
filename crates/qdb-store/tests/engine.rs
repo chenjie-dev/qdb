@@ -10,7 +10,10 @@ fn registering_the_same_symbol_twice_does_not_allocate_another_seq() {
     let second = engine.upsert_symbol("SZSE", "000001").unwrap();
     assert_eq!(first, second);
     assert_eq!(engine.applied_seq(), applied);
-    assert!(matches!(engine.upsert_symbol("", "1").unwrap_err(), StoreError::EmptyExchange));
+    assert!(matches!(
+        engine.upsert_symbol("", "1").unwrap_err(),
+        StoreError::EmptyExchange
+    ));
     assert!(engine.upsert_symbol("NOPE", "1").is_ok());
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -36,14 +39,23 @@ fn four_venues_accept_symbols_and_tag_the_trade_session() {
     engine.write_trade("SZSE", "000001", hk, 10, 100).unwrap();
     engine.write_trade("BSE", "830000", hk, 10, 100).unwrap();
     engine.write_trade("HKEX", "00700", hk, 300, 100).unwrap();
-    engine.write_trade("NYSE", "AAPL", utc(14, 30, 0), 180, 1).unwrap();
-    engine.write_trade("NASDAQ", "MSFT", utc(14, 30, 0), 400, 1).unwrap();
-    engine.write_trade("BINANCE", "BTCUSDT", hk, 100, 1).unwrap();
+    engine
+        .write_trade("NYSE", "AAPL", utc(14, 30, 0), 180, 1)
+        .unwrap();
+    engine
+        .write_trade("NASDAQ", "MSFT", utc(14, 30, 0), 400, 1)
+        .unwrap();
+    engine
+        .write_trade("BINANCE", "BTCUSDT", hk, 100, 1)
+        .unwrap();
     assert!(engine.resolve("HKEX:00700").is_ok());
     assert!(engine.resolve("NYSE:AAPL").is_ok());
     assert!(engine.resolve("NASDAQ:MSFT").is_ok());
     assert!(engine.resolve("BINANCE:BTCUSDT").is_ok());
-    assert!(engine.symbols().iter().all(|symbol| symbol.price_scale == 10_000));
+    assert!(engine
+        .symbols()
+        .iter()
+        .all(|symbol| symbol.price_scale == 10_000));
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -52,7 +64,9 @@ fn quote_replaces_bid_and_ask_without_adding_volume_to_the_bar() {
     let dir = temp("quote");
     let mut engine = Engine::open(&dir).unwrap();
     let ts = shanghai(9, 30, 0, 0);
-    engine.write_trade("BINANCE", "BTCUSDT", ts, 100, 2).unwrap();
+    engine
+        .write_trade("BINANCE", "BTCUSDT", ts, 100, 2)
+        .unwrap();
     let id = engine.resolve("BINANCE:BTCUSDT").unwrap();
     let volume = engine.klines(id, Period::M1)[0].volume;
     engine
@@ -72,7 +86,10 @@ fn quote_replaces_bid_and_ask_without_adding_volume_to_the_bar() {
         )
         .unwrap();
     let quote = engine.quote(id).unwrap();
-    assert_eq!((quote.last, quote.bid_px[0], quote.ask_px[0]), (101, 99, 102));
+    assert_eq!(
+        (quote.last, quote.bid_px[0], quote.ask_px[0]),
+        (101, 99, 102)
+    );
     assert_eq!(engine.klines(id, Period::M1)[0].volume, volume);
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -82,17 +99,25 @@ fn clock_watermark_survives_deleting_shared_memory() {
     let dir = temp("clock");
     let mut engine = Engine::open(&dir).unwrap();
     let start = utc(0, 0, 10);
-    engine.write_trade("BINANCE", "BTCUSDT", start, 100, 1).unwrap();
+    engine
+        .write_trade("BINANCE", "BTCUSDT", start, 100, 1)
+        .unwrap();
     engine.write_clock("BINANCE", utc(0, 1, 0)).unwrap();
     let id = engine.resolve("BINANCE:BTCUSDT").unwrap();
     assert_eq!(engine.klines(id, Period::M1).len(), 1);
-    assert_eq!(engine.klines(id, Period::M1)[0].state, qdb_abi::STATE_CLOSED);
+    assert_eq!(
+        engine.klines(id, Period::M1)[0].state,
+        qdb_abi::STATE_CLOSED
+    );
     drop(engine);
     std::fs::remove_file(dir.join("region.bin")).unwrap();
     let restored = Engine::open(&dir).unwrap();
     let id = restored.resolve("BINANCE:BTCUSDT").unwrap();
     assert_eq!(restored.klines(id, Period::M1)[0].close, 100);
-    assert_eq!(restored.klines(id, Period::M1)[0].state, qdb_abi::STATE_CLOSED);
+    assert_eq!(
+        restored.klines(id, Period::M1)[0].state,
+        qdb_abi::STATE_CLOSED
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -105,7 +130,9 @@ fn temp(name: &str) -> std::path::PathBuf {
 
 fn shanghai(h: u32, m: u32, s: u32, nanos: i64) -> i64 {
     let days = days(2024, 1, 2);
-    (days * 86_400 + i64::from(h) * 3600 + i64::from(m) * 60 + i64::from(s) - 8 * 3600) * 1_000_000_000 + nanos
+    (days * 86_400 + i64::from(h) * 3600 + i64::from(m) * 60 + i64::from(s) - 8 * 3600)
+        * 1_000_000_000
+        + nanos
 }
 
 fn utc(h: u32, m: u32, s: u32) -> i64 {

@@ -8,6 +8,7 @@
 |---|---|---|
 | `Io` | `io: ...` | 建目录、读写 WAL 或映射共享内存失败 |
 | `EmptyExchange` | `exchange label is empty` | 交易所标签是空字符串 |
+| `ReadOnly` | `read-only connection` | `open_read` 打开的引擎拒绝写入 |
 | `NotFound` | `symbol not found` | `resolve` 没有这只证券，或成交指向的证券不在表里 |
 | `Ambiguous` | `ambiguous symbol` | 裸代码对应多只证券 |
 | `Crc` | `wal crc failed` | 打开时 WAL 有坏 CRC，引擎拒绝继续写 |

@@ -18,7 +18,19 @@ qdb-shm   = { path = "crates/qdb-shm" }    # 另进程只读环形缓冲
 pub fn Engine::open(root: &Path) -> Result<Engine, StoreError>
 ```
 
-创建 `wal/` 和 `snap/`，重放 `wal/wal-1.qwal`，然后重建 `region.bin`。重放遇到坏 CRC 时，停在最后一条完好记录，并把引擎标成不可再写。文件尾部不足一条记录时忽略，不视为损坏。
+创建 `wal/` 和 `snap/`，重放 `wal/wal-1.qwal`，然后重建 `region.bin`。重放遇到坏 CRC 时，停在最后一条完好记录，并把引擎标成不可再写。
+
+```rust
+pub fn Engine::open_read(root: &Path) -> Result<Engine, StoreError>
+```
+
+`open_read` 只重放 WAL。目录不存在时返回错误。它不创建文件，不追加日志，也不改 `region.bin`。之后的 `write_trade`、`write_quote`、`write_clock` 返回 `read-only connection`。命令行客户端用的就是这个入口。
+
+```rust
+pub fn poll(&mut self) -> Result<Vec<Change>, StoreError>
+```
+
+`poll` 只读取打开之后新 `fsync` 的记录，并更新这次打开的内存表。返回的 `Change` 按表区分：`ticks`、`snapshots`、`klines`。没有新记录时返回空向量。坏 CRC 返回 `wal crc failed`。文件尾部不足一条记录时忽略，不视为损坏。
 
 开发配置的共享内存是 1024 个证券槽、4096 帧环形缓冲。这小于 ABI 里的默认值 65536。
 

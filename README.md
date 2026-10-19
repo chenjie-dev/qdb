@@ -9,6 +9,7 @@ QDB 是面向股市行情的内存数据库。采集进程把 Tick 写入本机�
 ```bash
 cargo test --workspace
 cargo run -p qdb-server -- data
+cargo run -p qdb-server --bin qdb-client -- data
 ```
 
 健康检查和快照读取默认监听 `127.0.0.1:9090`。进程内采集把公开行情写入库，`GET /v1/snapshots` 只读这份缓存。EquityLab Compose 用仓库根目录 `Dockerfile` 构建，容器内监听 `0.0.0.0:9090`。

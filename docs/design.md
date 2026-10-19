@@ -500,6 +500,23 @@ END <row_count>\n
 ERR <code> <message>\n
 ```
 
+### 5.4 命令行客户端
+
+`qdb-client` 用只读方式打开数据目录。它重放 `wal/wal-1.qwal`，不创建、不删除 `region.bin`，不追加 WAL，因此可以和写入进程同时看已经 `fsync` 的数据。普通查询每条语句重新打开一次。
+
+`.watch` 先打印该表的当前行，再从上次读到的位置跟随新 `fsync` 的记录。`snapshots` 看最新价、买一和卖一，`ticks` 看逐笔，`klines` 还要给周期。这是本机轮询，不是网络推送。
+
+除第 5 节的 `SELECT` 外，客户端接受：
+
+```text
+show      = "SHOW" "TABLES"
+describe  = "DESCRIBE" table | "DESC" table
+```
+
+`SHOW TABLES` 列出四张逻辑表和必要过滤。`DESCRIBE` 列出该表当前查询能返回的列。点命令 `.tables`、`.schema`、`.help`、`.quit` 是上述语句的快捷方式。
+
+没有查询用的网络端口。PostgreSQL 线协议和上面的行文本协议仍不在本版本。
+
 ## 6. 订阅
 
 发布模型：写入者把已提交帧放进环形缓冲后，所有跟上的读者都能看见。过滤在订阅网关做。共享内存读者自己过滤。

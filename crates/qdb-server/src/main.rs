@@ -9,8 +9,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use qdb_store::{Engine, Metrics};
 
 use crate::feed::{
-    apply_docs, apply_quotes, apply_trades, doc_json, klines_json, query_param, read_request, snapshots_json, write_http,
-    LiveQuote,
+    apply_docs, apply_quotes, apply_trades, doc_json, klines_json, query_param, read_request,
+    snapshots_json, write_http, LiveQuote,
 };
 use serde_json::Value;
 
@@ -23,12 +23,21 @@ fn main() {
     let docs: Arc<Mutex<HashMap<String, Value>>> = Arc::new(Mutex::new(HashMap::new()));
     feed::spawn(engine.clone(), live.clone());
     let addr = std::env::var("QDB_HTTP_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
-    let port: u16 = std::env::var("QDB_HTTP_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(9090);
+    let port: u16 = std::env::var("QDB_HTTP_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(9090);
     let listener = TcpListener::bind((addr.as_str(), port)).expect("bind health port");
     eprintln!("qdb listening on {addr}:{port}");
     for conn in listener.incoming() {
         if let Ok(stream) = conn {
-            let _ = handle(stream, metrics.clone(), engine.clone(), live.clone(), docs.clone());
+            let _ = handle(
+                stream,
+                metrics.clone(),
+                engine.clone(),
+                live.clone(),
+                docs.clone(),
+            );
         }
     }
 }
@@ -45,35 +54,69 @@ fn handle(
     if route == "/v1/trades" && req.method == "POST" {
         return match apply_trades(&engine, &req.body) {
             Ok(body) => write_http(&mut stream, 200, "application/json", &body),
-            Err(err) => write_http(&mut stream, 400, "application/json", &format!("{{\"error\":\"{err}\"}}")),
+            Err(err) => write_http(
+                &mut stream,
+                400,
+                "application/json",
+                &format!("{{\"error\":\"{err}\"}}"),
+            ),
         };
     }
     if route == "/v1/docs" && req.method == "POST" {
         return match apply_docs(&docs, &req.body) {
             Ok(body) => write_http(&mut stream, 200, "application/json", &body),
-            Err(err) => write_http(&mut stream, 400, "application/json", &format!("{{\"error\":\"{err}\"}}")),
+            Err(err) => write_http(
+                &mut stream,
+                400,
+                "application/json",
+                &format!("{{\"error\":\"{err}\"}}"),
+            ),
         };
     }
     if route == "/v1/docs" {
-        let key = query_param(query, "key").into_iter().next().unwrap_or_default();
+        let key = query_param(query, "key")
+            .into_iter()
+            .next()
+            .unwrap_or_default();
         let body = docs.lock().ok().and_then(|guard| doc_json(&guard, &key));
         return match body {
             Some(body) => write_http(&mut stream, 200, "application/json", &body),
-            None => write_http(&mut stream, 404, "application/json", "{\"error\":\"not found\"}"),
+            None => write_http(
+                &mut stream,
+                404,
+                "application/json",
+                "{\"error\":\"not found\"}",
+            ),
         };
     }
     if route == "/v1/quotes" && req.method == "POST" {
         return match apply_quotes(&engine, &live, &req.body) {
             Ok(body) => write_http(&mut stream, 200, "application/json", &body),
-            Err(err) => write_http(&mut stream, 400, "application/json", &format!("{{\"error\":\"{err}\"}}")),
+            Err(err) => write_http(
+                &mut stream,
+                400,
+                "application/json",
+                &format!("{{\"error\":\"{err}\"}}"),
+            ),
         };
     }
     if route == "/v1/klines" {
-        let symbol = query_param(query, "symbol").into_iter().next().unwrap_or_default();
-        let period = query_param(query, "period").into_iter().next().unwrap_or_else(|| "1d".into());
+        let symbol = query_param(query, "symbol")
+            .into_iter()
+            .next()
+            .unwrap_or_default();
+        let period = query_param(query, "period")
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "1d".into());
         return match klines_json(&engine, &symbol, &period) {
             Ok(body) => write_http(&mut stream, 200, "application/json", &body),
-            Err(err) => write_http(&mut stream, 404, "application/json", &format!("{{\"error\":\"{err}\"}}")),
+            Err(err) => write_http(
+                &mut stream,
+                404,
+                "application/json",
+                &format!("{{\"error\":\"{err}\"}}"),
+            ),
         };
     }
     if route == "/v1/snapshots" {
@@ -117,7 +160,10 @@ fn metrics_text(metrics: &Metrics) -> String {
 }
 
 fn now_ns() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -152,7 +198,8 @@ mod tests {
         let live = metrics();
         live.heartbeat_ns.store(now_ns(), Ordering::Release);
         assert!(health_ok(&live));
-        live.heartbeat_ns.store(now_ns().saturating_sub(3_000_000_000), Ordering::Release);
+        live.heartbeat_ns
+            .store(now_ns().saturating_sub(3_000_000_000), Ordering::Release);
         assert!(!health_ok(&live));
     }
 
