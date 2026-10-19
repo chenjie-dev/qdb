@@ -22,4 +22,4 @@ Agent 约定见 [AGENTS.md](AGENTS.md)，开发流水线见 [docs/2026-10-19-age
 5. seq 断点续传
 6. WAL + 启动恢复
 
-PostgreSQL 完整协议、WebSocket、gRPC、历史导入、权限审计和分布式复制在设计里预留，不进入第一版实现。券商全市场还缺的能力写在 [docs/2026-10-19-enterprise-broker-md.md](docs/2026-10-19-enterprise-broker-md.md)，后面再做。
+PostgreSQL 完整协议、WebSocket、gRPC、历史导入、权限审计和分布式复制在设计里预留，不进入第一版实现。券商全市场还缺的能力写在 [docs/2026-10-19-enterprise-broker-md.md](docs/2026-10-19-enterprise-broker-md.md)。分布式、高可用和高并发写在 [docs/2026-10-19-distributed-ha.md](docs/2026-10-19-distributed-ha.md)，后面再做。

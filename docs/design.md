@@ -810,7 +810,7 @@ write_seq = applied_seq，但环形缓冲里不必塞入历史帧
 
 ## 11. 分布式
 
-第一版不实现本节，但 ABI 和 WAL 从第一天带上 `cluster_id`、`node_id`、`partition_id`、`leader_epoch`。
+第一版不实现本节，但 ABI 和 WAL 从第一天带上 `cluster_id`、`node_id`、`partition_id`、`leader_epoch`。分区、复制、切换和单机并行的展开见 [分布式、高可用与高并发](2026-10-19-distributed-ha.md)。若细节与本节冲突，以本节的单写、epoch、WAL 复制和 D0/D1/D2 为准。
 
 ### 11.1 分区
 
@@ -975,5 +975,5 @@ M1 到 M5 构成最低可用版本。之后才是 PostgreSQL 简单查询、WebS
 | 历史导入 | 第 9.4 节 | 否 |
 | 健康检查、丢包、水位 | 第 10 节 | 是 |
 | 权限与审计 | 第 10 节 | 仅文件权限和恢复/gap 日志 |
-| 分布式 | 第 11 节 | 只预留字段和复制模型 |
+| 分布式、高可用、高并发 | 第 11 节与 [展开设计](2026-10-19-distributed-ha.md) | 只预留字段，不实现 |
 | 券商全品种、逐笔委托、订单簿、授权与历史库 | [企业级缺口](2026-10-19-enterprise-broker-md.md) | 否 |
