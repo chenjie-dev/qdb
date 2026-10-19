@@ -57,7 +57,7 @@
 | [diagnosing-bugs](./diagnosing-bugs/SKILL.md) | 硬 bug / 性能诊断 |
 | [code-review](./code-review/SKILL.md) | Standards + Spec 双轴审查。Spec 用 `docs/design.md` |
 | [differential-review](./differential-review/SKILL.md) | 安全向差分审查 |
-| [commit](./commit/SKILL.md) | `type: 中文` 提交 |
+| [commit](./commit/SKILL.md) | `type: 中文` 提交。推送经 Clash `127.0.0.1:7897` |
 | [resolving-merge-conflicts](./resolving-merge-conflicts/SKILL.md) | 合并冲突 |
 
 ### Rust

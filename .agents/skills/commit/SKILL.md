@@ -1,9 +1,9 @@
 ---
 name: commit
-description: Analyze staged/unstaged changes, auto-detect commit type, generate semantic commit message, and execute git commit. Use when the user says "/commit", "提交", or requests a code commit.
+description: Analyze staged/unstaged changes, auto-detect commit type, generate semantic commit message, and execute git commit. Use when the user says "/commit", "提交", "push", "推送", or requests a code commit or push to GitHub.
 ---
 
-> **中文说明**：仓库自定义技能。分析暂存/未暂存改动，自动判定类型并生成 `type: 中文描述` 的提交信息，确认后执行 git commit；对应 `/commit` 和「提交」。规则与根目录 AGENTS.md 一致，不默认 push、不打 Tag。勿提交含真实密钥的 `.env`。
+> **中文说明**：仓库自定义技能。分析暂存/未暂存改动，自动判定类型并生成 `type: 中文描述` 的提交信息，确认后执行 git commit；对应 `/commit` 和「提交」。规则与根目录 AGENTS.md 一致，不默认 push、不打 Tag。用户明确要求 push 时，经本机 Clash 代理 `127.0.0.1:7897` 推送。勿提交含真实密钥的 `.env`。
 
 # 智能代码提交
 
@@ -75,9 +75,19 @@ git commit -m "{commit message}"
 
 仅在用户明确要求 push 时执行。硬性约定见根目录 `AGENTS.md`。
 
+直连 `github.com:443` 会超时。推送时带上本机 Clash Verge 混合端口，不把代理写进 git config：
+
 ```bash
-git push
+https_proxy=http://127.0.0.1:7897 http_proxy=http://127.0.0.1:7897 git push
 ```
+
+首次推送并设置上游时：
+
+```bash
+https_proxy=http://127.0.0.1:7897 http_proxy=http://127.0.0.1:7897 git push -u origin main
+```
+
+当前远程是 `https://github.com/chenjie-dev/qdb.git`。`7897` 没有在监听时，先确认 Clash Verge 已启动，再查监听端口，不要改走别的代理。
 
 ## 重要规则
 

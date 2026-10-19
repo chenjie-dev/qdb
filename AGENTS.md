@@ -60,7 +60,7 @@ QDB 是面向股市行情的内存数据库，用 Rust 实现。单机上只有�
 
 - 信息格式：`type: 中文描述`（`feat` / `fix` / `perf` / `refactor` / `chore` / `docs` / `style`）
 - **确认后再提交**（用户已说「提交一次」且未改文案时可直接提交）
-- **不默认 push**；**禁止打 Tag**
+- **不默认 push**；**禁止打 Tag**。用户明确要求 push 时走 skill **commit** 的推送步骤：经 `https_proxy=http://127.0.0.1:7897` 推送，不把代理写入 git config
 - 不提交 `data/` 和密钥
 
 用户没有明确要求提交时，不执行 commit。skill **implement** 末尾的自动提交在本仓不生效。
