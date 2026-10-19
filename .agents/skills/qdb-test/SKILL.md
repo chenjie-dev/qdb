@@ -1,0 +1,54 @@
+---
+name: qdb-test
+description: >-
+  QDB automated test gate. Use before committing, when adding behavior, or when
+  the user mentions 自动化测试、回归、覆盖、边界. Run the full suite and add tests
+  for every implemented behavior described in the docs.
+---
+
+> **中文说明**：提交前必须跑通 `cargo test --workspace`。文档或公开接口里已经实现的行为，要有对应测试。未实现的企业级清单不写测试冒充完成。
+
+# QDB 自动化测试
+
+## 提交前（completion：整库测试通过）
+
+写完代码、执行 `git commit` 之前：
+
+```bash
+cargo test --workspace
+```
+
+失败则停止提交，先修到通过。只跑其中一个 crate 不能代替整库，除非本次改动明确只在该 crate，并且整库测试在同一轮里已经通过。
+
+## 覆盖范围
+
+测试只覆盖 **已经实现** 的公开行为。依据是：
+
+- [`docs/design.md`](../../../docs/design.md) 里第一版已经落地的条款
+- 各 crate 的公开函数
+- 本轮新增、且代码里真实存在的行为
+
+[`docs/2026-10-19-enterprise-broker-md.md`](../../../docs/2026-10-19-enterprise-broker-md.md) 和 [`docs/2026-10-19-distributed-ha.md`](../../../docs/2026-10-19-distributed-ha.md) 里标明未实现的能力，不要写成已通过的测试。
+
+新功能合入时，同一变更里加上测试。期望值来自设计中的具体数字或独立算好的时间边界，不用实现代码再算一遍当作期望。
+
+## 每个功能至少碰到的边界
+
+| 区域 | 要有的用例 |
+|---|---|
+| 布局 | 定长、往返编码、截断输入、校验和被改坏 |
+| 时间 | 上海秒/分/日，UTC 日切，4 小时边界，负时间不 panic |
+| 环形缓冲 | 跟上时序号连续，写满后慢读者得到 gap，容量不是 2 的幂被拒绝 |
+| WAL | 空文件、往返、尾部半截记录不算损坏，坏 CRC 停在前一条 |
+| 聚合 | 设计中的三笔成交、重放、缺号、迟到、时钟收线、别的交易所不被收线 |
+| 引擎 | 删掉共享内存仍可恢复，坏 CRC 拒绝新写入，时钟水位可重放，重复登记符号不新增序号 |
+| SQL | 示例查询、聚合、歧义代码、缺条件、超限、BETWEEN 含端点 |
+| 订阅 | 过滤、有序续传、序号空洞得到 Gap、未知代码失败 |
+| 健康 | 无心跳可用，CRC 或缺口不可用，心跳超过 2 秒不可用 |
+
+## 写法
+
+- 通过公开接口断言，不读私有字段。
+- 一个测试只讲一件事，名字写出条件和结果。
+- 用例之间不共享可变目录。临时目录用进程号区分，结束删除。
+- 不依赖网络和真实交易所。

@@ -12,7 +12,7 @@
 
 - PRD 的验收标准
 - [`docs/design.md`](../../docs/design.md) 第 13 节
-- 技能 `tdd`、`diagnosing-bugs`
+- 技能 `qdb-test`、`tdd`、`diagnosing-bugs`
 
 ## 步骤
 

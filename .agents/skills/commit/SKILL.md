@@ -63,7 +63,17 @@ git diff --staged
 
 **多类型变更时**，选择最主要的类型作为前缀。优先级：`feat` > `fix` > `perf` > `refactor` > `chore`
 
-### Step 4: 确认并提交
+### Step 4: 自动化测试
+
+提交前运行整库测试。失败则不要提交。
+
+```bash
+cargo test --workspace
+```
+
+本次变更若增加了已实现的行为，先按 skill **qdb-test** 补测试，再进入提交。未实现的设计清单不补假测试。
+
+### Step 5: 确认并提交
 
 展示生成的 commit message 供用户确认，用户确认后执行：
 
@@ -71,7 +81,7 @@ git diff --staged
 git commit -m "{commit message}"
 ```
 
-### Step 5: 推送
+### Step 6: 推送
 
 仅在用户明确要求 push 时执行。硬性约定见根目录 `AGENTS.md`。
 

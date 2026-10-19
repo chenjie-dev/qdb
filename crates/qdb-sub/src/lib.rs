@@ -91,7 +91,8 @@ mod tests {
     use qdb_abi::Period;
 
     fn sample() -> (std::path::PathBuf, qdb_store::Engine) {
-        let dir = std::env::temp_dir().join(format!("qdb-sub-{}", std::process::id()));
+        let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("qdb-sub-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut engine = qdb_store::Engine::open(&dir).unwrap();

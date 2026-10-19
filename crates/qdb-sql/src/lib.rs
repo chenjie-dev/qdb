@@ -371,7 +371,8 @@ mod tests {
     use qdb_abi::TickQuote;
 
     fn engine() -> (std::path::PathBuf, Engine) {
-        let dir = std::env::temp_dir().join(format!("qdb-sql-{}", std::process::id()));
+        let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let dir = std::env::temp_dir().join(format!("qdb-sql-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut engine = Engine::open(&dir).unwrap();

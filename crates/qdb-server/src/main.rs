@@ -75,3 +75,49 @@ fn metrics_text(metrics: &Metrics) -> String {
 fn now_ns() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::sync::Arc;
+
+    fn metrics() -> Metrics {
+        Metrics {
+            durable_seq: Arc::new(AtomicU64::new(4)),
+            applied_seq: Arc::new(AtomicU64::new(4)),
+            write_seq: Arc::new(AtomicU64::new(4)),
+            gap_total: Arc::new(AtomicU64::new(0)),
+            late_tick_total: Arc::new(AtomicU64::new(0)),
+            crc_failed: Arc::new(AtomicBool::new(false)),
+            heartbeat_ns: Arc::new(AtomicU64::new(0)),
+            subscriber_count: Arc::new(AtomicU64::new(1)),
+        }
+    }
+
+    #[test]
+    fn health_fails_on_crc_gap_or_stale_heartbeat() {
+        let fresh = metrics();
+        assert!(health_ok(&fresh));
+        fresh.crc_failed.store(true, Ordering::Release);
+        assert!(!health_ok(&fresh));
+
+        let gapped = metrics();
+        gapped.gap_total.store(1, Ordering::Release);
+        assert!(!health_ok(&gapped));
+
+        let live = metrics();
+        live.heartbeat_ns.store(now_ns(), Ordering::Release);
+        assert!(health_ok(&live));
+        live.heartbeat_ns.store(now_ns().saturating_sub(3_000_000_000), Ordering::Release);
+        assert!(!health_ok(&live));
+    }
+
+    #[test]
+    fn metrics_text_lists_the_sequence_gauges() {
+        let text = metrics_text(&metrics());
+        assert!(text.contains("qdb_durable_seq 4"));
+        assert!(text.contains("qdb_applied_seq 4"));
+        assert!(text.contains("qdb_subscriber_count 1"));
+    }
+}

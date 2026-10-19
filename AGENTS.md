@@ -64,9 +64,11 @@ QDB 是面向股市行情的内存数据库，用 Rust 实现。单机上只有�
 
 与任何 skill 冲突时，以本文件和 `docs/design.md` 为准。
 
-## 验证
+## 自动化测试
 
-有对应 crate 之后，相关改动至少让 `cargo test -p <crate>` 通过。帧、快照槽、K 线槽的改动要有 `size_of` / 偏移断言。恢复改动要覆盖「删掉共享内存文件后从 WAL 和状态快照重建」。
+写完代码、提交之前必须运行 `cargo test --workspace`，失败就不提交。已经实现的功能点和边界都要有测试；本轮新写进文档、且代码里已经存在的行为，同一变更里补上测试。未实现的企业级和分布式设计不写成已通过的用例。规范见 skill **qdb-test**。
+
+帧、快照槽、K 线槽的改动要有 `size_of` / 偏移断言。恢复改动要覆盖「删掉共享内存文件后从 WAL 重建」。
 
 ## 提交（/commit、提交）
 
@@ -96,5 +98,6 @@ QDB 是面向股市行情的内存数据库，用 Rust 实现。单机上只有�
 | 按设计实现 | `implement`（配 `tdd`） |
 | 深模块 / seam | `codebase-design` |
 | 对照设计审查 | `code-review`（Spec 来源是 `docs/design.md`） |
+| 提交前测试、补覆盖 | `qdb-test` |
 | 难 bug | `diagnosing-bugs` |
 | 写 skill / AGENTS | `writing-for-agents` |
