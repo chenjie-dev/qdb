@@ -6,7 +6,7 @@ use std::process::ExitCode;
 
 use qdb_abi::Period;
 use qdb_sql::{QueryResult, SqlEngine};
-use qdb_store::{Change, Engine};
+use qdb_store::{Catalog, Change, Engine};
 
 fn main() -> ExitCode {
     let args = match Args::parse(std::env::args().skip(1)) {
@@ -21,9 +21,30 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if let Some(command) = args.command {
-        return finish(&args.data, &command);
+        let mut session = Session::new(args.data);
+        return finish(&mut session, &command);
     }
     repl(&args.data)
+}
+
+struct Session {
+    instance: PathBuf,
+    database: String,
+}
+
+impl Session {
+    fn new(instance: PathBuf) -> Self {
+        Self {
+            instance,
+            database: "default".into(),
+        }
+    }
+
+    fn path(&self) -> Result<PathBuf, String> {
+        Catalog::open_read(&self.instance)
+            .and_then(|catalog| catalog.path(&self.database))
+            .map_err(|err| err.to_string())
+    }
 }
 
 struct Args {
@@ -63,13 +84,18 @@ impl Args {
     }
 }
 
-fn repl(data: &Path) -> ExitCode {
+fn repl(instance: &Path) -> ExitCode {
     let interactive = io::stdin().is_terminal();
+    let mut session = Session::new(instance.to_path_buf());
     let stdin = io::stdin();
     let mut lines = stdin.lock().lines();
     loop {
         if interactive {
-            eprint!("qdb> ");
+            if session.database == "default" {
+                eprint!("qdb> ");
+            } else {
+                eprint!("qdb {}> ", session.database);
+            }
             let _ = io::stderr().flush();
         }
         let Some(line) = lines.next() else {
@@ -85,7 +111,7 @@ fn repl(data: &Path) -> ExitCode {
         if line.trim() == ".quit" || line.trim() == ".exit" {
             break;
         }
-        let code = finish(data, &line);
+        let code = finish(&mut session, &line);
         if code != ExitCode::SUCCESS && !interactive {
             return code;
         }
@@ -93,16 +119,30 @@ fn repl(data: &Path) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn finish(data: &Path, line: &str) -> ExitCode {
+fn finish(session: &mut Session, line: &str) -> ExitCode {
+    if let Some(result) = catalog_command(session, line) {
+        return match result {
+            Ok(text) => {
+                if !text.is_empty() {
+                    print!("{text}");
+                }
+                ExitCode::SUCCESS
+            }
+            Err(message) => {
+                eprintln!("{message}");
+                ExitCode::from(1)
+            }
+        };
+    }
     match parse_watch(line) {
-        Some(Ok(watch)) => return follow(data, &watch),
+        Some(Ok(watch)) => return follow(session, &watch),
         Some(Err(message)) => {
             eprintln!("{message}");
             return ExitCode::from(1);
         }
         None => {}
     }
-    match execute(data, line) {
+    match execute(session, line) {
         Ok(text) => {
             if !text.is_empty() {
                 print!("{text}");
@@ -116,7 +156,51 @@ fn finish(data: &Path, line: &str) -> ExitCode {
     }
 }
 
-fn execute(data: &Path, line: &str) -> Result<String, String> {
+fn catalog_command(session: &mut Session, line: &str) -> Option<Result<String, String>> {
+    let text = line.trim().trim_end_matches(';').trim();
+    let parts: Vec<&str> = text.split_whitespace().collect();
+    let upper: Vec<String> = parts.iter().map(|part| part.to_ascii_uppercase()).collect();
+    match upper.as_slice() {
+        [command, what] if command == "SHOW" && what == "DATABASES" => {
+            Some(show_databases(&session.instance))
+        }
+        [command, what, name] if command == "CREATE" && what == "DATABASE" => Some(
+            create_database(&session.instance, parts[2])
+                .map(|()| format!("created {}\n", parts[2])),
+        ),
+        [command, name] if command == "USE" => {
+            Some(use_database(session, parts[1]).map(|name| format!("database {name}\n")))
+        }
+        _ => None,
+    }
+}
+
+fn show_databases(instance: &Path) -> Result<String, String> {
+    let names = Catalog::open_read(instance)
+        .and_then(|catalog| catalog.list())
+        .map_err(|err| err.to_string())?;
+    Ok(format_result(&QueryResult {
+        columns: vec!["database".into()],
+        rows: names.into_iter().map(|name| vec![name]).collect(),
+    }))
+}
+
+fn create_database(instance: &Path, name: &str) -> Result<(), String> {
+    let catalog = Catalog::open_read(instance).map_err(|err| err.to_string())?;
+    catalog
+        .create(name)
+        .map(|_| ())
+        .map_err(|err| err.to_string())
+}
+
+fn use_database(session: &mut Session, name: &str) -> Result<String, String> {
+    let catalog = Catalog::open_read(&session.instance).map_err(|err| err.to_string())?;
+    catalog.path(name).map_err(|err| err.to_string())?;
+    session.database = name.to_string();
+    Ok(name.to_string())
+}
+
+fn execute(session: &Session, line: &str) -> Result<String, String> {
     let line = line.trim();
     if line.is_empty() {
         return Ok(String::new());
@@ -124,7 +208,7 @@ fn execute(data: &Path, line: &str) -> Result<String, String> {
     let statement = if let Some(rest) = line.strip_prefix('.') {
         match rest.split_whitespace().collect::<Vec<_>>().as_slice() {
             ["tables"] => "SHOW TABLES".to_string(),
-            ["schema"] => return describe_all(data),
+            ["schema"] => return describe_all(session),
             ["schema", table] => format!("DESCRIBE {table}"),
             ["help"] => return Ok(help_text()),
             ["quit"] | ["exit"] => return Ok(String::new()),
@@ -133,15 +217,15 @@ fn execute(data: &Path, line: &str) -> Result<String, String> {
     } else {
         line.to_string()
     };
-    let engine = Engine::open_read(data).map_err(|err| err.to_string())?;
+    let engine = Engine::open_read(&session.path()?).map_err(|err| err.to_string())?;
     let result = SqlEngine::new(&engine)
         .query(&statement)
         .map_err(|err| err.to_string())?;
     Ok(format_result(&result))
 }
 
-fn describe_all(data: &Path) -> Result<String, String> {
-    let engine = Engine::open_read(data).map_err(|err| err.to_string())?;
+fn describe_all(session: &Session) -> Result<String, String> {
+    let engine = Engine::open_read(&session.path()?).map_err(|err| err.to_string())?;
     let sql = SqlEngine::new(&engine);
     let mut out = String::new();
     for table in ["symbols", "ticks", "snapshots", "klines"] {
@@ -266,8 +350,11 @@ fn parse_watch(line: &str) -> Option<Result<Watch, String>> {
     Some(Ok(watch))
 }
 
-fn follow(data: &Path, watch: &Watch) -> ExitCode {
-    let mut engine = match Engine::open_read(data) {
+fn follow(session: &Session, watch: &Watch) -> ExitCode {
+    let mut engine = match session
+        .path()
+        .and_then(|path| Engine::open_read(&path).map_err(|err| err.to_string()))
+    {
         Ok(engine) => engine,
         Err(err) => {
             eprintln!("{err}");
@@ -374,6 +461,9 @@ qdb-client [数据目录] [-c 语句]
 
 只读。查询重放已经 fsync 的 WAL。订阅接着读新写入的记录。不修改 region.bin。
 
+  CREATE DATABASE 库名
+  SHOW DATABASES
+  USE 库名
   SHOW TABLES
   DESCRIBE 表名
   SELECT ...
@@ -411,20 +501,21 @@ mod tests {
     #[test]
     fn client_lists_tables_and_reads_a_trade() {
         let dir = sample();
-        let tables = execute(&dir, ".tables").unwrap();
+        let session = Session::new(dir.clone());
+        let tables = execute(&session, ".tables").unwrap();
         assert!(tables.contains("klines"));
         assert!(tables.contains("symbol, period"));
-        let described = execute(&dir, ".schema ticks").unwrap();
+        let described = execute(&session, ".schema ticks").unwrap();
         assert!(described.contains("price"));
         let rows = execute(
-            &dir,
+            &session,
             "SELECT price, volume FROM ticks WHERE symbol = 'SSE:600000'",
         )
         .unwrap();
         assert!(rows.contains("1050000"));
         assert!(rows.contains("100"));
         let region = std::fs::read(dir.join("region.bin")).unwrap();
-        execute(&dir, "SHOW TABLES").unwrap();
+        execute(&session, "SHOW TABLES").unwrap();
         assert_eq!(std::fs::read(dir.join("region.bin")).unwrap(), region);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -434,7 +525,8 @@ mod tests {
         let dir = sample();
         let watch = parse_watch(".watch SSE:600000").unwrap().unwrap();
         assert_eq!(watch.table, "snapshots");
-        let engine = qdb_store::Engine::open_read(&dir).unwrap();
+        let engine =
+            qdb_store::Engine::open_read(&Session::new(dir.clone()).path().unwrap()).unwrap();
         let current = current_line(&engine, &watch);
         assert!(current.contains("last=1050000"));
         let change = qdb_store::Change {
@@ -464,6 +556,30 @@ mod tests {
     fn missing_directory_is_an_error() {
         let missing = std::env::temp_dir().join("qdb-client-missing-dir");
         let _ = std::fs::remove_dir_all(&missing);
-        assert!(execute(&missing, "SHOW TABLES").is_err());
+        let session = Session::new(missing);
+        assert!(execute(&session, "SHOW TABLES").is_err());
+    }
+
+    #[test]
+    fn create_database_keeps_trades_apart() {
+        let dir = sample();
+        let mut session = Session::new(dir.clone());
+        catalog_command(&mut session, "CREATE DATABASE crypto")
+            .unwrap()
+            .unwrap();
+        let listed = catalog_command(&mut session, "SHOW DATABASES")
+            .unwrap()
+            .unwrap();
+        assert!(listed.contains("default"));
+        assert!(listed.contains("crypto"));
+        catalog_command(&mut session, "USE crypto")
+            .unwrap()
+            .unwrap();
+        let rows = execute(
+            &session,
+            "SELECT price FROM ticks WHERE symbol = 'SSE:600000'",
+        );
+        assert!(rows.is_err());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

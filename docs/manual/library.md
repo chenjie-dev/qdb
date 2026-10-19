@@ -12,6 +12,18 @@ qdb-shm   = { path = "crates/qdb-shm" }    # 另进程只读环形缓冲
 
 热路径不使用 serde。价格和时间在进入这些函数之前就应是整数。
 
+## 多个库
+
+`Catalog` 管一个实例目录。`open` 保证有库 `default`。`create` 只建目录和空 WAL，不映射共享内存。`open_database` 才是该库的写入者。
+
+```rust
+let catalog = qdb_store::Catalog::open(std::path::Path::new("data"))?;
+catalog.create("ashare")?;
+let mut ashare = catalog.open_database("ashare")?;
+```
+
+每个库的 `seq` 从 1 单独递增。只读用 `open_read` 和 `open_database_read`。
+
 ## 打开
 
 ```rust

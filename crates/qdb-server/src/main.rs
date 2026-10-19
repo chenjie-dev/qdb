@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use qdb_store::{Engine, Metrics};
+use qdb_store::{Catalog, Engine, Metrics};
 
 use crate::feed::{
     apply_docs, apply_quotes, apply_trades, doc_json, klines_json, query_param, read_request,
@@ -14,14 +14,45 @@ use crate::feed::{
 };
 use serde_json::Value;
 
+struct Databases {
+    catalog: Catalog,
+    engines: Mutex<HashMap<String, Arc<Mutex<Engine>>>>,
+}
+
+impl Databases {
+    fn get(&self, name: &str) -> Result<Arc<Mutex<Engine>>, String> {
+        let mut engines = self
+            .engines
+            .lock()
+            .map_err(|_| "database lock".to_string())?;
+        if let Some(engine) = engines.get(name) {
+            return Ok(engine.clone());
+        }
+        if !self.catalog.exists(name) {
+            return Err(format!("database not found: {name}"));
+        }
+        let engine = Arc::new(Mutex::new(
+            self.catalog
+                .open_database(name)
+                .map_err(|err| err.to_string())?,
+        ));
+        engines.insert(name.to_string(), engine.clone());
+        Ok(engine)
+    }
+}
+
 fn main() {
     let root = std::env::args().nth(1).unwrap_or_else(|| "data".into());
-    let engine = Engine::open(std::path::Path::new(&root)).expect("open qdb");
-    let metrics = engine.metrics();
-    let engine = Arc::new(Mutex::new(engine));
+    let catalog = Catalog::open(std::path::Path::new(&root)).expect("open qdb");
+    let databases = Databases {
+        catalog,
+        engines: Mutex::new(HashMap::new()),
+    };
+    let engine = databases.get("default").expect("open default database");
+    let metrics = engine.lock().expect("default database").metrics();
     let live: Arc<Mutex<HashMap<String, LiveQuote>>> = Arc::new(Mutex::new(HashMap::new()));
     let docs: Arc<Mutex<HashMap<String, Value>>> = Arc::new(Mutex::new(HashMap::new()));
-    feed::spawn(engine.clone(), live.clone());
+    feed::spawn(engine, live.clone());
     let addr = std::env::var("QDB_HTTP_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
     let port: u16 = std::env::var("QDB_HTTP_PORT")
         .ok()
@@ -34,7 +65,7 @@ fn main() {
             let _ = handle(
                 stream,
                 metrics.clone(),
-                engine.clone(),
+                &databases,
                 live.clone(),
                 docs.clone(),
             );
@@ -45,12 +76,23 @@ fn main() {
 fn handle(
     mut stream: TcpStream,
     metrics: Metrics,
-    engine: Arc<Mutex<Engine>>,
+    databases: &Databases,
     live: Arc<Mutex<HashMap<String, LiveQuote>>>,
     docs: Arc<Mutex<HashMap<String, Value>>>,
 ) -> std::io::Result<()> {
     let req = read_request(&mut stream)?;
     let (route, query) = req.path.split_once('?').unwrap_or((req.path.as_str(), ""));
+    let engine = match database(databases, query) {
+        Ok(engine) => engine,
+        Err(err) => {
+            return write_http(
+                &mut stream,
+                404,
+                "application/json",
+                &format!("{{\"error\":\"{err}\"}}"),
+            );
+        }
+    };
     if route == "/v1/trades" && req.method == "POST" {
         return match apply_trades(&engine, &req.body) {
             Ok(body) => write_http(&mut stream, 200, "application/json", &body),
@@ -134,6 +176,14 @@ fn handle(
     let status = if ok { 200 } else { 503 };
     let body = if ok { "ok\n" } else { "unavailable\n" };
     write_http(&mut stream, status, "text/plain", body)
+}
+
+fn database(databases: &Databases, query: &str) -> Result<Arc<Mutex<Engine>>, String> {
+    let name = query_param(query, "db")
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "default".into());
+    databases.get(&name)
 }
 
 fn health_ok(metrics: &Metrics) -> bool {

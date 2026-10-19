@@ -16,6 +16,9 @@ use qdb_shm::{RegionConfig, ShmRegion};
 use qdb_wal::{read_from, read_path, WalAppender, WalRead, WalRecord};
 use thiserror::Error;
 
+mod catalog;
+pub use catalog::{Catalog, CatalogError};
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("io: {0}")]

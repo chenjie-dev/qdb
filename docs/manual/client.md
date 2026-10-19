@@ -20,6 +20,20 @@ cargo run -p qdb-server --bin qdb-client -- data -c "SHOW TABLES"
 
 `-h` 打印用法。语句可以带结尾分号。
 
+## 多个库
+
+一个数据目录是一个实例，里面可以有多个库。每个库有自己的成交、报价、K 线和序号。
+
+```text
+qdb> CREATE DATABASE ashare
+qdb> SHOW DATABASES
+qdb> USE ashare
+```
+
+不写 `USE` 时打在 `default` 上。实例根目录里已经有的 `wal/` 就是这个 `default`，不会被挪走。新建的库在 `db/<库名>/`。库名以字母或下划线开头，只含字母、数字和下划线，最长 32 字节。
+
+换库之后，查询和 `.watch` 只看当前库。服务进程写行情时用查询参数 `db` 指定库，缺省仍是 `default`。
+
 ## 表结构
 
 ```text
