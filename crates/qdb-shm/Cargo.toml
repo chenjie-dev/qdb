@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+libc.workspace = true
 memmap2.workspace = true
 qdb-abi.workspace = true
 thiserror.workspace = true

@@ -1,6 +1,7 @@
-//! 共享内存区域、环形缓冲和 seqlock。unsafe 只出现在映射和原子量别名处。
+//! 共享内存区域、环形缓冲和 seqlock。unsafe 只出现在映射、原子量别名和实例文件锁处。
 
-use std::fs::OpenOptions;
+use std::fs::{File, OpenOptions};
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -28,7 +29,11 @@ pub enum ShmError {
     #[error("capacity must be a power of two")]
     BadCapacity,
     #[error("reader was lapped: expected {expected}, tail {tail}, capacity {capacity}")]
-    Lapped { expected: u64, tail: u64, capacity: u64 },
+    Lapped {
+        expected: u64,
+        tail: u64,
+        capacity: u64,
+    },
     #[error("sequence gap: expected {expected}, saw {saw}")]
     SeqGap { expected: u64, saw: u64 },
     #[error("torn or overwritten frame")]
@@ -39,6 +44,8 @@ pub enum ShmError {
     EpochChanged,
     #[error("snapshot version was odd or changed")]
     Busy,
+    #[error("another qdb instance is already running")]
+    InstanceRunning,
 }
 
 #[derive(Clone, Debug)]
@@ -103,8 +110,10 @@ impl ShmRegion {
             .open(path)
             .map_err(|err| ShmError::Io(err.to_string()))?;
         let len = region_len(cfg);
-        file.set_len(len as u64).map_err(|err| ShmError::Io(err.to_string()))?;
-        let mut mmap = unsafe { MmapMut::map_mut(&file) }.map_err(|err| ShmError::Io(err.to_string()))?;
+        file.set_len(len as u64)
+            .map_err(|err| ShmError::Io(err.to_string()))?;
+        let mut mmap =
+            unsafe { MmapMut::map_mut(&file) }.map_err(|err| ShmError::Io(err.to_string()))?;
         mmap.fill(0);
         write_header(&mut mmap, cfg);
         Ok(Self {
@@ -120,7 +129,8 @@ impl ShmRegion {
             .write(true)
             .open(path)
             .map_err(|err| ShmError::Io(err.to_string()))?;
-        let mmap = unsafe { MmapMut::map_mut(&file) }.map_err(|err| ShmError::Io(err.to_string()))?;
+        let mmap =
+            unsafe { MmapMut::map_mut(&file) }.map_err(|err| ShmError::Io(err.to_string()))?;
         check_header(&mmap)?;
         let capacity = read_u32(&mmap, 16);
         Ok(Self { mmap, capacity })
@@ -279,7 +289,8 @@ unsafe fn write_at<T>(pod: &SnapshotPod, offset: usize, value: T) {
 fn region_len(cfg: &RegionConfig) -> usize {
     let symbols = cfg.max_symbols as usize * std::mem::size_of::<qdb_abi::SymbolRec>();
     let snapshots = cfg.max_symbols as usize * std::mem::size_of::<SnapshotPod>();
-    let klines = cfg.max_symbols as usize * PERIOD_SLOTS as usize * std::mem::size_of::<qdb_abi::KlinePod>();
+    let klines =
+        cfg.max_symbols as usize * PERIOD_SLOTS as usize * std::mem::size_of::<qdb_abi::KlinePod>();
     let readers = cfg.reader_slots as usize * 64;
     HEADER_PAGE + readers + symbols + snapshots + klines + cfg.ring_capacity as usize * FRAME_SIZE
 }
@@ -302,7 +313,9 @@ fn write_header(mmap: &mut MmapMut, cfg: &RegionConfig) {
     let snapshot_off = symbol_off + symbol_bytes;
     let snapshot_bytes = cfg.max_symbols as u64 * std::mem::size_of::<SnapshotPod>() as u64;
     let kline_off = snapshot_off + snapshot_bytes;
-    let kline_bytes = cfg.max_symbols as u64 * PERIOD_SLOTS as u64 * std::mem::size_of::<qdb_abi::KlinePod>() as u64;
+    let kline_bytes = cfg.max_symbols as u64
+        * PERIOD_SLOTS as u64
+        * std::mem::size_of::<qdb_abi::KlinePod>() as u64;
     let ring_off = kline_off + kline_bytes;
     write_u64(mmap, OFF_SYMBOL, symbol_off);
     write_u64(mmap, OFF_SNAPSHOT, snapshot_off);
@@ -358,6 +371,41 @@ fn atomic_u64_ro(mmap: &Mmap, offset: usize) -> &AtomicU64 {
     unsafe { &*mmap[offset..].as_ptr().cast::<AtomicU64>() }
 }
 
+/// 一台机器上的 qdb 进程锁。持有者退出或 Drop 后释放。
+pub struct InstanceLock {
+    file: File,
+}
+
+impl InstanceLock {
+    pub fn try_acquire(path: &Path) -> Result<Self, ShmError> {
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent).map_err(|err| ShmError::Io(err.to_string()))?;
+            }
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)
+            .map_err(|err| ShmError::Io(err.to_string()))?;
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            return Err(ShmError::InstanceRunning);
+        }
+        Ok(Self { file })
+    }
+}
+
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,7 +414,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_path(name: &str) -> std::path::PathBuf {
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let dir = std::env::temp_dir().join(format!("qdb-{name}-{}-{nanos}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("region.bin")
@@ -463,7 +514,11 @@ mod tests {
         region.publish(&frame(1)).unwrap();
         let status = Command::new(std::env::current_exe().unwrap())
             .env("QDB_CHILD_PATH", &path)
-            .args(["--exact", "two_processes_share_one_frame", "--test-threads=1"])
+            .args([
+                "--exact",
+                "two_processes_share_one_frame",
+                "--test-threads=1",
+            ])
             .status()
             .unwrap();
         assert!(status.success());

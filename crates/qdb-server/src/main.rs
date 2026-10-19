@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use qdb_shm::InstanceLock;
 use qdb_store::{replay_bytes, Catalog, Engine, Metrics};
 
 use crate::feed::{
@@ -42,6 +43,15 @@ impl Databases {
 }
 
 fn main() {
+    let lock_path =
+        std::env::var("QDB_INSTANCE_LOCK").unwrap_or_else(|_| "/tmp/qdb.instance.lock".into());
+    let _instance = match InstanceLock::try_acquire(std::path::Path::new(&lock_path)) {
+        Ok(lock) => lock,
+        Err(_) => {
+            eprintln!("本机已有一个 qdb 实例，共享内存只允许运行一个");
+            std::process::exit(1);
+        }
+    };
     let root = std::env::args().nth(1).unwrap_or_else(|| "data".into());
     let catalog = Catalog::open(std::path::Path::new(&root)).expect("open qdb");
     let databases = Databases {
