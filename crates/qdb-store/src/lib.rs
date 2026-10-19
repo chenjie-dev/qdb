@@ -18,8 +18,10 @@ use thiserror::Error;
 
 mod catalog;
 mod dump;
+mod table;
 pub use catalog::{Catalog, CatalogError};
 pub use dump::{playback, replay_bytes, replay_file};
+pub use table::{Cell, ColumnDef, ColumnType, IndexDef, TableSchema};
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -29,6 +31,14 @@ pub enum StoreError {
     EmptyExchange,
     #[error("read-only connection")]
     ReadOnly,
+    #[error("table already exists")]
+    TableExists,
+    #[error("duplicate key")]
+    DuplicateKey,
+    #[error("type mismatch")]
+    TypeMismatch,
+    #[error("schema: {0}")]
+    Schema(String),
     #[error("symbol not found")]
     NotFound,
     #[error("ambiguous symbol")]
@@ -128,6 +138,7 @@ pub struct Engine {
     crc_failed: bool,
     readonly: bool,
     wal_pos: u64,
+    tables: table::TableSet,
 }
 
 impl Engine {
@@ -177,6 +188,7 @@ impl Engine {
             crc_failed: loaded.crc_failed,
             readonly,
             wal_pos: loaded.consumed,
+            tables: table::TableSet::default(),
         };
         for record in &loaded.records {
             engine.apply_record(record)?;
@@ -198,6 +210,40 @@ impl Engine {
 
     pub fn crc_failed(&self) -> bool {
         self.crc_failed
+    }
+
+    pub fn table_names(&self) -> Vec<String> {
+        self.tables.names()
+    }
+
+    pub fn table_schema(&self, name: &str) -> Option<&TableSchema> {
+        self.tables.schema(name)
+    }
+
+    pub fn create_table(&mut self, schema: TableSchema) -> Result<u64, StoreError> {
+        self.ensure_writable()?;
+        table::TableSet::validate_new(&schema)?;
+        if self.tables.schema(&schema.name).is_some() {
+            return Err(StoreError::TableExists);
+        }
+        let payload = table::TableSet::encode_schema(&schema);
+        self.commit(MsgType::TableSchema, 0, 0, 0, 0, &payload, 0)
+    }
+
+    pub fn insert_row(&mut self, table: &str, values: &[Cell]) -> Result<u64, StoreError> {
+        self.ensure_writable()?;
+        let payload = self.tables.encode_row(table, values)?;
+        self.commit(MsgType::RowInsert, 0, 0, 0, 0, &payload, 0)
+    }
+
+    pub fn scan_table(
+        &self,
+        table: &str,
+        column: Option<&str>,
+        expected: Option<&Cell>,
+        limit: usize,
+    ) -> Result<(Vec<String>, Vec<Vec<String>>), StoreError> {
+        self.tables.scan(table, column, expected, limit)
     }
 
     /// 读入写入者新 `fsync` 的记录，并更新本进程里的表。
@@ -519,6 +565,17 @@ impl Engine {
                         ask_px,
                     },
                 );
+                self.agg.note_seq(record.seq)?;
+                Ok(Vec::new())
+            }
+            Some(MsgType::TableSchema) => {
+                let schema = table::TableSet::decode_schema(&record.payload)?;
+                self.tables.insert_schema(schema)?;
+                self.agg.note_seq(record.seq)?;
+                Ok(Vec::new())
+            }
+            Some(MsgType::RowInsert) => {
+                self.tables.insert_encoded(&record.payload)?;
                 self.agg.note_seq(record.seq)?;
                 Ok(Vec::new())
             }

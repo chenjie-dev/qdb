@@ -2,7 +2,7 @@
 #![forbid(unsafe_code)]
 
 use qdb_abi::{KlineBody, Period};
-use qdb_store::{Engine, StoreError};
+use qdb_store::{Cell, ColumnDef, ColumnType, Engine, IndexDef, StoreError, TableSchema};
 use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -34,6 +34,22 @@ impl<'a> SqlEngine<'a> {
         Self { engine }
     }
 
+    pub fn execute(engine: &mut Engine, sql: &str) -> Result<QueryResult, SqlError> {
+        let sql = sql.trim().trim_end_matches(';').trim();
+        let tokens = tokenize(sql);
+        let head = tokens
+            .first()
+            .map(|token| token.to_ascii_lowercase())
+            .unwrap_or_default();
+        if head == "create" {
+            return exec_create(engine, &tokens);
+        }
+        if head == "insert" {
+            return exec_insert(engine, &tokens);
+        }
+        SqlEngine::new(engine).query(sql)
+    }
+
     pub fn query(&self, sql: &str) -> Result<QueryResult, SqlError> {
         let sql = sql.trim().trim_end_matches(';').trim();
         let tokens = tokenize(sql);
@@ -41,12 +57,16 @@ impl<'a> SqlEngine<'a> {
             .first()
             .is_some_and(|token| token.eq_ignore_ascii_case("show"))
         {
-            return query_show(&tokens);
+            let mut listed = query_show(&tokens)?;
+            for name in self.engine.table_names() {
+                listed.rows.push(vec![name, String::new()]);
+            }
+            return Ok(listed);
         }
         if tokens.first().is_some_and(|token| {
             token.eq_ignore_ascii_case("describe") || token.eq_ignore_ascii_case("desc")
         }) {
-            return query_describe(&tokens);
+            return self.query_user_describe(&tokens);
         }
         let stmt = parse(sql)?;
         if stmt.limit > 100_000 {
@@ -57,7 +77,7 @@ impl<'a> SqlEngine<'a> {
             "snapshots" => self.query_snapshots(&stmt),
             "symbols" => self.query_symbols(&stmt),
             "ticks" => self.query_ticks(&stmt),
-            other => Err(SqlError::Syntax(format!("unknown table {other}"))),
+            other => self.query_user(other, &stmt),
         }
     }
 }
@@ -70,6 +90,8 @@ struct Stmt {
     period: Option<Period>,
     ts_from: Option<i64>,
     ts_to: Option<i64>,
+    eq_column: Option<String>,
+    eq_value: Option<String>,
     limit: u64,
 }
 
@@ -131,6 +153,8 @@ fn parse(sql: &str) -> Result<Stmt, SqlError> {
     let mut period = None;
     let mut ts_from = None;
     let mut ts_to = None;
+    let mut eq_column = None;
+    let mut eq_value = None;
     if tokens
         .get(index)
         .map(|t| t.eq_ignore_ascii_case("where"))
@@ -181,6 +205,9 @@ fn parse(sql: &str) -> Result<Stmt, SqlError> {
                     symbol = Some(unquote(&value));
                 } else if field == "period" {
                     period = Period::parse(&unquote(&value));
+                } else {
+                    eq_column = Some(field);
+                    eq_value = Some(unquote(&value));
                 }
             }
             if tokens
@@ -208,6 +235,8 @@ fn parse(sql: &str) -> Result<Stmt, SqlError> {
         period,
         ts_from,
         ts_to,
+        eq_column,
+        eq_value,
         limit,
     })
 }
@@ -362,6 +391,68 @@ impl<'a> SqlEngine<'a> {
         rows.truncate(stmt.limit as usize);
         Ok(QueryResult { columns, rows })
     }
+
+    fn query_user(&self, table: &str, stmt: &Stmt) -> Result<QueryResult, SqlError> {
+        let schema = self
+            .engine
+            .table_schema(table)
+            .ok_or_else(|| SqlError::Syntax(format!("unknown table {table}")))?
+            .clone();
+        let filter = match (&stmt.eq_column, &stmt.eq_value) {
+            (Some(column), Some(raw)) => {
+                let definition = schema
+                    .columns
+                    .iter()
+                    .find(|item| item.name == *column)
+                    .ok_or_else(|| SqlError::Syntax(format!("unknown column {column}")))?;
+                Some((column.clone(), parse_cell(definition.ty, raw)?))
+            }
+            _ => None,
+        };
+        let (columns, rows) = self
+            .engine
+            .scan_table(
+                table,
+                filter.as_ref().map(|(column, _)| column.as_str()),
+                filter.as_ref().map(|(_, cell)| cell),
+                stmt.limit as usize,
+            )
+            .map_err(map_store)?;
+        Ok(QueryResult { columns, rows })
+    }
+
+    fn query_user_describe(&self, tokens: &[String]) -> Result<QueryResult, SqlError> {
+        if tokens.len() != 2 {
+            return Err(SqlError::Syntax("describe table".into()));
+        }
+        let table = tokens[1].trim_matches('\'').to_ascii_lowercase();
+        if let Some(schema) = self.engine.table_schema(&table) {
+            let rows = schema
+                .columns
+                .iter()
+                .map(|column| {
+                    let mut note = column.ty.as_str().to_string();
+                    if column.primary_key {
+                        note.push_str(" PRIMARY KEY");
+                    }
+                    if let Some(index) = schema
+                        .indexes
+                        .iter()
+                        .find(|index| index.column == column.name)
+                    {
+                        note.push_str(" INDEX ");
+                        note.push_str(&index.name);
+                    }
+                    row(&column.name, &note)
+                })
+                .collect();
+            return Ok(QueryResult {
+                columns: vec!["column".into(), "note".into()],
+                rows,
+            });
+        }
+        query_describe(tokens)
+    }
 }
 
 fn aggregate(rows: &[KlineBody], agg: &Agg) -> Result<String, SqlError> {
@@ -434,6 +525,151 @@ fn kline_i128(row: &KlineBody, column: &str) -> i128 {
         "volume" => row.volume as i128,
         "amount" => row.amount as i128,
         _ => 0,
+    }
+}
+
+fn exec_create(engine: &mut Engine, tokens: &[String]) -> Result<QueryResult, SqlError> {
+    let mut index = 0;
+    expect(tokens, &mut index, "create")?;
+    expect(tokens, &mut index, "table")?;
+    let name = tokens
+        .get(index)
+        .ok_or_else(|| SqlError::Syntax("table".into()))?
+        .to_ascii_lowercase();
+    index += 1;
+    expect(tokens, &mut index, "(")?;
+    let mut columns = Vec::new();
+    let mut indexes = Vec::new();
+    while tokens.get(index).is_some_and(|token| token != ")") {
+        if tokens[index].eq_ignore_ascii_case("index") {
+            index += 1;
+            let index_name = tokens
+                .get(index)
+                .ok_or_else(|| SqlError::Syntax("index".into()))?
+                .to_ascii_lowercase();
+            index += 1;
+            expect(tokens, &mut index, "(")?;
+            let column = tokens
+                .get(index)
+                .ok_or_else(|| SqlError::Syntax("index column".into()))?
+                .to_ascii_lowercase();
+            index += 1;
+            expect(tokens, &mut index, ")")?;
+            indexes.push(IndexDef {
+                name: index_name,
+                column,
+            });
+        } else {
+            let column_name = tokens
+                .get(index)
+                .ok_or_else(|| SqlError::Syntax("column".into()))?
+                .to_ascii_lowercase();
+            index += 1;
+            let type_name = tokens
+                .get(index)
+                .ok_or_else(|| SqlError::Syntax("type".into()))?;
+            let ty = ColumnType::parse(&type_name.to_ascii_uppercase())
+                .ok_or_else(|| SqlError::Syntax(format!("unknown type {type_name}")))?;
+            index += 1;
+            let mut primary_key = false;
+            if tokens
+                .get(index)
+                .is_some_and(|token| token.eq_ignore_ascii_case("primary"))
+            {
+                index += 1;
+                expect(tokens, &mut index, "key")?;
+                primary_key = true;
+            }
+            columns.push(ColumnDef {
+                name: column_name,
+                ty,
+                primary_key,
+            });
+        }
+        if tokens.get(index).is_some_and(|token| token == ",") {
+            index += 1;
+        }
+    }
+    expect(tokens, &mut index, ")")?;
+    engine
+        .create_table(TableSchema {
+            name,
+            columns,
+            indexes,
+        })
+        .map_err(map_store)?;
+    Ok(QueryResult {
+        columns: vec!["result".into()],
+        rows: vec![vec!["created".into()]],
+    })
+}
+
+fn exec_insert(engine: &mut Engine, tokens: &[String]) -> Result<QueryResult, SqlError> {
+    let mut index = 0;
+    expect(tokens, &mut index, "insert")?;
+    expect(tokens, &mut index, "into")?;
+    let name = tokens
+        .get(index)
+        .ok_or_else(|| SqlError::Syntax("table".into()))?
+        .to_ascii_lowercase();
+    index += 1;
+    expect(tokens, &mut index, "values")?;
+    expect(tokens, &mut index, "(")?;
+    let schema = engine
+        .table_schema(&name)
+        .cloned()
+        .ok_or(SqlError::NotFound)?;
+    let mut raws = Vec::new();
+    while tokens.get(index).is_some_and(|token| token != ")") {
+        raws.push(unquote(
+            tokens
+                .get(index)
+                .ok_or_else(|| SqlError::Syntax("value".into()))?,
+        ));
+        index += 1;
+        if tokens.get(index).is_some_and(|token| token == ",") {
+            index += 1;
+        }
+    }
+    expect(tokens, &mut index, ")")?;
+    if raws.len() != schema.columns.len() {
+        return Err(SqlError::Syntax("column count".into()));
+    }
+    let values = raws
+        .iter()
+        .zip(&schema.columns)
+        .map(|(raw, column)| parse_cell(column.ty, raw))
+        .collect::<Result<Vec<_>, _>>()?;
+    engine.insert_row(&name, &values).map_err(map_store)?;
+    Ok(QueryResult {
+        columns: vec!["result".into()],
+        rows: vec![vec!["inserted".into()]],
+    })
+}
+
+fn parse_cell(ty: ColumnType, raw: &str) -> Result<Cell, SqlError> {
+    match ty {
+        ColumnType::Int64 => raw
+            .parse::<i64>()
+            .map(Cell::Int64)
+            .map_err(|_| SqlError::Syntax("type mismatch".into())),
+        ColumnType::Bool => match raw.to_ascii_lowercase().as_str() {
+            "true" => Ok(Cell::Bool(true)),
+            "false" => Ok(Cell::Bool(false)),
+            _ => Err(SqlError::Syntax("type mismatch".into())),
+        },
+        ColumnType::String => Ok(Cell::String(raw.to_string())),
+    }
+}
+
+fn map_store(err: StoreError) -> SqlError {
+    match err {
+        StoreError::NotFound => SqlError::NotFound,
+        StoreError::TableExists => SqlError::Syntax("table already exists".into()),
+        StoreError::DuplicateKey => SqlError::Syntax("duplicate key".into()),
+        StoreError::TypeMismatch => SqlError::Syntax("type mismatch".into()),
+        StoreError::Schema(message) => SqlError::Syntax(message),
+        other => SqlError::Store(other.to_string()),
     }
 }
 
@@ -643,6 +879,49 @@ mod tests {
         assert!(sql
             .query("SELECT last FROM snapshots WHERE symbol = '000001'")
             .is_err());
+    }
+
+    #[test]
+    fn user_table_keeps_its_index_and_survives_reopen() {
+        let (dir, mut engine) = engine();
+        let created = SqlEngine::execute(
+            &mut engine,
+            "CREATE TABLE note (id INT64 PRIMARY KEY, code STRING, active BOOL, INDEX idx_code (code))",
+        )
+        .unwrap();
+        assert_eq!(created.rows[0][0], "created");
+        SqlEngine::execute(
+            &mut engine,
+            "INSERT INTO note VALUES (1, 'SSE:600000', true)",
+        )
+        .unwrap();
+        SqlEngine::execute(
+            &mut engine,
+            "INSERT INTO note VALUES (2, 'SZSE:000001', false)",
+        )
+        .unwrap();
+        assert!(
+            SqlEngine::execute(&mut engine, "INSERT INTO note VALUES (1, 'again', true)").is_err()
+        );
+        assert!(SqlEngine::execute(&mut engine, "CREATE TABLE note (id INT64)").is_err());
+        assert!(SqlEngine::execute(&mut engine, "CREATE TABLE ticks (id INT64)").is_err());
+        assert!(SqlEngine::execute(&mut engine, "CREATE TABLE bad (id FLOAT)").is_err());
+        drop(engine);
+        let engine = Engine::open(&dir).unwrap();
+        let sql = SqlEngine::new(&engine);
+        let rows = sql
+            .query("SELECT * FROM note WHERE code = 'SSE:600000'")
+            .unwrap();
+        assert_eq!(rows.rows.len(), 1);
+        assert_eq!(rows.rows[0][0], "1");
+        assert_eq!(rows.rows[0][2], "true");
+        let described = sql.query("DESCRIBE note").unwrap();
+        assert!(described
+            .rows
+            .iter()
+            .any(|row| row[0] == "id" && row[1].contains("PRIMARY KEY")));
+        let listed = sql.query("SHOW TABLES").unwrap();
+        assert!(listed.rows.iter().any(|row| row[0] == "note"));
     }
 
     #[test]

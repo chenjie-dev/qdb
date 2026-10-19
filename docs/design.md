@@ -519,6 +519,33 @@ describe  = "DESCRIBE" table | "DESC" table
 
 没有查询用的网络端口。PostgreSQL 线协议和上面的行文本协议仍不在本版本。
 
+### 5.5 建表
+
+用户表和行情四张表分开。`symbols`、`ticks`、`snapshots`、`klines` 不能被 `CREATE TABLE` 覆盖。
+
+支持的字段类型只有三种，都按小端写入 WAL，不使用浮点：
+
+| 类型 | 含义 |
+| --- | --- |
+| `INT64` | 有符号 64 位整数。价格、数量、时间和序号用它 |
+| `STRING` | UTF-8 文本，最长 1024 字节 |
+| `BOOL` | `true` 或 `false` |
+
+一张表至少一列，最多一个 `PRIMARY KEY`。主键重复时插入失败。`INDEX 索引名 (列)` 是二级索引，不要求唯一，只用于等值查找。没有索引的列仍可在 `WHERE` 里过滤，实现会扫描全表。
+
+```text
+CREATE TABLE name (
+  id INT64 PRIMARY KEY,
+  code STRING,
+  active BOOL,
+  INDEX idx_code (code)
+)
+INSERT INTO name VALUES (1, 'SSE:600000', true)
+SELECT * FROM name WHERE code = 'SSE:600000'
+```
+
+`INSERT` 的值顺序与建表列顺序一致。建表和插入各占一个 `seq`，类型号分别是 8 和 9。定义写在 WAL 里，重启后仍在。共享内存帧只发布表名；完整定义以 WAL 为准。
+
 ## 6. 订阅
 
 发布模型：写入者把已提交帧放进环形缓冲后，所有跟上的读者都能看见。过滤在订阅网关做。共享内存读者自己过滤。

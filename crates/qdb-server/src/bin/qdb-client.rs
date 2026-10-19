@@ -272,7 +272,7 @@ fn complete_line(line: &str, pos: usize, words: &CompletionWords) -> (usize, Vec
             words.tables.clone()
         }
         _ if last == Some("SHOW") => vec!["TABLES".into(), "DATABASES".into()],
-        _ if last == Some("CREATE") => vec!["DATABASE".into()],
+        _ if last == Some("CREATE") => vec!["DATABASE".into(), "TABLE".into()],
         _ if last == Some("FROM") => words.tables.clone(),
         _ if last == Some(".WATCH") || last == Some(".SUB") || last == Some("SUBSCRIBE") => {
             let mut options = vec!["snapshots".into(), "ticks".into(), "klines".into()];
@@ -497,6 +497,19 @@ fn execute(session: &Session, line: &str) -> Result<String, String> {
     } else {
         line.to_string()
     };
+    let head = statement
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if head == "create" || head == "insert" {
+        let catalog = Catalog::open_read(&session.instance).map_err(|err| err.to_string())?;
+        let mut engine = catalog
+            .open_database(&session.database)
+            .map_err(|err| err.to_string())?;
+        let result = SqlEngine::execute(&mut engine, &statement).map_err(|err| err.to_string())?;
+        return Ok(format_result(&result));
+    }
     let engine = Engine::open_read(&session.path()?).map_err(|err| err.to_string())?;
     let result = SqlEngine::new(&engine)
         .query(&statement)
@@ -508,11 +521,18 @@ fn describe_all(session: &Session) -> Result<String, String> {
     let engine = Engine::open_read(&session.path()?).map_err(|err| err.to_string())?;
     let sql = SqlEngine::new(&engine);
     let mut out = String::new();
-    for table in ["symbols", "ticks", "snapshots", "klines"] {
+    let mut names = vec![
+        "symbols".to_string(),
+        "ticks".to_string(),
+        "snapshots".to_string(),
+        "klines".to_string(),
+    ];
+    names.extend(engine.table_names());
+    for table in names {
         let result = sql
             .query(&format!("DESCRIBE {table}"))
             .map_err(|err| err.to_string())?;
-        out.push_str(table);
+        out.push_str(&table);
         out.push('\n');
         out.push_str(&format_result(&result));
         out.push('\n');

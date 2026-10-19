@@ -46,6 +46,8 @@ pub enum MsgType {
     SymbolUpsert = 5,
     ClockTick = 6,
     GapAck = 7,
+    TableSchema = 8,
+    RowInsert = 9,
 }
 
 impl MsgType {
@@ -58,6 +60,8 @@ impl MsgType {
             5 => Self::SymbolUpsert,
             6 => Self::ClockTick,
             7 => Self::GapAck,
+            8 => Self::TableSchema,
+            9 => Self::RowInsert,
             _ => return None,
         })
     }

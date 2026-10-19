@@ -4,6 +4,23 @@
 
 本版本没有 `INSERT`、`UPDATE`、`DELETE`、`JOIN`、子查询和函数嵌套。写入走 [库接口](library.md)。
 
+## 建表
+
+用户表使用三种类型：`INT64`、`STRING`、`BOOL`。价格和时间用 `INT64`，不用浮点。`STRING` 最长 1024 字节。一张表最多一个 `PRIMARY KEY`。`INDEX` 是不唯一的二级索引，供 `WHERE 列 = 值` 查找。
+
+```sql
+CREATE TABLE note (
+  id INT64 PRIMARY KEY,
+  code STRING,
+  active BOOL,
+  INDEX idx_code (code)
+);
+INSERT INTO note VALUES (1, 'SSE:600000', true);
+SELECT * FROM note WHERE code = 'SSE:600000';
+```
+
+`INSERT` 的值按建表时的列顺序书写。不能建名为 `symbols`、`ticks`、`snapshots`、`klines` 的表。建表和插入会以写入者身份打开当前库。
+
 ## 目录
 
 ```sql
