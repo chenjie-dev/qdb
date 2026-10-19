@@ -1,0 +1,11 @@
+[package]
+name = "qdb-wal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+crc32fast.workspace = true
+qdb-abi.workspace = true
+thiserror.workspace = true

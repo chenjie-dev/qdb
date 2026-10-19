@@ -1,0 +1,11 @@
+[package]
+name = "qdb-sub"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+qdb-abi.workspace = true
+qdb-store.workspace = true
+thiserror.workspace = true

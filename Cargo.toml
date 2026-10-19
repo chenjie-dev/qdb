@@ -1,6 +1,31 @@
 [workspace]
 resolver = "2"
-members = []
+members = [
+    "crates/qdb-abi",
+    "crates/qdb-shm",
+    "crates/qdb-wal",
+    "crates/qdb-agg",
+    "crates/qdb-store",
+    "crates/qdb-sql",
+    "crates/qdb-sub",
+    "crates/qdb-server",
+]
 
-# 实现阶段再加入 crates。当前仓库只有设计，见 docs/design.md。
-# 约定：edition = "2021"，MSRV = 1.78，热路径不引入 serde。
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.78"
+
+[workspace.dependencies]
+thiserror = "1"
+crc32fast = "1"
+memmap2 = "0.9"
+libc = "0.2"
+qdb-abi = { path = "crates/qdb-abi" }
+qdb-shm = { path = "crates/qdb-shm" }
+qdb-wal = { path = "crates/qdb-wal" }
+qdb-agg = { path = "crates/qdb-agg" }
+qdb-store = { path = "crates/qdb-store" }
+qdb-sql = { path = "crates/qdb-sql" }
+qdb-sub = { path = "crates/qdb-sub" }

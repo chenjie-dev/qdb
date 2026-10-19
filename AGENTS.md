@@ -39,6 +39,7 @@ QDB 是面向股市行情的内存数据库，用 Rust 实现。单机上只有�
 | 线程、原子量、共享内存、`unsafe` | skill **rust-concurrency-design** |
 | 成交/报价、K 线、序号、缺口、快照加增量 | skill **market-data-systems** |
 | A 股代码、时段、竞价、涨跌停、复权 | skill **a-share-market** |
+| 币安、24 小时连续交易、UTC 日线 | skill **binance-market** |
 | 共享内存、WAL、`unsafe` 的差分审查 | skill **differential-review** |
 
 设计第 13 节的 M1–M5 是最低可用版本。验收标准以那一节为准。
@@ -88,6 +89,7 @@ QDB 是面向股市行情的内存数据库，用 Rust 实现。单机上只有�
 | 并发、共享内存 | `rust-concurrency-design` |
 | 行情概念 | `market-data-systems` |
 | A 股制度 | `a-share-market` |
+| 币安 / 24 小时行情 | `binance-market` |
 | 拷问方案并落术语 / ADR | `grill-with-docs` |
 | 按设计实现 | `implement`（配 `tdd`） |
 | 深模块 / seam | `codebase-design` |

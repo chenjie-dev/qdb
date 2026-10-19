@@ -30,6 +30,7 @@
 |---|---|
 | [market-data-systems](./market-data-systems/SKILL.md) | 成交与报价、事件时间、K 线、序号、快照加增量 |
 | [a-share-market](./a-share-market/SKILL.md) | 交易所代码、时段、竞价、涨跌停、复权 |
+| [binance-market](./binance-market/SKILL.md) | 24 小时连续交易、UTC 日线、深度续传 |
 
 ### 文档与领域
 
