@@ -16,7 +16,7 @@ description: >-
 1. 读根目录 [`AGENTS.md`](../../../AGENTS.md) 的硬性约束。术语冲突时以 [`CONTEXT.md`](../../../CONTEXT.md) 为准。
 2. 按改动加载前备技能：新类型或 crate 用 `rust-program-design`；线程、原子或共享内存用 `rust-concurrency-design`；成交、K 线、序号或订阅用 `market-data-systems`；A 股代码、时段、竞价或复权用 `a-share-market`；币安或 24 小时连续交易用 `binance-market`。
 3. 只打开 [`docs/design.md`](../../../docs/design.md) 里这一改动对应的节，加上第 13 节里该里程碑的验收。
-4. 确认落点。没有点名的能力停在设计里，不实现。
+4. 确认落点。没有点名的能力停在设计里，不实现。券商级缺口见 [`docs/2026-10-19-enterprise-broker-md.md`](../../../docs/2026-10-19-enterprise-broker-md.md)，任务没点名就不做。
 
 | 改动意图 | 落点 |
 |---|---|
