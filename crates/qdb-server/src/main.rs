@@ -6,7 +6,7 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use qdb_store::{Catalog, Engine, Metrics};
+use qdb_store::{replay_bytes, Catalog, Engine, Metrics};
 
 use crate::feed::{
     apply_docs, apply_quotes, apply_trades, doc_json, klines_json, query_param, read_request,
@@ -93,6 +93,33 @@ fn handle(
             );
         }
     };
+    if route == "/v1/replay" && req.method == "POST" {
+        let mut guard = match engine.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return write_http(
+                    &mut stream,
+                    400,
+                    "application/json",
+                    "{\"error\":\"engine lock\"}",
+                );
+            }
+        };
+        return match replay_bytes(&mut guard, &req.body) {
+            Ok(changes) => write_http(
+                &mut stream,
+                200,
+                "application/json",
+                &format!("{{\"played\":{}}}", changes.len()),
+            ),
+            Err(err) => write_http(
+                &mut stream,
+                400,
+                "application/json",
+                &format!("{{\"error\":\"{err}\"}}"),
+            ),
+        };
+    }
     if route == "/v1/trades" && req.method == "POST" {
         return match apply_trades(&engine, &req.body) {
             Ok(body) => write_http(&mut stream, 200, "application/json", &body),

@@ -34,6 +34,19 @@ qdb> USE ashare
 
 换库之后，查询和 `.watch` 只看当前库。服务进程写行情时用查询参数 `db` 指定库，缺省仍是 `default`。
 
+## 转储和回放
+
+`.dump` 把当前库已经落盘的行情写成文件。`.restore` 把这份文件写回当前库；当前库必须还没有行情。之后打开该库，成交、报价和 K 线与转储时一致。
+
+```text
+qdb> .dump market.qdump
+qdb> CREATE DATABASE copy
+qdb> USE copy
+qdb> .restore market.qdump
+```
+
+`.replay` 按文件里的顺序把成交和报价再打一遍，不写入当前库。要把这段行情写进正在运行的库，向该库发送 `POST /v1/replay?db=库名`，正文是转储文件的字节。
+
 ## 表结构
 
 ```text

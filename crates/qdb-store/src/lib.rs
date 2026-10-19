@@ -17,7 +17,9 @@ use qdb_wal::{read_from, read_path, WalAppender, WalRead, WalRecord};
 use thiserror::Error;
 
 mod catalog;
+mod dump;
 pub use catalog::{Catalog, CatalogError};
+pub use dump::{playback, replay_bytes, replay_file};
 
 #[derive(Debug, Error)]
 pub enum StoreError {

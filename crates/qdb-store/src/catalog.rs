@@ -4,7 +4,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use qdb_wal::WalAppender;
+use qdb_wal::{read_dump, read_path, replace_wal, write_dump, WalAppender};
 use thiserror::Error;
 
 use crate::{Engine, StoreError};
@@ -17,6 +17,8 @@ pub enum CatalogError {
     InvalidName,
     #[error("database already exists")]
     Exists,
+    #[error("database is not empty")]
+    NotEmpty,
     #[error("database not found")]
     NotFound,
     #[error(transparent)]
@@ -111,6 +113,34 @@ impl Catalog {
         Ok(Engine::open_read(&self.path(name)?)?)
     }
 
+    /// 把该库已经提交的行情写成转储文件。
+    pub fn dump(&self, name: &str, file: &Path) -> Result<u64, CatalogError> {
+        let loaded = read_path(&self.path(name)?.join("wal/wal-1.qwal")).map_err(io)?;
+        if loaded.crc_failed {
+            return Err(StoreError::Crc.into());
+        }
+        write_dump(file, &loaded.records).map_err(io)?;
+        Ok(loaded.records.len() as u64)
+    }
+
+    /// 把转储文件写回一个空库的 WAL。打开该库后得到原来的序号和 K 线。
+    pub fn restore(&self, name: &str, file: &Path) -> Result<u64, CatalogError> {
+        let wal_path = self.path(name)?.join("wal/wal-1.qwal");
+        let existing = read_path(&wal_path).map_err(io)?;
+        if existing.crc_failed {
+            return Err(StoreError::Crc.into());
+        }
+        if !existing.records.is_empty() {
+            return Err(CatalogError::NotEmpty);
+        }
+        let dump = read_dump(file).map_err(io)?;
+        if dump.crc_failed {
+            return Err(StoreError::Crc.into());
+        }
+        replace_wal(&wal_path, &dump.records).map_err(io)?;
+        Ok(dump.records.len() as u64)
+    }
+
     fn resolved_path(&self, name: &str) -> PathBuf {
         if name == "default" && self.legacy_default() && !self.named_wal("default") {
             self.root.clone()
@@ -199,6 +229,110 @@ mod tests {
         assert_eq!(catalog.path("default").unwrap(), root);
         let read = catalog.open_database_read("default").unwrap();
         assert!(read.resolve("SSE:600000").is_ok());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn dump_restores_the_same_bars_and_replay_repeats_the_prices() {
+        let root = temp_root("dump");
+        let catalog = Catalog::open(&root).unwrap();
+        let mut source = catalog.open_database("default").unwrap();
+        source
+            .write_trade("SSE", "600000", 1_704_160_200_000_000_000, 10, 2)
+            .unwrap();
+        source
+            .write_trade("SSE", "600000", 1_704_160_230_000_000_000, 12, 3)
+            .unwrap();
+        let bars = source.klines(source.resolve("SSE:600000").unwrap(), qdb_abi::Period::M1);
+        drop(source);
+        let file = root.join("market.qdump");
+        let n = catalog.dump("default", &file).unwrap();
+        assert!(n >= 2);
+        catalog.create("copy").unwrap();
+        catalog.restore("copy", &file).unwrap();
+        let copy = catalog.open_database_read("copy").unwrap();
+        let id = copy.resolve("SSE:600000").unwrap();
+        assert_eq!(copy.klines(id, qdb_abi::Period::M1), bars);
+        assert_eq!(copy.ticks(id).len(), 2);
+        assert!(catalog.restore("default", &file).is_err());
+        let played = crate::playback(&file).unwrap();
+        let prices: Vec<i64> = played
+            .iter()
+            .filter(|change| change.table == "ticks")
+            .map(|change| change.price)
+            .collect();
+        assert_eq!(prices, vec![10, 12]);
+        let source = catalog.open_database_read("default").unwrap();
+        assert_eq!(source.ticks(source.resolve("SSE:600000").unwrap()).len(), 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn rejects_invalid_duplicate_and_unknown_database_names() {
+        let root = temp_root("names");
+        let catalog = Catalog::open(&root).unwrap();
+        let long = "a".repeat(33);
+        for name in ["", "1share", "bad-name", "a/b", "..", long.as_str()] {
+            assert!(
+                matches!(catalog.create(name), Err(CatalogError::InvalidName)),
+                "{name}"
+            );
+        }
+        assert!(matches!(catalog.create("_ok"), Ok(_)));
+        assert!(matches!(catalog.create("_ok"), Err(CatalogError::Exists)));
+        assert!(matches!(
+            catalog.dump("missing", &root.join("x.qdump")),
+            Err(CatalogError::NotFound)
+        ));
+        assert!(matches!(
+            catalog.restore("missing", &root.join("x.qdump")),
+            Err(CatalogError::NotFound)
+        ));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn restore_rejects_a_bad_dump_and_replay_keeps_quote_prices() {
+        let root = temp_root("quote");
+        let catalog = Catalog::open(&root).unwrap();
+        let mut source = catalog.open_database("default").unwrap();
+        source
+            .write_quote(
+                "SSE",
+                "600000",
+                1_704_160_200_000_000_000,
+                &qdb_abi::TickQuote {
+                    last: 11,
+                    volume: 0,
+                    amount: 0,
+                    bid_px: [10, 0, 0, 0, 0],
+                    bid_qty: [1, 0, 0, 0, 0],
+                    ask_px: [12, 0, 0, 0, 0],
+                    ask_qty: [1, 0, 0, 0, 0],
+                },
+            )
+            .unwrap();
+        source
+            .write_clock("SSE", 1_704_160_260_000_000_000)
+            .unwrap();
+        drop(source);
+        let file = root.join("tape.qdump");
+        catalog.dump("default", &file).unwrap();
+        std::fs::write(&file, b"NOTADUMP").unwrap();
+        catalog.create("copy").unwrap();
+        assert!(matches!(
+            catalog.restore("copy", &file),
+            Err(CatalogError::Io(_))
+        ));
+        catalog.dump("default", &file).unwrap();
+        catalog.restore("copy", &file).unwrap();
+        let copy = catalog.open_database_read("copy").unwrap();
+        let quote = copy.quote(copy.resolve("SSE:600000").unwrap()).unwrap();
+        assert_eq!((quote.last, quote.bid_px[0], quote.ask_px[0]), (11, 10, 12));
+        let played = crate::playback(&file).unwrap();
+        assert!(played
+            .iter()
+            .any(|change| change.table == "snapshots" && change.bid == 10 && change.ask == 12));
         let _ = fs::remove_dir_all(root);
     }
 }

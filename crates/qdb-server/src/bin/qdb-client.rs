@@ -6,7 +6,7 @@ use std::process::ExitCode;
 
 use qdb_abi::Period;
 use qdb_sql::{QueryResult, SqlEngine};
-use qdb_store::{Catalog, Change, Engine};
+use qdb_store::{playback, Catalog, Change, Engine};
 
 fn main() -> ExitCode {
     let args = match Args::parse(std::env::args().skip(1)) {
@@ -171,6 +171,12 @@ fn catalog_command(session: &mut Session, line: &str) -> Option<Result<String, S
         [command, name] if command == "USE" => {
             Some(use_database(session, parts[1]).map(|name| format!("database {name}\n")))
         }
+        _ if upper
+            .first()
+            .is_some_and(|word| word == ".DUMP" || word == ".RESTORE" || word == ".REPLAY") =>
+        {
+            Some(file_command(session, &upper[0], parts.get(1).copied()))
+        }
         _ => None,
     }
 }
@@ -191,6 +197,41 @@ fn create_database(instance: &Path, name: &str) -> Result<(), String> {
         .create(name)
         .map(|_| ())
         .map_err(|err| err.to_string())
+}
+
+fn file_command(session: &Session, command: &str, file: Option<&str>) -> Result<String, String> {
+    let Some(file) = file else {
+        return Err("missing file path".into());
+    };
+    let path = Path::new(file);
+    let catalog = Catalog::open_read(&session.instance).map_err(|err| err.to_string())?;
+    match command {
+        ".DUMP" => {
+            let n = catalog
+                .dump(&session.database, path)
+                .map_err(|err| err.to_string())?;
+            Ok(format!("dumped {n} records\n"))
+        }
+        ".RESTORE" => {
+            let n = catalog
+                .restore(&session.database, path)
+                .map_err(|err| err.to_string())?;
+            Ok(format!("restored {n} records\n"))
+        }
+        ".REPLAY" => {
+            let changes = playback(path).map_err(|err| err.to_string())?;
+            let mut out = String::new();
+            for change in changes
+                .iter()
+                .filter(|change| change.table == "ticks" || change.table == "snapshots")
+            {
+                out.push_str(&format_change(change));
+                out.push('\n');
+            }
+            Ok(out)
+        }
+        _ => Err("unknown command. try .help".into()),
+    }
 }
 
 fn use_database(session: &mut Session, name: &str) -> Result<String, String> {
@@ -467,6 +508,9 @@ qdb-client [数据目录] [-c 语句]
   SHOW TABLES
   DESCRIBE 表名
   SELECT ...
+  .dump 文件
+  .restore 文件
+  .replay 文件
   .watch [snapshots|ticks|klines] 交易所:代码 [周期]
 
   .tables          列出表
@@ -580,6 +624,56 @@ mod tests {
             "SELECT price FROM ticks WHERE symbol = 'SSE:600000'",
         );
         assert!(rows.is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dump_restores_into_an_empty_database_and_replay_does_not_require_it() {
+        let dir = sample();
+        let mut session = Session::new(dir.clone());
+        let dump = dir.join("tape.qdump");
+        let dumped = catalog_command(&mut session, &format!(".dump {}", dump.display()))
+            .unwrap()
+            .unwrap();
+        assert!(dumped.contains("dumped"));
+        catalog_command(&mut session, "CREATE DATABASE copy")
+            .unwrap()
+            .unwrap();
+        catalog_command(&mut session, "USE copy").unwrap().unwrap();
+        catalog_command(&mut session, &format!(".restore {}", dump.display()))
+            .unwrap()
+            .unwrap();
+        let rows = execute(
+            &session,
+            "SELECT price FROM ticks WHERE symbol = 'SSE:600000'",
+        )
+        .unwrap();
+        assert!(rows.contains("1050000"));
+        catalog_command(&mut session, "USE default")
+            .unwrap()
+            .unwrap();
+        assert!(
+            catalog_command(&mut session, &format!(".restore {}", dump.display()))
+                .unwrap()
+                .is_err()
+        );
+        let replay = catalog_command(&mut session, &format!(".replay {}", dump.display()))
+            .unwrap()
+            .unwrap();
+        assert!(replay.contains("1050000"));
+        let still = execute(
+            &session,
+            "SELECT price FROM ticks WHERE symbol = 'SSE:600000'",
+        )
+        .unwrap();
+        assert!(still.contains("1050000"));
+        std::fs::write(&dump, b"NOTADUMP").unwrap();
+        catalog_command(&mut session, "USE copy").unwrap().unwrap();
+        assert!(
+            catalog_command(&mut session, &format!(".restore {}", dump.display()))
+                .unwrap()
+                .is_err()
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

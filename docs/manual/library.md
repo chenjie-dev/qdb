@@ -24,6 +24,8 @@ let mut ashare = catalog.open_database("ashare")?;
 
 每个库的 `seq` 从 1 单独递增。只读用 `open_read` 和 `open_database_read`。
 
+`dump` 把库里已经提交的记录写成 `QDBDUMP1` 文件。`restore` 写回一个空库的 WAL，再打开就得到原来的序号和 K 线。`replay_file` 把这些记录按顺序重新写入一个打开的库，并分配新的序号。`playback` 只回放并返回成交和报价，不改调用方的库。
+
 ## 打开
 
 ```rust

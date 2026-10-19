@@ -54,16 +54,9 @@ impl WalAppender {
     }
 
     pub fn append(&mut self, record: &WalRecord) -> Result<(), WalError> {
-        let body = encode_body(record);
-        let crc = crc32fast::hash(&body);
+        let bytes = encode_framed(record);
         self.file
-            .write_all(&crc.to_le_bytes())
-            .map_err(|err| WalError::Io(err.to_string()))?;
-        self.file
-            .write_all(&(body.len() as u32).to_le_bytes())
-            .map_err(|err| WalError::Io(err.to_string()))?;
-        self.file
-            .write_all(&body)
+            .write_all(&bytes)
             .map_err(|err| WalError::Io(err.to_string()))?;
         Ok(())
     }
@@ -146,6 +139,69 @@ fn parse_bytes(bytes: &[u8], base: u64) -> Result<WalRead, WalError> {
         last_good_seq,
         consumed: base + offset as u64,
     })
+}
+
+pub const DUMP_MAGIC: &[u8; 8] = b"QDBDUMP1";
+
+pub fn write_dump(path: &Path, records: &[WalRecord]) -> Result<(), WalError> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent).map_err(|err| WalError::Io(err.to_string()))?;
+        }
+    }
+    let mut file = File::create(path).map_err(|err| WalError::Io(err.to_string()))?;
+    file.write_all(DUMP_MAGIC)
+        .map_err(|err| WalError::Io(err.to_string()))?;
+    for record in records {
+        file.write_all(&encode_framed(record))
+            .map_err(|err| WalError::Io(err.to_string()))?;
+    }
+    file.sync_all()
+        .map_err(|err| WalError::Io(err.to_string()))?;
+    Ok(())
+}
+
+pub fn parse_dump_body(bytes: &[u8]) -> Result<WalRead, WalError> {
+    parse_bytes(bytes, 0)
+}
+
+pub fn read_dump(path: &Path) -> Result<WalRead, WalError> {
+    let mut file = File::open(path).map_err(|err| WalError::Io(err.to_string()))?;
+    let mut magic = [0u8; 8];
+    file.read_exact(&mut magic)
+        .map_err(|err| WalError::Io(err.to_string()))?;
+    if &magic != DUMP_MAGIC {
+        return Err(WalError::Io("not a qdb dump".into()));
+    }
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .map_err(|err| WalError::Io(err.to_string()))?;
+    parse_bytes(&bytes, 0)
+}
+
+/// 用这些记录替换 WAL 文件。调用方要保证没有别的写入者正打开它。
+pub fn replace_wal(path: &Path, records: &[WalRecord]) -> Result<(), WalError> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|err| WalError::Io(err.to_string()))?;
+    }
+    let mut file = File::create(path).map_err(|err| WalError::Io(err.to_string()))?;
+    for record in records {
+        file.write_all(&encode_framed(record))
+            .map_err(|err| WalError::Io(err.to_string()))?;
+    }
+    file.sync_all()
+        .map_err(|err| WalError::Io(err.to_string()))?;
+    Ok(())
+}
+
+fn encode_framed(record: &WalRecord) -> Vec<u8> {
+    let body = encode_body(record);
+    let crc = crc32fast::hash(&body);
+    let mut out = Vec::with_capacity(8 + body.len());
+    out.extend_from_slice(&crc.to_le_bytes());
+    out.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    out.extend_from_slice(&body);
+    out
 }
 
 fn encode_body(record: &WalRecord) -> Vec<u8> {
@@ -246,6 +302,43 @@ mod tests {
         assert_eq!(next.records.len(), 1);
         assert_eq!(next.records[0].seq, 2);
         assert!(next.consumed > first.consumed);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn dump_rejects_bad_magic_and_ignores_a_short_tail() {
+        let dir = std::env::temp_dir().join(format!("qdb-dump-edge-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tape.qdump");
+        std::fs::write(&path, b"NOTADUMP").unwrap();
+        assert!(read_dump(&path).is_err());
+
+        write_dump(&path, &[]).unwrap();
+        let mut raw = std::fs::read(&path).unwrap();
+        raw.extend_from_slice(&[1, 2, 3, 4]);
+        std::fs::write(&path, &raw).unwrap();
+        let read = read_dump(&path).unwrap();
+        assert!(!read.crc_failed);
+        assert!(read.records.is_empty());
+
+        write_dump(
+            &path,
+            &[WalRecord {
+                seq: 1,
+                msg_type: 1,
+                flags: 0,
+                payload: vec![9, 9, 9, 9],
+            }],
+        )
+        .unwrap();
+        let mut raw = std::fs::read(&path).unwrap();
+        let last = raw.len() - 1;
+        raw[last] ^= 0xff;
+        std::fs::write(&path, &raw).unwrap();
+        let read = read_dump(&path).unwrap();
+        assert!(read.crc_failed);
+        assert!(read.records.is_empty());
         let _ = std::fs::remove_dir_all(dir);
     }
 }
