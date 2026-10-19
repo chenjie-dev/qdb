@@ -1,0 +1,6 @@
+[workspace]
+resolver = "2"
+members = []
+
+# 实现阶段再加入 crates。当前仓库只有设计，见 docs/design.md。
+# 约定：edition = "2021"，MSRV = 1.78，热路径不引入 serde。
