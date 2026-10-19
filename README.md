@@ -4,7 +4,7 @@ QDB 是面向股市行情的内存数据库。采集进程把 Tick 写入本机�
 
 当前阶段是设计，还没有实现代码。设计全文在 [docs/design.md](docs/design.md)。
 
-Agent 约定见 [AGENTS.md](AGENTS.md)，技能索引见 [.agents/skills/README.md](.agents/skills/README.md)。
+Agent 约定见 [AGENTS.md](AGENTS.md)，开发流水线见 [docs/2026-10-19-agent-pipeline.md](docs/2026-10-19-agent-pipeline.md)，技能索引见 [.agents/skills/README.md](.agents/skills/README.md)。
 
 ## 最低可用版本
 

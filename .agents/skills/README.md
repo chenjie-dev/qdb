@@ -7,13 +7,13 @@
 
 1. **流程类**：从 `equitylab/.agents/skills` 复制（该仓源自 deeplexcloud / mattpocock 系），加上本仓 **qdb-dev**。
 2. **栈专用**：从 equitylab 已安装的副本取来，只保留 Rust 通用实践和差分审查。来源见锁文件。
-3. **本仓编写**：`qdb-dev`，加上 Rust 程序设计（`rust-program-design`、`rust-concurrency-design`）和行情前备知识（`market-data-systems`、`a-share-market`）。公开技能库里没有与本设计一致的对应物。
+3. **本仓编写**：`qdb-dev`、`qdb-pipeline`，加上 Rust 程序设计（`rust-program-design`、`rust-concurrency-design`）和行情前备知识（`market-data-systems`、`a-share-market`）。公开技能库里没有与本设计一致的对应物。
 
 ## 未放入（刻意跳过）
 
 与本仓无关：`fastapi`、`langgraph-*`、`langchain-rag`、`rag-architect`、`redis-core`、`supabase-postgres-best-practices`、`qdrant-clients-sdk`、`ai-sdk`、`mcp-builder`、前端与 Tailwind / shadcn、`playwright-cli`、`webapp-testing`、`docker-patterns`、`multi-stage-dockerfile`、`devops-engineer`、`prd-development`、`user-story`、`semgrep`、`typescript-magician`。
 
-也不复制 EquityLab 的 `.agents/team/` 流水线。QDB 按 `docs/design.md` 第 13 节的 M1–M5 推进。
+角色和阶段按本仓 [qdb-pipeline](./qdb-pipeline/SKILL.md) 与 [`.agents/team/`](../team/README.md)，不照搬 EquityLab 的前端和 RAG 角色。第一版范围仍是 `docs/design.md` 第 13 节的 M1–M5。
 
 ## 索引
 
@@ -22,6 +22,7 @@
 | Skill | 用途 |
 |---|---|
 | [qdb-dev](./qdb-dev/SKILL.md) | 改 ABI、共享内存、WAL、聚合、SQL、订阅和恢复 |
+| [qdb-pipeline](./qdb-pipeline/SKILL.md) | 规划→架构→开发→测试→评审→发布→运维 |
 
 ### 行情前备知识
 

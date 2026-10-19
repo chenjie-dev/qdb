@@ -7,7 +7,7 @@ description: >-
   QDB、共享内存、环形缓冲、WAL、K 线、seq、行情库.
 ---
 
-> **中文说明**：在 QDB 上实现或修改时使用。先对齐 `docs/design.md` 的对应节和 `AGENTS.md`，再改指定 crate；第一版只做到 M1–M5。
+> **中文说明**：在 QDB 上实现或修改时使用。先对齐 `docs/design.md` 的对应节和 `AGENTS.md`，再改指定 crate；第一版只做到 M1–M5。一轮功能的阶段顺序见 `qdb-pipeline`。
 
 # QDB 开发
 

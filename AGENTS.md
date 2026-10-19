@@ -14,7 +14,17 @@ QDB 是面向股市行情的内存数据库，用 Rust 实现。单机上只有�
                               ↘ 状态快照 → 启动恢复
 ```
 
-目录约定：`docs/design.md` 是设计正文，`crates/*` 是实现，`.agents/skills/` 是 agent 技能。第一版还没有 crate。
+目录约定：`docs/design.md` 是设计正文，`crates/*` 是实现，`.agents/skills/` 是技能，`.agents/team/` 是角色卡，`.agents/artifacts/` 是阶段交接物。第一版还没有 crate。
+
+## 开发流水线
+
+功能默认按阶段推进，入口 skill 是 **qdb-pipeline**：
+
+```text
+规划 → 架构 → 开发（Engine 与 Query）→ 测试 → 评审 → 发布 → 运维
+```
+
+说明：[docs/2026-10-19-agent-pipeline.md](docs/2026-10-19-agent-pipeline.md)。角色卡：[`.agents/team/`](.agents/team/README.md)。交接物用 [`.agents/templates/`](.agents/templates/) 写到 `.agents/artifacts/`。门禁未过不得进入下一阶段。小修复可跳过规划和架构，不能跳过冒烟和简短评审。
 
 ## 必读指针（按需加载）
 
@@ -23,6 +33,7 @@ QDB 是面向股市行情的内存数据库，用 Rust 实现。单机上只有�
 | 改任何实现、ABI、恢复或订阅行为 | [`docs/design.md`](docs/design.md) 里对应的节，不要整篇重读 |
 | 术语不一致 | [`CONTEXT.md`](CONTEXT.md) |
 | 在本仓落代码 | skill **qdb-dev** |
+| 按阶段做功能 | skill **qdb-pipeline**，说明见 [`docs/2026-10-19-agent-pipeline.md`](docs/2026-10-19-agent-pipeline.md) |
 | 写或改 Rust | skill **rust-best-practices**；异步 IO 再加 **rust-async-patterns** |
 | 新增 crate、公开类型、错误或所有权 | skill **rust-program-design** |
 | 线程、原子量、共享内存、`unsafe` | skill **rust-concurrency-design** |
@@ -72,6 +83,7 @@ QDB 是面向股市行情的内存数据库，用 Rust 实现。单机上只有�
 | 意图 | Skill |
 |---|---|
 | 在本仓实现或修改 | `qdb-dev` |
+| 按流水线推进 | `qdb-pipeline` |
 | 类型、crate、所有权 | `rust-program-design` |
 | 并发、共享内存 | `rust-concurrency-design` |
 | 行情概念 | `market-data-systems` |
