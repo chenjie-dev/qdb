@@ -8,8 +8,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use qdb_abi::{
-    code_str, decode_trade, encode_kline, encode_trade, exchange, fixed_code, seal_frame, Frame,
-    FrameHeader, KlineBody, MsgType, Period, TickQuote, TickTrade,
+    code_str, decode_trade, encode_kline, encode_trade, fixed_code, seal_frame, Frame,
+    FrameHeader, KlineBody,
+    MsgType, Period, TickQuote, TickTrade,
 };
 use qdb_agg::{BarEvent, KlineAggregator, TradeInput};
 use qdb_shm::{RegionConfig, ShmRegion};
@@ -20,8 +21,8 @@ use thiserror::Error;
 pub enum StoreError {
     #[error("io: {0}")]
     Io(String),
-    #[error("unknown exchange {0}")]
-    UnknownExchange(String),
+    #[error("exchange label is empty")]
+    EmptyExchange,
     #[error("symbol not found")]
     NotFound,
     #[error("ambiguous symbol")]
@@ -40,6 +41,7 @@ pub struct Symbol {
     pub exchange_id: u16,
     pub code: String,
     pub price_scale: u16,
+    pub exchange: String,
 }
 
 #[derive(Clone, Debug)]
@@ -92,6 +94,7 @@ pub struct Engine {
     agg: KlineAggregator,
     symbols: Vec<Symbol>,
     by_key: HashMap<(u16, String), u32>,
+    exchanges: Vec<String>,
     ticks: HashMap<u32, Vec<TickRow>>,
     quotes: HashMap<u32, QuoteRow>,
     frames: Vec<Frame>,
@@ -113,6 +116,7 @@ impl Engine {
             agg: KlineAggregator::default(),
             symbols: Vec::new(),
             by_key: HashMap::new(),
+            exchanges: Vec::new(),
             ticks: HashMap::new(),
             quotes: HashMap::new(),
             frames: Vec::new(),
@@ -172,7 +176,7 @@ impl Engine {
 
     pub fn resolve(&self, text: &str) -> Result<u32, StoreError> {
         if let Some((ex, code)) = text.split_once(':') {
-            let (exchange_id, _) = exchange(ex).ok_or_else(|| StoreError::UnknownExchange(ex.to_string()))?;
+            let exchange_id = self.exchange_id(ex).ok_or(StoreError::NotFound)?;
             return self.by_key.get(&(exchange_id, code.to_string())).copied().ok_or(StoreError::NotFound);
         }
         let hits: Vec<u32> = self.symbols.iter().filter(|symbol| symbol.code == text).map(|symbol| symbol.id).collect();
@@ -184,7 +188,10 @@ impl Engine {
     }
 
     pub fn upsert_symbol(&mut self, exchange_code: &str, code: &str) -> Result<u32, StoreError> {
-        let (exchange_id, _) = exchange(exchange_code).ok_or_else(|| StoreError::UnknownExchange(exchange_code.to_string()))?;
+        if exchange_code.is_empty() {
+            return Err(StoreError::EmptyExchange);
+        }
+        let exchange_id = self.intern_exchange(exchange_code);
         if let Some(id) = self.by_key.get(&(exchange_id, code.to_string())) {
             return Ok(*id);
         }
@@ -193,8 +200,9 @@ impl Engine {
         let mut payload = Vec::new();
         payload.extend_from_slice(&id.to_le_bytes());
         payload.extend_from_slice(&exchange_id.to_le_bytes());
+        payload.extend_from_slice(&fixed_label(exchange_code));
         payload.extend_from_slice(&fixed_code(code));
-        self.commit(MsgType::SymbolUpsert, 0, id, exchange_id, 0, &payload)?;
+        self.commit(MsgType::SymbolUpsert, 0, id, exchange_id, 0, &payload, 0)?;
         Ok(id)
     }
 
@@ -218,7 +226,7 @@ impl Engine {
             amount: price.saturating_mul(volume),
             trade_id: 0,
         }));
-        self.commit(MsgType::TickTrade, event_ts_ns, symbol_id, exchange_id, 0, &payload)
+        self.commit(MsgType::TickTrade, event_ts_ns, symbol_id, exchange_id, 0, &payload, 0)
     }
 
     pub fn write_quote(
@@ -236,17 +244,20 @@ impl Engine {
         payload.extend_from_slice(&quote.last.to_le_bytes());
         payload.extend_from_slice(&quote.bid_px[0].to_le_bytes());
         payload.extend_from_slice(&quote.ask_px[0].to_le_bytes());
-        self.commit(MsgType::TickQuote, event_ts_ns, symbol_id, exchange_id, 0, &payload)
+        self.commit(MsgType::TickQuote, event_ts_ns, symbol_id, exchange_id, 0, &payload, 0)
     }
 
     /// 连续交易的时间水位。水位越过桶结束时间就闭合 K 线，不需要等待下一笔成交。
     pub fn write_clock(&mut self, exchange_code: &str, watermark_ns: i64) -> Result<u64, StoreError> {
         self.ensure_writable()?;
-        let (exchange_id, _) = exchange(exchange_code).ok_or_else(|| StoreError::UnknownExchange(exchange_code.to_string()))?;
+        if exchange_code.is_empty() {
+            return Err(StoreError::EmptyExchange);
+        }
+        let exchange_id = self.intern_exchange(exchange_code);
         let mut payload = Vec::new();
         payload.extend_from_slice(&exchange_id.to_le_bytes());
         payload.extend_from_slice(&watermark_ns.to_le_bytes());
-        self.commit(MsgType::ClockTick, watermark_ns, 0, exchange_id, 0, &payload)
+        self.commit(MsgType::ClockTick, watermark_ns, 0, exchange_id, 0, &payload, 0)
     }
 
     fn commit(
@@ -257,12 +268,13 @@ impl Engine {
         exchange_id: u16,
         period_id: u16,
         payload: &[u8],
+        flags: u16,
     ) -> Result<u64, StoreError> {
         let seq = self.next_seq;
         let record = WalRecord {
             seq,
             msg_type: msg_type as u16,
-            flags: 0,
+            flags,
             payload: payload.to_vec(),
         };
         self.wal.append(&record).map_err(io)?;
@@ -278,7 +290,7 @@ impl Engine {
                 recv_ts_ns: event_ts_ns,
                 payload_len: 0,
                 msg_type: msg_type as u16,
-                flags: 0,
+                flags,
                 symbol_id,
                 exchange_id,
                 period_id,
@@ -308,7 +320,9 @@ impl Engine {
             Some(MsgType::SymbolUpsert) => {
                 let id = u32::from_le_bytes(record.payload[0..4].try_into().unwrap());
                 let exchange_id = u16::from_le_bytes(record.payload[4..6].try_into().unwrap());
-                let code = code_str(&record.payload[6..38]);
+                let exchange_name = code_str(&record.payload[6..22]);
+                let code = code_str(&record.payload[22..54]);
+                self.remember_exchange(exchange_id, &exchange_name);
                 if !self.by_key.contains_key(&(exchange_id, code.clone())) {
                     self.by_key.insert((exchange_id, code.clone()), id);
                     self.symbols.push(Symbol {
@@ -316,6 +330,7 @@ impl Engine {
                         exchange_id,
                         code,
                         price_scale: 10_000,
+                        exchange: exchange_name,
                     });
                 }
                 self.agg.note_seq(record.seq)?;
@@ -325,7 +340,8 @@ impl Engine {
                 let symbol_id = u32::from_le_bytes(record.payload[0..4].try_into().unwrap());
                 let event_ts_ns = i64::from_le_bytes(record.payload[4..12].try_into().unwrap());
                 let trade = decode_trade(&record.payload[12..]).ok_or(StoreError::Crc)?;
-                let exchange_id = self.symbols.iter().find(|symbol| symbol.id == symbol_id).ok_or(StoreError::NotFound)?.exchange_id;
+                let symbol = self.symbols.iter().find(|symbol| symbol.id == symbol_id).ok_or(StoreError::NotFound)?;
+                let exchange_id = symbol.exchange_id;
                 let (_status, events) = self.agg.apply_trade(
                     record.seq,
                     &TradeInput {
@@ -433,6 +449,38 @@ fn bar_frame(seq: u64, ts: i64, event: &BarEvent, out_idx: u16) -> Frame {
         },
         &encode_kline(&bar.body),
     )
+}
+
+impl Engine {
+    fn intern_exchange(&mut self, name: &str) -> u16 {
+        if let Some(index) = self.exchanges.iter().position(|existing| existing == name) {
+            return (index as u16) + 1;
+        }
+        self.exchanges.push(name.to_string());
+        self.exchanges.len() as u16
+    }
+
+    fn remember_exchange(&mut self, id: u16, name: &str) {
+        let index = (id as usize).saturating_sub(1);
+        if self.exchanges.len() <= index {
+            self.exchanges.resize(index + 1, String::new());
+        }
+        if self.exchanges[index].is_empty() {
+            self.exchanges[index] = name.to_string();
+        }
+    }
+
+    fn exchange_id(&self, name: &str) -> Option<u16> {
+        self.exchanges.iter().position(|existing| existing == name).map(|index| (index as u16) + 1)
+    }
+}
+
+fn fixed_label(value: &str) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    let bytes = value.as_bytes();
+    let n = bytes.len().min(16);
+    out[..n].copy_from_slice(&bytes[..n]);
+    out
 }
 
 fn io<E: std::fmt::Display>(err: E) -> StoreError {

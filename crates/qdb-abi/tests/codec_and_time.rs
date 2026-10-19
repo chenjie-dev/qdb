@@ -1,8 +1,8 @@
 use qdb_abi::{
     align_bucket, checksum_frame, code_str, decode_kline, decode_trade, encode_kline, encode_trade,
-    exchange, exchange_continuous, exchange_tz, fixed_code, frame_from_bytes, frame_to_bytes,
-    seal_frame, symbol_key, FrameHeader, KlineBody, MsgType, Period, TickTrade, EXCHANGE_BINANCE,
-    EXCHANGE_SSE, FRAME_SIZE, PERIOD_D1_ID, TZ_SHANGHAI_MIN, TZ_UTC_MIN,
+    fixed_code, frame_from_bytes, frame_to_bytes,
+    seal_frame, symbol_key, FrameHeader, KlineBody, MsgType, Period, TickTrade, FRAME_SIZE,
+    PERIOD_D1_ID,
 };
 
 #[test]
@@ -45,7 +45,7 @@ fn sealed_frame_detects_a_changed_payload_byte() {
             msg_type: MsgType::TickTrade as u16,
             flags: 0,
             symbol_id: 3,
-            exchange_id: EXCHANGE_BINANCE,
+            exchange_id: 1,
             period_id: 0,
             partition_id: 0,
             reserved: 0,
@@ -69,26 +69,17 @@ fn period_ids_fit_the_frame_and_four_hours_align_to_epoch() {
     assert_eq!(Period::D1.id(), PERIOD_D1_ID);
     assert!(Period::parse("1w").is_none());
     let step = Period::H4.nanos();
-    assert_eq!(align_bucket(Period::H4, step, TZ_UTC_MIN), step);
-    assert_eq!(align_bucket(Period::H4, step - 1, TZ_UTC_MIN), 0);
-    assert_eq!(align_bucket(Period::H4, -1, TZ_UTC_MIN), -step);
+    assert_eq!(align_bucket(Period::H4, step), step);
+    assert_eq!(align_bucket(Period::H4, step - 1), 0);
+    assert_eq!(align_bucket(Period::H4, -1), -step);
 }
 
 #[test]
-fn exchanges_keep_their_own_day_boundary() {
-    assert_eq!(exchange("BINANCE").unwrap(), (EXCHANGE_BINANCE, TZ_UTC_MIN));
-    assert!(exchange_continuous(EXCHANGE_BINANCE));
-    assert!(!exchange_continuous(EXCHANGE_SSE));
-    assert_eq!(exchange_tz(EXCHANGE_SSE), TZ_SHANGHAI_MIN);
-    assert!(exchange("NASDAQ").is_none());
-    assert_eq!(symbol_key(EXCHANGE_BINANCE, "BTCUSDT").unwrap(), "BINANCE:BTCUSDT");
-
-    let utc_midnight = utc_ns(2024, 1, 3, 0, 0, 0);
-    assert_eq!(align_bucket(Period::D1, utc_midnight, TZ_UTC_MIN), utc_midnight);
-    assert_ne!(
-        align_bucket(Period::D1, utc_midnight, TZ_SHANGHAI_MIN),
-        align_bucket(Period::D1, utc_midnight, TZ_UTC_MIN)
-    );
+fn symbol_key_is_caller_text_and_days_are_utc() {
+    assert_eq!(symbol_key("ANY", "BTCUSDT"), "ANY:BTCUSDT");
+    let midnight = utc_ns(2024, 1, 3, 0, 0, 0);
+    assert_eq!(align_bucket(Period::D1, midnight), midnight);
+    assert_eq!(align_bucket(Period::D1, midnight - 1), midnight - Period::D1.nanos());
 }
 
 #[test]

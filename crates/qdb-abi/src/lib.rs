@@ -24,12 +24,6 @@ pub const OFF_HEARTBEAT_NS: usize = 448;
 pub const OFF_EPOCH: usize = 512;
 pub const OFF_SYMBOL_COUNT: usize = 520;
 
-pub const EXCHANGE_SSE: u16 = 1;
-pub const EXCHANGE_SZSE: u16 = 2;
-pub const EXCHANGE_BSE: u16 = 3;
-pub const EXCHANGE_BINANCE: u16 = 4;
-pub const TZ_SHANGHAI_MIN: i16 = 480;
-pub const TZ_UTC_MIN: i16 = 0;
 
 pub const FLAG_FROM_WAL: u16 = 1 << 0;
 pub const FLAG_TS_REGRESSION: u16 = 1 << 1;
@@ -80,7 +74,7 @@ pub enum Period {
     D1,
 }
 
-/// 86400 放不进帧头里的 `u16`，日线用 `u16::MAX`，对齐长度仍是一个上海交易日。
+/// 86400 放不进帧头里的 `u16`，日线用 `u16::MAX`。日界由调用方给出的时区偏移决定。
 pub const PERIOD_D1_ID: u16 = u16::MAX;
 
 pub const PERIODS: [Period; ACTIVE_PERIODS] = [
@@ -274,62 +268,14 @@ pub struct SymbolRec {
     pub code: [u8; 32],
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ExchangeRec {
-    pub exchange_id: u16,
-    pub tz_offset_min: i16,
-    pub code: [u8; 8],
+pub fn symbol_key(exchange: &str, code: &str) -> String {
+    format!("{exchange}:{code}")
 }
 
-pub fn exchange(code: &str) -> Option<(u16, i16)> {
-    let id = exchange_id(code)?;
-    Some((id, exchange_tz(id)))
-}
-
-pub fn exchange_id(code: &str) -> Option<u16> {
-    Some(match code {
-        "SSE" => EXCHANGE_SSE,
-        "SZSE" => EXCHANGE_SZSE,
-        "BSE" => EXCHANGE_BSE,
-        "BINANCE" => EXCHANGE_BINANCE,
-        _ => return None,
-    })
-}
-
-pub fn exchange_tz(id: u16) -> i16 {
-    match id {
-        EXCHANGE_BINANCE => TZ_UTC_MIN,
-        _ => TZ_SHANGHAI_MIN,
-    }
-}
-
-/// 连续交易没有午休和收盘。日线按 UTC 自然日。A 股日线仍按上海交易日。
-pub fn exchange_continuous(id: u16) -> bool {
-    id == EXCHANGE_BINANCE
-}
-
-pub fn exchange_code(id: u16) -> Option<&'static str> {
-    Some(match id {
-        EXCHANGE_SSE => "SSE",
-        EXCHANGE_SZSE => "SZSE",
-        EXCHANGE_BSE => "BSE",
-        EXCHANGE_BINANCE => "BINANCE",
-        _ => return None,
-    })
-}
-
-pub fn symbol_key(exchange_id: u16, code: &str) -> Option<String> {
-    Some(format!("{}:{}", exchange_code(exchange_id)?, code))
-}
-
-/// 把事件时间对齐到周期桶起点，返回 UTC 纳秒。日线按上海交易日。
-pub fn align_bucket(period: Period, event_ts_ns: i64, tz_offset_min: i16) -> i64 {
-    let offset = i64::from(tz_offset_min) * 60 * 1_000_000_000;
-    let local = event_ts_ns + offset;
+/// 按 UTC 把事件时间对齐到周期桶起点。时区换算由业务系统在写入前完成。
+pub fn align_bucket(period: Period, event_ts_ns: i64) -> i64 {
     let step = period.nanos();
-    let start_local = local - local.rem_euclid(step);
-    start_local - offset
+    event_ts_ns - event_ts_ns.rem_euclid(step)
 }
 
 pub fn encode_trade(trade: &TickTrade) -> [u8; 32] {
@@ -500,31 +446,18 @@ mod tests {
     }
 
     #[test]
-    fn one_second_and_one_minute_buckets_follow_shanghai_clock() {
-        let ts = shanghai_ns(2024, 1, 2, 9, 30, 0, 100_000_000);
-        let next = shanghai_ns(2024, 1, 2, 9, 30, 1, 0);
-        assert_eq!(
-            align_bucket(Period::S1, ts, TZ_SHANGHAI_MIN),
-            shanghai_ns(2024, 1, 2, 9, 30, 0, 0)
-        );
-        assert_ne!(
-            align_bucket(Period::S1, ts, TZ_SHANGHAI_MIN),
-            align_bucket(Period::S1, next, TZ_SHANGHAI_MIN)
-        );
-        assert_eq!(
-            align_bucket(Period::M1, ts, TZ_SHANGHAI_MIN),
-            align_bucket(Period::M1, next, TZ_SHANGHAI_MIN)
-        );
-        assert_eq!(
-            align_bucket(Period::D1, ts, TZ_SHANGHAI_MIN),
-            shanghai_ns(2024, 1, 2, 0, 0, 0, 0)
-        );
+    fn one_second_and_one_minute_buckets_follow_utc() {
+        let ts = utc_ns(2024, 1, 2, 1, 30, 0, 100_000_000);
+        let next = utc_ns(2024, 1, 2, 1, 30, 1, 0);
+        assert_eq!(align_bucket(Period::S1, ts), utc_ns(2024, 1, 2, 1, 30, 0, 0));
+        assert_ne!(align_bucket(Period::S1, ts), align_bucket(Period::S1, next));
+        assert_eq!(align_bucket(Period::M1, ts), align_bucket(Period::M1, next));
+        assert_eq!(align_bucket(Period::D1, ts), utc_ns(2024, 1, 2, 0, 0, 0, 0));
     }
 
-    fn shanghai_ns(y: i32, m: u32, d: u32, h: u32, min: u32, s: u32, nanos: i64) -> i64 {
+    fn utc_ns(y: i32, m: u32, d: u32, h: u32, min: u32, s: u32, nanos: i64) -> i64 {
         let days = days_from_civil(y, m, d);
-        let local = days * 86_400 + i64::from(h) * 3600 + i64::from(min) * 60 + i64::from(s);
-        (local - i64::from(TZ_SHANGHAI_MIN) * 60) * 1_000_000_000 + nanos
+        (days * 86_400 + i64::from(h) * 3600 + i64::from(min) * 60 + i64::from(s)) * 1_000_000_000 + nanos
     }
 
     fn days_from_civil(mut y: i32, m: u32, d: u32) -> i64 {

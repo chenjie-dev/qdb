@@ -1,4 +1,4 @@
-use qdb_abi::{Period, EXCHANGE_BINANCE, EXCHANGE_SZSE, KLINE_INCOMPLETE};
+use qdb_abi::{Period, KLINE_INCOMPLETE};
 use qdb_agg::{KlineAggregator, TradeInput};
 
 #[test]
@@ -37,7 +37,7 @@ fn clock_does_not_seal_another_exchange() {
     let mut agg = KlineAggregator::default();
     agg.apply_trade(1, &sz(shanghai(9, 30, 0, 0), 10, 1)).unwrap();
     let end = shanghai(9, 31, 0, 0);
-    agg.apply_clock(2, EXCHANGE_BINANCE, end).unwrap();
+    agg.apply_clock(2, 2, end).unwrap();
     assert!(agg.sealed(1, Period::M1).is_empty());
     assert!(agg.open_bar(1, Period::M1).is_some());
 }
@@ -57,7 +57,7 @@ fn four_hour_bucket_changes_on_the_boundary() {
 fn sz(ts: i64, price: i64, volume: i64) -> TradeInput {
     TradeInput {
         symbol_id: 1,
-        exchange_id: EXCHANGE_SZSE,
+        exchange_id: 1,
         event_ts_ns: ts,
         price,
         volume,
@@ -68,7 +68,7 @@ fn sz(ts: i64, price: i64, volume: i64) -> TradeInput {
 fn binance(ts: i64, price: i64) -> TradeInput {
     TradeInput {
         symbol_id: 1,
-        exchange_id: EXCHANGE_BINANCE,
+        exchange_id: 2,
         event_ts_ns: ts,
         price,
         volume: 1,

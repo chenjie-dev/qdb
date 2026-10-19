@@ -1,9 +1,7 @@
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use qdb_store::{Engine, Metrics};
 
@@ -11,15 +9,7 @@ fn main() {
     let root = std::env::args().nth(1).unwrap_or_else(|| "data".into());
     let engine = Engine::open(std::path::Path::new(&root)).expect("open qdb");
     let metrics = engine.metrics();
-    let engine = Arc::new(Mutex::new(engine));
-    let clock = Arc::clone(&engine);
-    thread::spawn(move || loop {
-        thread::sleep(Duration::from_secs(1));
-        let watermark = now_ns() as i64;
-        if let Ok(mut engine) = clock.lock() {
-            let _ = engine.write_clock("BINANCE", watermark);
-        }
-    });
+    let _engine = engine;
     let port: u16 = std::env::var("QDB_HTTP_PORT").ok().and_then(|v| v.parse().ok()).unwrap_or(9090);
     let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind health port");
     eprintln!("qdb listening on 127.0.0.1:{port}");

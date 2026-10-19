@@ -60,6 +60,10 @@ dependencies = [
 name = "qdb-server"
 version = "0.1.0"
 dependencies = [
+ "qdb-abi",
+ "qdb-agg",
+ "qdb-shm",
+ "qdb-sql",
  "qdb-store",
 ]
 

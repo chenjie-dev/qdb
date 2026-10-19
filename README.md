@@ -2,7 +2,7 @@
 
 QDB 是面向股市行情的内存数据库。采集进程把 Tick 写入本机共享内存，数据库、订阅和策略进程只读；查询、K 线聚合和恢复以进程内内存表和 WAL 为准。共享内存是热数据总线，不是唯一存储。
 
-当前是可运行的初版，覆盖设计里的 M1–M5。A 股按交易日切日线；`BINANCE:BTCUSDT` 这类全球连续市场按 UTC 全天切，没有收盘。设计全文在 [docs/design.md](docs/design.md)。
+当前是可运行的初版，覆盖设计里的 M1–M5。库只负责写入、聚合、查询和订阅；开市时间和时区偏移由业务系统在写入时给出。设计全文在 [docs/design.md](docs/design.md)。
 
 ```bash
 cargo test --workspace

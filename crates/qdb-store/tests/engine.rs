@@ -10,7 +10,8 @@ fn registering_the_same_symbol_twice_does_not_allocate_another_seq() {
     let second = engine.upsert_symbol("SZSE", "000001").unwrap();
     assert_eq!(first, second);
     assert_eq!(engine.applied_seq(), applied);
-    assert!(matches!(engine.upsert_symbol("NOPE", "1").unwrap_err(), StoreError::UnknownExchange(_)));
+    assert!(matches!(engine.upsert_symbol("", "1").unwrap_err(), StoreError::EmptyExchange));
+    assert!(engine.upsert_symbol("NOPE", "1").is_ok());
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -23,6 +24,26 @@ fn a_unique_bare_code_resolves_and_ticks_keep_price_times_volume() {
     let id = engine.resolve("000001").unwrap();
     let tick = &engine.ticks(id)[0];
     assert_eq!((tick.price, tick.volume, tick.amount), (10, 100, 1000));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn four_venues_accept_symbols_and_tag_the_trade_session() {
+    let dir = temp("venues");
+    let mut engine = Engine::open(&dir).unwrap();
+    let hk = utc(8, 5, 0);
+    engine.write_trade("SSE", "600000", hk, 10, 100).unwrap();
+    engine.write_trade("SZSE", "000001", hk, 10, 100).unwrap();
+    engine.write_trade("BSE", "830000", hk, 10, 100).unwrap();
+    engine.write_trade("HKEX", "00700", hk, 300, 100).unwrap();
+    engine.write_trade("NYSE", "AAPL", utc(14, 30, 0), 180, 1).unwrap();
+    engine.write_trade("NASDAQ", "MSFT", utc(14, 30, 0), 400, 1).unwrap();
+    engine.write_trade("BINANCE", "BTCUSDT", hk, 100, 1).unwrap();
+    assert!(engine.resolve("HKEX:00700").is_ok());
+    assert!(engine.resolve("NYSE:AAPL").is_ok());
+    assert!(engine.resolve("NASDAQ:MSFT").is_ok());
+    assert!(engine.resolve("BINANCE:BTCUSDT").is_ok());
+    assert!(engine.symbols().iter().all(|symbol| symbol.price_scale == 10_000));
     let _ = std::fs::remove_dir_all(dir);
 }
 

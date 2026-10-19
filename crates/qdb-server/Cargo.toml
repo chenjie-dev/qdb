@@ -6,8 +6,16 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+qdb-abi.workspace = true
+qdb-agg.workspace = true
+qdb-shm.workspace = true
+qdb-sql.workspace = true
 qdb-store.workspace = true
 
 [[bin]]
 name = "qdb"
 path = "src/main.rs"
+
+[[bin]]
+name = "qdb-bench"
+path = "src/bin/qdb-bench.rs"

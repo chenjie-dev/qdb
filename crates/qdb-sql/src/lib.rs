@@ -212,7 +212,7 @@ impl<'a> SqlEngine<'a> {
         let columns = vec!["symbol".into(), "exchange".into()];
         let mut rows = Vec::new();
         for symbol in self.engine.symbols() {
-            let name = format!("{}:{}", qdb_abi::exchange_code(symbol.exchange_id).unwrap_or("?"), symbol.code);
+            let name = format!("{}:{}", symbol.exchange, symbol.code);
             rows.push(vec![name, symbol.exchange_id.to_string()]);
         }
         rows.truncate(stmt.limit as usize);

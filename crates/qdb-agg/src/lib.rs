@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 
 use qdb_abi::{
-    align_bucket, exchange_tz, KlineBody, Period, KLINE_INCOMPLETE, ORIGIN_LIVE, PERIODS,
+    align_bucket, KlineBody, Period, KLINE_INCOMPLETE, ORIGIN_LIVE, PERIODS,
     STATE_CLOSED, STATE_OPEN,
 };
 use thiserror::Error;
@@ -164,7 +164,7 @@ impl KlineAggregator {
     }
 
     fn apply_period(&mut self, seq: u64, trade: &TradeInput, period: Period) -> Option<BarEvent> {
-        let bucket = align_bucket(period, trade.event_ts_ns, exchange_tz(trade.exchange_id));
+        let bucket = align_bucket(period, trade.event_ts_ns);
         let key = (trade.symbol_id, period.id());
         if let Some(bar) = self.open.get(&key) {
             if trade.event_ts_ns < bar.body.bucket_start_ns {
@@ -232,7 +232,7 @@ impl KlineAggregator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use qdb_abi::{EXCHANGE_SZSE, Period};
+    use qdb_abi::Period;
 
     fn ts(h: u32, m: u32, s: u32, nanos: i64) -> i64 {
         qdb_abi_time(2024, 1, 2, h, m, s, nanos)
@@ -256,7 +256,7 @@ mod tests {
     fn trade(ts_ns: i64, price: i64, volume: i64) -> TradeInput {
         TradeInput {
             symbol_id: 1,
-            exchange_id: EXCHANGE_SZSE,
+            exchange_id: 1,
             event_ts_ns: ts_ns,
             price,
             volume,
@@ -338,7 +338,7 @@ mod tests {
         let start = utc_ns(2024, 1, 2, 0, 0, 10);
         agg.apply_trade(1, &binance(start, 100)).unwrap();
         let end = utc_ns(2024, 1, 2, 0, 1, 0);
-        agg.apply_clock(2, qdb_abi::EXCHANGE_BINANCE, end).unwrap();
+        agg.apply_clock(2, 2, end).unwrap();
         assert_eq!(agg.sealed(1, Period::M1).len(), 1);
         assert_eq!(agg.sealed(1, Period::M1)[0].close, 100);
         assert!(agg.open_bar(1, Period::M1).is_none());
@@ -347,7 +347,7 @@ mod tests {
     fn binance(ts_ns: i64, price: i64) -> TradeInput {
         TradeInput {
             symbol_id: 1,
-            exchange_id: qdb_abi::EXCHANGE_BINANCE,
+            exchange_id: 2,
             event_ts_ns: ts_ns,
             price,
             volume: 1,
