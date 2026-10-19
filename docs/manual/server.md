@@ -1,6 +1,6 @@
 # 服务进程
 
-`qdb` 打开一个数据目录，然后在本机提供健康检查。它不接收 SQL，也不接收写入。写入仍通过链接 `qdb-store` 的程序完成。
+`qdb` 打开一个数据目录。HTTP 接收成交和报价写入，并提供快照与 K 线读取。它不接收 SQL。进程内采集默认开启，EquityLab Compose 设 `QDB_FEED=0`，改由外部采集进程写入。
 
 ## 启动
 
@@ -8,7 +8,9 @@
 cargo run -p qdb-server --bin qdb -- data
 ```
 
-数据目录是第一个参数，缺省为 `data`。监听地址固定是 `127.0.0.1`。端口由环境变量 `QDB_HTTP_PORT` 决定，缺省 9090。
+数据目录是第一个参数，缺省为 `data`。监听地址由 `QDB_HTTP_ADDR` 决定，缺省 `127.0.0.1`。端口由 `QDB_HTTP_PORT` 决定，缺省 9090。
+
+采集默认开启，约每秒拉一批公开快照并 `write_quote` / 增量 `write_trade`。`QDB_FEED=0` 关闭。`QDB_FEED_CODES` 是逗号分隔的 6 位代码，缺省为内置种子。`QDB_FEED_MS` 是间隔毫秒数，缺省 1000。价格按 10000 倍写入整数。依赖本机 `curl`。
 
 ```bash
 QDB_HTTP_PORT=19090 cargo run -p qdb-server --bin qdb -- /var/lib/qdb
@@ -20,7 +22,31 @@ QDB_HTTP_PORT=19090 cargo run -p qdb-server --bin qdb -- /var/lib/qdb
 
 ## HTTP
 
-请求路径按空格分隔的第二段识别。除 `/metrics` 及其带查询串的形式外，其余路径都按健康检查处理。
+请求路径按空格分隔的第二段识别。
+
+### GET /v1/snapshots?symbols=
+
+`symbols` 为逗号分隔的 `交易所:代码`，例如 `SSE:600519,SZSE:000001`。缺省返回当前采集缓存。正文是 JSON：`source=qdb`，`scale=10000`，`data[]` 含名称、现价、开高低、昨收、量额和 `seq`。这里读的是进程内缓存，不执行 SQL。缓存里没有的代码不会回源。
+
+### POST /v1/quotes
+
+JSON：`{"items":[{"exchange":"SSE","code":"600519","ts_ns":1,"last":13250000,"price":1325.0,"open":1322.5,"high":1348.6,"low":1321.0,"pre_close":1329.0,"volume":1,"amount":1,"name":"贵州茅台"}]}`。`last` 是按 10000 倍缩放的整数。成功正文 `{"written":N}`。
+
+### POST /v1/trades
+
+JSON：`{"items":[{"exchange":"SSE","code":"600519","ts_ns":1,"price":13250000,"volume":100}]}`。成交进入 K 线聚合。同一桶内按时间顺序写入开、高、低、收，可以把一根历史 K 线还原进库。
+
+### POST /v1/docs
+
+JSON：`{"items":[{"key":"binance:ticker:BTCUSDT","value":{}}]}`。值原样保存，供采集进程存放盘口、成交和列表。进程重启后清空。
+
+### GET /v1/docs?key=
+
+返回该 key 的 JSON 值。没有则 404。
+
+### GET /v1/klines?symbol=SSE:600519&period=1d
+
+`period` 取 `1s` `1m` `5m` `15m` `1h` `4h` `1d`。`state` 为 0 表示未闭合。价格已按 `scale` 还原成十进制。
 
 ### GET /health
 

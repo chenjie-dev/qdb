@@ -11,7 +11,7 @@ cargo test --workspace
 cargo run -p qdb-server -- data
 ```
 
-健康检查默认监听 `127.0.0.1:9090`。
+健康检查和快照读取默认监听 `127.0.0.1:9090`。进程内采集把公开行情写入库，`GET /v1/snapshots` 只读这份缓存。EquityLab Compose 用仓库根目录 `Dockerfile` 构建，容器内监听 `0.0.0.0:9090`。
 
 Agent 约定见 [AGENTS.md](AGENTS.md)，开发流水线见 [docs/2026-10-19-agent-pipeline.md](docs/2026-10-19-agent-pipeline.md)，技能索引见 [.agents/skills/README.md](.agents/skills/README.md)。
 
