@@ -1,12 +1,20 @@
 //! 只读命令行客户端。查看表结构，并查询已经落盘的数据。
 
+use std::cell::RefCell;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::rc::Rc;
 
 use qdb_abi::Period;
 use qdb_sql::{QueryResult, SqlEngine};
 use qdb_store::{playback, Catalog, Change, Engine};
+use rustyline::completion::{Completer, Pair};
+use rustyline::error::ReadlineError;
+use rustyline::highlight::Highlighter;
+use rustyline::hint::Hinter;
+use rustyline::validate::Validator;
+use rustyline::{CompletionType, Config, Context, Editor, Helper};
 
 fn main() -> ExitCode {
     let args = match Args::parse(std::env::args().skip(1)) {
@@ -85,19 +93,56 @@ impl Args {
 }
 
 fn repl(instance: &Path) -> ExitCode {
-    let interactive = io::stdin().is_terminal();
+    if io::stdin().is_terminal() {
+        return repl_tty(instance);
+    }
+    repl_lines(instance)
+}
+
+fn repl_tty(instance: &Path) -> ExitCode {
+    let session = Rc::new(RefCell::new(Session::new(instance.to_path_buf())));
+    let config = Config::builder()
+        .completion_type(CompletionType::List)
+        .build();
+    let mut editor = match Editor::with_config(config) {
+        Ok(editor) => editor,
+        Err(err) => {
+            eprintln!("io: {err}");
+            return ExitCode::from(1);
+        }
+    };
+    editor.set_helper(Some(QdbHelper {
+        session: session.clone(),
+    }));
+    loop {
+        let prompt = prompt(&session.borrow());
+        match editor.readline(&prompt) {
+            Ok(line) => {
+                if line.trim() == ".quit"
+                    || line.trim() == ".exit"
+                    || line.trim() == "quit"
+                    || line.trim() == "exit"
+                {
+                    break;
+                }
+                let _ = editor.add_history_entry(line.as_str());
+                let _ = finish(&mut session.borrow_mut(), &line);
+            }
+            Err(ReadlineError::Interrupted | ReadlineError::Eof) => break,
+            Err(err) => {
+                eprintln!("io: {err}");
+                return ExitCode::from(1);
+            }
+        }
+    }
+    ExitCode::SUCCESS
+}
+
+fn repl_lines(instance: &Path) -> ExitCode {
     let mut session = Session::new(instance.to_path_buf());
     let stdin = io::stdin();
     let mut lines = stdin.lock().lines();
     loop {
-        if interactive {
-            if session.database == "default" {
-                eprint!("qdb> ");
-            } else {
-                eprint!("qdb {}> ", session.database);
-            }
-            let _ = io::stderr().flush();
-        }
         let Some(line) = lines.next() else {
             break;
         };
@@ -108,16 +153,200 @@ fn repl(instance: &Path) -> ExitCode {
                 return ExitCode::from(1);
             }
         };
-        if line.trim() == ".quit" || line.trim() == ".exit" {
+        if line.trim() == ".quit"
+            || line.trim() == ".exit"
+            || line.trim() == "quit"
+            || line.trim() == "exit"
+        {
             break;
         }
         let code = finish(&mut session, &line);
-        if code != ExitCode::SUCCESS && !interactive {
+        if code != ExitCode::SUCCESS {
             return code;
         }
     }
     ExitCode::SUCCESS
 }
+
+fn prompt(session: &Session) -> String {
+    if session.database == "default" {
+        "qdb> ".into()
+    } else {
+        format!("qdb {}> ", session.database)
+    }
+}
+
+struct CompletionWords {
+    commands: Vec<String>,
+    databases: Vec<String>,
+    tables: Vec<String>,
+    symbols: Vec<String>,
+    periods: Vec<String>,
+}
+
+fn completion_words(session: &Session) -> CompletionWords {
+    let databases = Catalog::open_read(&session.instance)
+        .and_then(|catalog| catalog.list())
+        .unwrap_or_default();
+    let symbols = session
+        .path()
+        .ok()
+        .and_then(|path| Engine::open_read(&path).ok())
+        .map(|engine| {
+            engine
+                .symbols()
+                .iter()
+                .map(|symbol| format!("{}:{}", symbol.exchange, symbol.code))
+                .collect()
+        })
+        .unwrap_or_default();
+    CompletionWords {
+        commands: [
+            "help",
+            "ll",
+            "ls",
+            "quit",
+            "exit",
+            "SHOW",
+            "SELECT",
+            "DESCRIBE",
+            "DESC",
+            "CREATE",
+            "USE",
+            "SUBSCRIBE",
+            ".dump",
+            ".restore",
+            ".replay",
+            ".watch",
+            ".sub",
+            ".tables",
+            ".schema",
+            ".help",
+            ".quit",
+            ".exit",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect(),
+        databases,
+        tables: ["symbols", "ticks", "snapshots", "klines"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        symbols,
+        periods: ["1s", "1m", "5m", "15m", "1h", "4h", "1d"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    }
+}
+
+fn complete_line(line: &str, pos: usize, words: &CompletionWords) -> (usize, Vec<String>) {
+    let pos = pos.min(line.len());
+    let start = line[..pos]
+        .rfind(char::is_whitespace)
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let current = &line[start..pos];
+    let before: Vec<String> = line[..start]
+        .split_whitespace()
+        .map(|token| token.to_ascii_uppercase())
+        .collect();
+    let last = before.last().map(String::as_str);
+    let options = match before.as_slice() {
+        [] => words.commands.clone(),
+        [watch, kind, _]
+            if (watch == ".WATCH" || watch == ".SUB" || watch == "SUBSCRIBE")
+                && kind == "KLINES" =>
+        {
+            words.periods.clone()
+        }
+        [watch, kind]
+            if (watch == ".WATCH" || watch == ".SUB" || watch == "SUBSCRIBE")
+                && (kind == "SNAPSHOTS" || kind == "TICKS" || kind == "KLINES") =>
+        {
+            words.symbols.clone()
+        }
+        _ if last == Some("USE") => words.databases.clone(),
+        _ if last == Some("DESCRIBE") || last == Some("DESC") || last == Some(".SCHEMA") => {
+            words.tables.clone()
+        }
+        _ if last == Some("SHOW") => vec!["TABLES".into(), "DATABASES".into()],
+        _ if last == Some("CREATE") => vec!["DATABASE".into()],
+        _ if last == Some("FROM") => words.tables.clone(),
+        _ if last == Some(".WATCH") || last == Some(".SUB") || last == Some("SUBSCRIBE") => {
+            let mut options = vec!["snapshots".into(), "ticks".into(), "klines".into()];
+            options.extend(words.symbols.clone());
+            options
+        }
+        _ if before.len() >= 2 && before[before.len() - 2] == "SYMBOL" && last == Some("=") => {
+            quote_values(&words.symbols)
+        }
+        _ if before.len() >= 2 && before[before.len() - 2] == "PERIOD" && last == Some("=") => {
+            quote_values(&words.periods)
+        }
+        _ => Vec::new(),
+    };
+    let typed = current.trim_start_matches('\'').to_ascii_lowercase();
+    let matches = options
+        .into_iter()
+        .filter(|option| {
+            option
+                .to_ascii_lowercase()
+                .starts_with(&current.to_ascii_lowercase())
+                || option
+                    .trim_matches('\'')
+                    .to_ascii_lowercase()
+                    .starts_with(&typed)
+        })
+        .collect();
+    (start, matches)
+}
+
+fn quote_values(values: &[String]) -> Vec<String> {
+    values.iter().map(|value| format!("'{value}'")).collect()
+}
+
+struct QdbHelper {
+    session: Rc<RefCell<Session>>,
+}
+
+impl Completer for QdbHelper {
+    type Candidate = Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Pair>)> {
+        let session = self.session.borrow();
+        let words = completion_words(&session);
+        let (start, matches) = complete_line(line, pos, &words);
+        let pairs = matches
+            .into_iter()
+            .map(|word| Pair {
+                display: word.clone(),
+                replacement: word,
+            })
+            .collect();
+        Ok((start, pairs))
+    }
+}
+
+impl Hinter for QdbHelper {
+    type Hint = String;
+
+    fn hint(&self, _line: &str, _pos: usize, _ctx: &Context<'_>) -> Option<String> {
+        None
+    }
+}
+
+impl Highlighter for QdbHelper {}
+
+impl Validator for QdbHelper {}
+
+impl Helper for QdbHelper {}
 
 fn finish(session: &mut Session, line: &str) -> ExitCode {
     if let Some(result) = catalog_command(session, line) {
@@ -171,6 +400,8 @@ fn catalog_command(session: &mut Session, line: &str) -> Option<Result<String, S
         [command, name] if command == "USE" => {
             Some(use_database(session, parts[1]).map(|name| format!("database {name}\n")))
         }
+        [command] if command == "HELP" || command == "?" => Some(Ok(help_text())),
+        [command] if command == "LL" || command == "LS" => Some(list_here(session)),
         _ if upper
             .first()
             .is_some_and(|word| word == ".DUMP" || word == ".RESTORE" || word == ".REPLAY") =>
@@ -179,6 +410,14 @@ fn catalog_command(session: &mut Session, line: &str) -> Option<Result<String, S
         }
         _ => None,
     }
+}
+
+fn list_here(session: &Session) -> Result<String, String> {
+    let mut out = String::from("databases\n");
+    out.push_str(&show_databases(&session.instance)?);
+    out.push_str(&format!("\ntables in {}\n", session.database));
+    out.push_str(&execute(session, "SHOW TABLES")?);
+    Ok(out)
 }
 
 fn show_databases(instance: &Path) -> Result<String, String> {
@@ -230,7 +469,7 @@ fn file_command(session: &Session, command: &str, file: Option<&str>) -> Result<
             }
             Ok(out)
         }
-        _ => Err("unknown command. try .help".into()),
+        _ => Err("unknown command. try help".into()),
     }
 }
 
@@ -253,7 +492,7 @@ fn execute(session: &Session, line: &str) -> Result<String, String> {
             ["schema", table] => format!("DESCRIBE {table}"),
             ["help"] => return Ok(help_text()),
             ["quit"] | ["exit"] => return Ok(String::new()),
-            _ => return Err("unknown command. try .help".into()),
+            _ => return Err("unknown command. try help".into()),
         }
     } else {
         line.to_string()
@@ -513,12 +752,16 @@ qdb-client [数据目录] [-c 语句]
   .replay 文件
   .watch [snapshots|ticks|klines] 交易所:代码 [周期]
 
+  help             显示本页
+  ll               列出库和当前库的表
+  Tab              补全命令、库名、表名和代码
   .tables          列出表
   .schema [表名]   列出列
   .help
   .quit
 
 .watch 先打印当前行，再持续打印变更。Ctrl-C 结束。
+交互时按 Tab 补全。
 "
     .to_string()
 }
@@ -528,11 +771,10 @@ mod tests {
     use super::*;
 
     fn sample() -> PathBuf {
-        let n = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("qdb-client-{n}"));
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("qdb-client-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut engine = qdb_store::Engine::open(&dir).unwrap();
         engine
@@ -593,6 +835,43 @@ mod tests {
         assert!(format_change(&change).contains("last=1060000"));
         let ticks = parse_watch("SUBSCRIBE ticks SSE:600000").unwrap().unwrap();
         assert!(!watch_matches(&change, &ticks));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn tab_completes_commands_databases_tables_and_symbols() {
+        let words = CompletionWords {
+            commands: vec!["help".into(), "SHOW".into(), "USE".into(), ".watch".into()],
+            databases: vec!["default".into(), "ashare".into()],
+            tables: vec!["klines".into(), "ticks".into()],
+            symbols: vec!["SSE:600000".into()],
+            periods: vec!["1m".into(), "1d".into()],
+        };
+        let (start, commands) = complete_line("he", 2, &words);
+        assert_eq!(start, 0);
+        assert_eq!(commands, vec!["help".to_string()]);
+        let (_, databases) = complete_line("USE ", 4, &words);
+        assert_eq!(databases, vec!["default".to_string(), "ashare".to_string()]);
+        let (_, tables) = complete_line("DESCRIBE k", 11, &words);
+        assert_eq!(tables, vec!["klines".to_string()]);
+        let (start, symbols) = complete_line("SELECT * FROM klines WHERE symbol = 'SS", 39, &words);
+        assert!(symbols == vec!["'SSE:600000'".to_string()], "{symbols:?}");
+        assert_eq!(&"SELECT * FROM klines WHERE symbol = 'SS"[start..], "'SS");
+        let (_, periods) = complete_line(".watch klines SSE:600000 ", 25, &words);
+        assert_eq!(periods, vec!["1m".to_string(), "1d".to_string()]);
+    }
+
+    #[test]
+    fn help_and_ll_are_client_commands() {
+        let dir = sample();
+        let mut session = Session::new(dir.clone());
+        let help = catalog_command(&mut session, "help").unwrap().unwrap();
+        assert!(help.contains("SHOW TABLES"));
+        assert!(help.contains("ll"));
+        let listed = catalog_command(&mut session, "ll").unwrap().unwrap();
+        assert!(listed.contains("default"));
+        assert!(listed.contains("klines"));
+        assert!(listed.contains("ticks"));
         let _ = std::fs::remove_dir_all(dir);
     }
 

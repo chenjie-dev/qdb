@@ -446,7 +446,7 @@ order       = ident ["ASC" | "DESC"] { "," ident ["ASC" | "DESC"] }
 
 | 表 | 必要过滤 | 内容 |
 | --- | --- | --- |
-| `ticks` | `symbol`，以及 `ts` 范围或 `LIMIT` | 保留窗口内的逐笔 |
+| `ticks` | `symbol` 可省略；省略时返回全部代码，并用 `LIMIT` 截断 | 保留窗口内的逐笔 |
 | `klines` | `symbol` 和 `period` | 已闭合段加一根未闭合 |
 | `snapshots` | 可选 `symbol` | 最新价和五档。无 `WHERE` 时必须有 `LIMIT` |
 | `symbols` | 无 | 符号目录 |

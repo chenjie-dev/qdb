@@ -313,25 +313,51 @@ impl<'a> SqlEngine<'a> {
     }
 
     fn query_ticks(&self, stmt: &Stmt) -> Result<QueryResult, SqlError> {
-        let symbol = stmt
-            .symbol
-            .clone()
-            .ok_or_else(|| SqlError::Syntax("symbol required".into()))?;
-        let symbol_id = map_resolve(self.engine.resolve(&symbol))?;
-        let columns = vec!["ts".into(), "price".into(), "volume".into(), "seq".into()];
+        let targets = if let Some(symbol) = &stmt.symbol {
+            vec![(symbol.clone(), map_resolve(self.engine.resolve(symbol))?)]
+        } else {
+            self.engine
+                .symbols()
+                .iter()
+                .map(|symbol| (format!("{}:{}", symbol.exchange, symbol.code), symbol.id))
+                .collect()
+        };
+        let columns = if stmt.symbol.is_none() {
+            vec![
+                "symbol".into(),
+                "ts".into(),
+                "price".into(),
+                "volume".into(),
+                "seq".into(),
+            ]
+        } else {
+            vec!["ts".into(), "price".into(), "volume".into(), "seq".into()]
+        };
         let mut rows = Vec::new();
-        for tick in self.engine.ticks(symbol_id) {
-            if stmt.ts_from.is_some_and(|from| tick.ts < from)
-                || stmt.ts_to.is_some_and(|to| tick.ts > to)
-            {
-                continue;
+        for (name, symbol_id) in targets {
+            for tick in self.engine.ticks(symbol_id) {
+                if stmt.ts_from.is_some_and(|from| tick.ts < from)
+                    || stmt.ts_to.is_some_and(|to| tick.ts > to)
+                {
+                    continue;
+                }
+                if stmt.symbol.is_none() {
+                    rows.push(vec![
+                        name.clone(),
+                        tick.ts.to_string(),
+                        tick.price.to_string(),
+                        tick.volume.to_string(),
+                        tick.seq.to_string(),
+                    ]);
+                } else {
+                    rows.push(vec![
+                        tick.ts.to_string(),
+                        tick.price.to_string(),
+                        tick.volume.to_string(),
+                        tick.seq.to_string(),
+                    ]);
+                }
             }
-            rows.push(vec![
-                tick.ts.to_string(),
-                tick.price.to_string(),
-                tick.volume.to_string(),
-                tick.seq.to_string(),
-            ]);
         }
         rows.truncate(stmt.limit as usize);
         Ok(QueryResult { columns, rows })
@@ -419,7 +445,7 @@ fn query_show(tokens: &[String]) -> Result<QueryResult, SqlError> {
         columns: vec!["table".into(), "filter".into()],
         rows: vec![
             vec!["symbols".into(), String::new()],
-            vec!["ticks".into(), "symbol".into()],
+            vec!["ticks".into(), String::new()],
             vec!["snapshots".into(), "symbol".into()],
             vec!["klines".into(), "symbol, period".into()],
         ],
@@ -617,6 +643,24 @@ mod tests {
         assert!(sql
             .query("SELECT last FROM snapshots WHERE symbol = '000001'")
             .is_err());
+    }
+
+    #[test]
+    fn ticks_without_a_symbol_return_every_trade() {
+        let (_dir, engine) = engine();
+        let sql = SqlEngine::new(&engine);
+        let all = sql.query("SELECT * FROM ticks;").unwrap();
+        assert_eq!(all.columns, ["symbol", "ts", "price", "volume", "seq"]);
+        assert!(all
+            .rows
+            .iter()
+            .any(|row| row[0] == "SZSE:000001" && row[2] == "10"));
+        assert!(all.rows.iter().any(|row| row[0] == "SSE:000001"));
+        let one = sql
+            .query("SELECT * FROM ticks WHERE symbol = 'SZSE:000001'")
+            .unwrap();
+        assert_eq!(one.columns, ["ts", "price", "volume", "seq"]);
+        assert!(one.rows.iter().all(|row| row.len() == 4));
     }
 
     #[test]

@@ -18,7 +18,7 @@ cargo run -p qdb-server --bin qdb-client -- data
 cargo run -p qdb-server --bin qdb-client -- data -c "SHOW TABLES"
 ```
 
-`-h` 打印用法。语句可以带结尾分号。
+`-h` 打印用法。交互里输入 `help` 同样打印用法，`ll` 列出库和当前库的表。按 Tab 补全命令、库名、表名和代码。语句可以带结尾分号。
 
 ## 多个库
 
@@ -62,7 +62,7 @@ qdb> DESCRIBE ticks
 | 表 | 查询时要写的过滤 |
 |---|---|
 | `symbols` | 无 |
-| `ticks` | `symbol` |
+| `ticks` | 无 |
 | `snapshots` | `symbol` |
 | `klines` | `symbol` 和 `period` |
 

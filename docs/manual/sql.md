@@ -34,7 +34,7 @@ FROM table_name
 
 | 谓词 | 适用 | 说明 |
 |---|---|---|
-| `symbol = '交易所:代码'` | `ticks`、`snapshots`、`klines` | 也可用唯一的裸代码 |
+| `symbol = '交易所:代码'` | `snapshots`、`klines` 必须写；`ticks` 可以不写 | 也可用唯一的裸代码。`ticks` 不写时返回全部代码 |
 | `period = '1m'` | `klines` | 取值见 [数据模型](data-model.md) |
 | `ts BETWEEN a AND b` | `ticks`、`klines` | 闭区间，纳秒整数 |
 
@@ -57,10 +57,14 @@ SELECT * FROM symbols
 
 ```sql
 SELECT * FROM ticks
-WHERE symbol = 'SSE:600000' AND ts BETWEEN 1704160200000000000 AND 1704160260000000000
 ```
 
-列顺序固定为 `ts`、`price`、`volume`、`seq`。指定其他列名不会改变这四列。
+不写 `symbol` 时，`*` 的列是 `symbol`、`ts`、`price`、`volume`、`seq`，包含库里全部成交，仍受 `LIMIT` 约束。写了 `symbol` 时列是 `ts`、`price`、`volume`、`seq`。指定其他列名不会改变这些列。
+
+```sql
+SELECT * FROM ticks
+WHERE symbol = 'SSE:600000' AND ts BETWEEN 1704160200000000000 AND 1704160260000000000
+```
 
 ### snapshots
 
