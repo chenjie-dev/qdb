@@ -17,6 +17,7 @@ use qdb_wal::{read_from, read_path, WalAppender, WalRead, WalRecord};
 use thiserror::Error;
 
 mod catalog;
+mod checkpoint;
 mod dump;
 mod table;
 pub use catalog::{Catalog, CatalogError};
@@ -70,11 +71,26 @@ pub struct TickRow {
 }
 
 #[derive(Clone, Debug)]
+pub struct LiveRow {
+    pub seq: u64,
+    pub symbol: String,
+    pub kind: &'static str,
+    pub ts: i64,
+    pub price: i64,
+    pub volume: i64,
+    pub last: i64,
+    pub bid_px: [i64; 5],
+    pub ask_px: [i64; 5],
+}
+
+#[derive(Clone, Debug)]
 pub struct QuoteRow {
     pub seq: u64,
     pub last: i64,
     pub bid_px: [i64; 5],
+    pub bid_qty: [i64; 5],
     pub ask_px: [i64; 5],
+    pub ask_qty: [i64; 5],
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -139,15 +155,26 @@ pub struct Engine {
     readonly: bool,
     wal_pos: u64,
     tables: table::TableSet,
+    region: RegionConfig,
+    group_limit: u64,
+    group_interval_ns: u64,
+    group_started_ns: u64,
+    pending: Vec<Frame>,
+    flush_count: u64,
 }
 
 impl Engine {
     pub fn open(root: &Path) -> Result<Self, StoreError> {
+        Self::open_with(root, &RegionConfig::dev())
+    }
+
+    pub fn open_with(root: &Path, region: &RegionConfig) -> Result<Self, StoreError> {
         fs::create_dir_all(root.join("wal")).map_err(io)?;
         fs::create_dir_all(root.join("snap")).map_err(io)?;
-        let wal = WalAppender::open(&root.join("wal/wal-1.qwal")).map_err(io)?;
-        let loaded = wal.read().map_err(io)?;
-        let mut engine = Self::from_replay(root, Some(wal), &loaded)?;
+        let wal_path = root.join("wal/wal-1.qwal");
+        let wal = WalAppender::open(&wal_path).map_err(io)?;
+        let (loaded, checkpoint) = load_for_open(root, &wal_path)?;
+        let mut engine = Self::from_replay(root, Some(wal), &loaded, region, checkpoint)?;
         engine.attach_shm()?;
         engine.sync_metrics();
         Ok(engine)
@@ -161,8 +188,9 @@ impl Engine {
                 root.display()
             )));
         }
-        let loaded = read_path(&root.join("wal/wal-1.qwal")).map_err(io)?;
-        let engine = Self::from_replay(root, None, &loaded)?;
+        let wal_path = root.join("wal/wal-1.qwal");
+        let (loaded, checkpoint) = load_for_open(root, &wal_path)?;
+        let engine = Self::from_replay(root, None, &loaded, &RegionConfig::dev(), checkpoint)?;
         Ok(engine)
     }
 
@@ -170,6 +198,8 @@ impl Engine {
         root: &Path,
         wal: Option<WalAppender>,
         loaded: &WalRead,
+        region: &RegionConfig,
+        checkpoint: Option<checkpoint::Checkpoint>,
     ) -> Result<Self, StoreError> {
         let readonly = wal.is_none();
         let mut engine = Self {
@@ -189,7 +219,16 @@ impl Engine {
             readonly,
             wal_pos: loaded.consumed,
             tables: table::TableSet::default(),
+            region: region.clone(),
+            group_limit: 1,
+            group_interval_ns: 0,
+            group_started_ns: 0,
+            pending: Vec::new(),
+            flush_count: 0,
         };
+        if let Some(checkpoint) = checkpoint {
+            engine.install_checkpoint(checkpoint)?;
+        }
         for record in &loaded.records {
             engine.apply_record(record)?;
         }
@@ -197,6 +236,7 @@ impl Engine {
             engine.crc_failed = true;
             engine.metrics.crc_failed.store(true, Ordering::Release);
         }
+        engine.wal_pos = loaded.consumed;
         engine.next_seq = engine.agg.last_applied_seq() + 1;
         if engine.readonly {
             engine.sync_metrics();
@@ -393,8 +433,18 @@ impl Engine {
         let mut payload = Vec::new();
         payload.extend_from_slice(&symbol_id.to_le_bytes());
         payload.extend_from_slice(&quote.last.to_le_bytes());
-        payload.extend_from_slice(&quote.bid_px[0].to_le_bytes());
-        payload.extend_from_slice(&quote.ask_px[0].to_le_bytes());
+        for value in quote.bid_px {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in quote.bid_qty {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in quote.ask_px {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
+        for value in quote.ask_qty {
+            payload.extend_from_slice(&value.to_le_bytes());
+        }
         self.commit(
             MsgType::TickQuote,
             event_ts_ns,
@@ -450,10 +500,6 @@ impl Engine {
         };
         let wal = self.wal.as_mut().ok_or(StoreError::ReadOnly)?;
         wal.append(&record).map_err(io)?;
-        wal.flush().map_err(io)?;
-        if let Some(shm) = self.shm.as_mut() {
-            shm.set_durable(seq);
-        }
         let events = self.apply_record(&record)?;
         let frame = seal_frame(
             FrameHeader {
@@ -477,15 +523,188 @@ impl Engine {
             self.frames
                 .push(bar_frame(seq, event_ts_ns, event, index as u16 + 1));
         }
+        if self.pending.is_empty() {
+            self.group_started_ns = now_ns();
+        }
+        self.pending.push(frame);
+        self.next_seq = self.applied_seq() + 1;
+        self.maybe_flush()?;
+        Ok(seq)
+    }
+
+    pub fn set_group_commit(&mut self, max_records: u64, interval_ns: u64) {
+        self.group_limit = max_records.max(1);
+        self.group_interval_ns = interval_ns;
+    }
+
+    pub fn flush_count(&self) -> u64 {
+        self.flush_count
+    }
+
+    pub fn checkpoint(&mut self) -> Result<(), StoreError> {
+        self.flush()?;
+        let ticks = self
+            .ticks
+            .iter()
+            .flat_map(|(symbol_id, rows)| rows.iter().map(|row| (*symbol_id, row.clone())))
+            .collect();
+        let quotes = self
+            .quotes
+            .iter()
+            .map(|(symbol_id, quote)| (*symbol_id, quote.clone()))
+            .collect();
+        checkpoint::write(
+            &self.root,
+            &checkpoint::Checkpoint {
+                wal_pos: self.wal_pos,
+                symbols: self.symbols.clone(),
+                exchanges: self.exchanges.clone(),
+                ticks,
+                quotes,
+                agg: self.agg.export_state(),
+                tables: self.tables.to_bytes(),
+            },
+        )
+    }
+
+    pub fn changes_since(
+        &self,
+        symbol: Option<&str>,
+        from_seq: u64,
+        limit: usize,
+    ) -> (u64, Vec<LiveRow>) {
+        let snapshot_seq = self.applied_seq();
+        if from_seq == 0 {
+            let quotes = self
+                .quotes
+                .iter()
+                .filter_map(|(symbol_id, quote)| {
+                    let name = self.symbol_name(*symbol_id);
+                    if symbol.is_some_and(|wanted| wanted != name) {
+                        return None;
+                    }
+                    Some(LiveRow {
+                        seq: quote.seq,
+                        symbol: name,
+                        kind: "snapshot",
+                        ts: 0,
+                        price: quote.last,
+                        volume: 0,
+                        last: quote.last,
+                        bid_px: quote.bid_px,
+                        ask_px: quote.ask_px,
+                    })
+                })
+                .take(limit)
+                .collect();
+            return (snapshot_seq, quotes);
+        }
+        let mut rows = Vec::new();
+        for frame in &self.frames {
+            if rows.len() >= limit || frame.seq() <= from_seq {
+                continue;
+            }
+            let kind = match MsgType::from_u16(frame.header.msg_type) {
+                Some(MsgType::TickTrade) => "trade",
+                Some(MsgType::TickQuote) => "quote",
+                _ => continue,
+            };
+            let name = self.symbol_name(frame.header.symbol_id);
+            if symbol.is_some_and(|wanted| wanted != name) {
+                continue;
+            }
+            if kind == "quote" {
+                if let Some((_, last, bid_px, _, ask_px, _)) = decode_quote_payload(&frame.payload)
+                {
+                    rows.push(LiveRow {
+                        seq: frame.seq(),
+                        symbol: name,
+                        kind,
+                        ts: frame.header.event_ts_ns,
+                        price: last,
+                        volume: 0,
+                        last,
+                        bid_px,
+                        ask_px,
+                    });
+                }
+            } else if let Some(trade) = qdb_abi::decode_trade(&frame.payload[12..]) {
+                rows.push(LiveRow {
+                    seq: frame.seq(),
+                    symbol: name,
+                    kind,
+                    ts: frame.header.event_ts_ns,
+                    price: trade.price,
+                    volume: trade.volume,
+                    last: trade.price,
+                    bid_px: [0; 5],
+                    ask_px: [0; 5],
+                });
+            }
+        }
+        (snapshot_seq, rows)
+    }
+
+    fn install_checkpoint(&mut self, saved: checkpoint::Checkpoint) -> Result<(), StoreError> {
+        self.symbols = saved.symbols;
+        self.by_key = self
+            .symbols
+            .iter()
+            .map(|symbol| ((symbol.exchange_id, symbol.code.clone()), symbol.id))
+            .collect();
+        self.exchanges = saved.exchanges;
+        self.ticks.clear();
+        for (symbol_id, tick) in saved.ticks {
+            self.ticks.entry(symbol_id).or_default().push(tick);
+        }
+        self.quotes = saved.quotes.into_iter().collect();
+        self.agg.import_state(saved.agg);
+        self.tables.from_bytes(&saved.tables)?;
+        self.wal_pos = saved.wal_pos;
+        Ok(())
+    }
+
+    pub fn flush(&mut self) -> Result<(), StoreError> {
+        self.flush_pending()
+    }
+
+    fn maybe_flush(&mut self) -> Result<(), StoreError> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let count_due = self.pending.len() as u64 >= self.group_limit;
+        let time_due = self.group_interval_ns > 0
+            && now_ns().saturating_sub(self.group_started_ns) >= self.group_interval_ns;
+        if count_due || time_due {
+            self.flush_pending()?;
+        }
+        Ok(())
+    }
+
+    fn flush_pending(&mut self) -> Result<(), StoreError> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        if let Some(wal) = self.wal.as_mut() {
+            wal.flush().map_err(io)?;
+        }
+        self.wal_pos = fs::metadata(self.root.join("wal/wal-1.qwal"))
+            .map(|meta| meta.len())
+            .unwrap_or(self.wal_pos);
+        let last = self.pending.last().map(|frame| frame.seq()).unwrap_or(0);
         let applied = self.applied_seq();
         if let Some(shm) = self.shm.as_mut() {
+            shm.set_durable(last);
             shm.set_applied(applied);
-            shm.publish(&frame).map_err(io)?;
+            for frame in &self.pending {
+                shm.publish(frame).map_err(io)?;
+            }
             shm.set_heartbeat(now_ns());
         }
-        self.next_seq = self.applied_seq() + 1;
+        self.pending.clear();
+        self.flush_count += 1;
         self.sync_metrics();
-        Ok(seq)
+        Ok(())
     }
 
     fn apply_record(&mut self, record: &WalRecord) -> Result<Vec<BarEvent>, StoreError> {
@@ -541,28 +760,26 @@ impl Engine {
                     seq: record.seq,
                     last: trade.price,
                     bid_px: [0; 5],
+                    bid_qty: [0; 5],
                     ask_px: [0; 5],
+                    ask_qty: [0; 5],
                 });
                 quote.seq = record.seq;
                 quote.last = trade.price;
                 Ok(events)
             }
             Some(MsgType::TickQuote) => {
-                let symbol_id = u32::from_le_bytes(record.payload[0..4].try_into().unwrap());
-                let last = i64::from_le_bytes(record.payload[4..12].try_into().unwrap());
-                let bid = i64::from_le_bytes(record.payload[12..20].try_into().unwrap());
-                let ask = i64::from_le_bytes(record.payload[20..28].try_into().unwrap());
-                let mut bid_px = [0; 5];
-                let mut ask_px = [0; 5];
-                bid_px[0] = bid;
-                ask_px[0] = ask;
+                let (symbol_id, last, bid_px, bid_qty, ask_px, ask_qty) =
+                    decode_quote_payload(&record.payload).ok_or(StoreError::Crc)?;
                 self.quotes.insert(
                     symbol_id,
                     QuoteRow {
                         seq: record.seq,
                         last,
                         bid_px,
+                        bid_qty,
                         ask_px,
+                        ask_qty,
                     },
                 );
                 self.agg.note_seq(record.seq)?;
@@ -596,7 +813,7 @@ impl Engine {
         if path.exists() {
             let _ = fs::remove_file(&path);
         }
-        let shm = ShmRegion::create(&path, &RegionConfig::dev()).map_err(io)?;
+        let shm = ShmRegion::create(&path, &self.region).map_err(io)?;
         if self.applied_seq() > 0 {
             shm.set_applied(self.applied_seq());
             shm.set_durable(self.applied_seq());
@@ -795,8 +1012,73 @@ fn fixed_label(value: &str) -> [u8; 16] {
     out
 }
 
+fn load_for_open(
+    root: &Path,
+    wal_path: &Path,
+) -> Result<(WalRead, Option<checkpoint::Checkpoint>), StoreError> {
+    let file_len = if wal_path.is_file() {
+        fs::metadata(wal_path).map_err(io)?.len()
+    } else {
+        0
+    };
+    if let Some(saved) = checkpoint::read(root) {
+        if saved.wal_pos <= file_len {
+            let tail = read_from(wal_path, saved.wal_pos).map_err(io)?;
+            if !tail.crc_failed {
+                return Ok((tail, Some(saved)));
+            }
+        }
+    }
+    Ok((read_path(wal_path).map_err(io)?, None))
+}
+
+pub(crate) fn decode_quote_payload(
+    payload: &[u8],
+) -> Option<(u32, i64, [i64; 5], [i64; 5], [i64; 5], [i64; 5])> {
+    if payload.len() < 28 {
+        return None;
+    }
+    let symbol_id = u32::from_le_bytes(payload[0..4].try_into().ok()?);
+    let last = i64::from_le_bytes(payload[4..12].try_into().ok()?);
+    let mut bid_px = [0; 5];
+    let mut bid_qty = [0; 5];
+    let mut ask_px = [0; 5];
+    let mut ask_qty = [0; 5];
+    if payload.len() >= 172 {
+        let mut at = 12;
+        for slot in &mut bid_px {
+            *slot = i64::from_le_bytes(payload[at..at + 8].try_into().ok()?);
+            at += 8;
+        }
+        for slot in &mut bid_qty {
+            *slot = i64::from_le_bytes(payload[at..at + 8].try_into().ok()?);
+            at += 8;
+        }
+        for slot in &mut ask_px {
+            *slot = i64::from_le_bytes(payload[at..at + 8].try_into().ok()?);
+            at += 8;
+        }
+        for slot in &mut ask_qty {
+            *slot = i64::from_le_bytes(payload[at..at + 8].try_into().ok()?);
+            at += 8;
+        }
+    } else {
+        bid_px[0] = i64::from_le_bytes(payload[12..20].try_into().ok()?);
+        ask_px[0] = i64::from_le_bytes(payload[20..28].try_into().ok()?);
+    }
+    Some((symbol_id, last, bid_px, bid_qty, ask_px, ask_qty))
+}
+
 fn io<E: std::fmt::Display>(err: E) -> StoreError {
     StoreError::Io(err.to_string())
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        if self.wal.is_some() {
+            let _ = self.flush_pending();
+        }
+    }
 }
 
 fn now_ns() -> u64 {

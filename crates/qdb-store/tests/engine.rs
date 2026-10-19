@@ -121,6 +121,85 @@ fn clock_watermark_survives_deleting_shared_memory() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[test]
+fn group_commit_fsyncs_once_for_the_batch_and_hides_it_until_flush() {
+    let dir = temp("group");
+    let mut engine = Engine::open(&dir).unwrap();
+    engine.set_group_commit(100, 0);
+    let before = engine.flush_count();
+    engine
+        .write_trade("SSE", "600000", utc(1, 0, 0), 10, 1)
+        .unwrap();
+    engine
+        .write_trade("SSE", "600000", utc(1, 0, 1), 11, 1)
+        .unwrap();
+    assert_eq!(engine.flush_count(), before);
+    engine.flush().unwrap();
+    assert_eq!(engine.flush_count(), before + 1);
+    drop(engine);
+    let restored = Engine::open_read(&dir).unwrap();
+    let id = restored.resolve("SSE:600000").unwrap();
+    assert_eq!(restored.ticks(id).len(), 2);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn quote_keeps_five_levels_and_changes_start_from_the_snapshot() {
+    let dir = temp("depth");
+    let mut engine = Engine::open(&dir).unwrap();
+    let quote = TickQuote {
+        last: 11,
+        volume: 0,
+        amount: 0,
+        bid_px: [10, 9, 8, 7, 6],
+        bid_qty: [1, 2, 3, 4, 5],
+        ask_px: [12, 13, 14, 15, 16],
+        ask_qty: [6, 7, 8, 9, 10],
+    };
+    engine
+        .write_quote("SSE", "600000", utc(1, 0, 0), &quote)
+        .unwrap();
+    let id = engine.resolve("SSE:600000").unwrap();
+    let stored = engine.quote(id).unwrap();
+    assert_eq!(stored.bid_px, [10, 9, 8, 7, 6]);
+    assert_eq!(stored.ask_px, [12, 13, 14, 15, 16]);
+    assert_eq!(stored.bid_qty[1], 2);
+    let (snapshot_seq, rows) = engine.changes_since(Some("SSE:600000"), 0, 10);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].kind, "snapshot");
+    assert_eq!(rows[0].bid_px[2], 8);
+    let (_seq, next) = engine.changes_since(Some("SSE:600000"), snapshot_seq, 10);
+    assert!(next.is_empty());
+    engine
+        .write_trade("SSE", "600000", utc(1, 0, 1), 12, 3)
+        .unwrap();
+    let (_seq, next) = engine.changes_since(Some("SSE:600000"), snapshot_seq, 10);
+    assert!(next
+        .iter()
+        .any(|row| row.kind == "trade" && row.price == 12));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn checkpoint_survives_a_corrupt_wal_prefix() {
+    let dir = temp("ck");
+    let mut engine = Engine::open(&dir).unwrap();
+    engine
+        .write_trade("SSE", "600000", utc(2, 0, 0), 15, 4)
+        .unwrap();
+    engine.checkpoint().unwrap();
+    drop(engine);
+    let wal = dir.join("wal/wal-1.qwal");
+    let mut raw = std::fs::read(&wal).unwrap();
+    raw[20] ^= 0xff;
+    std::fs::write(&wal, &raw).unwrap();
+    let restored = Engine::open(&dir).unwrap();
+    assert!(!restored.crc_failed());
+    let id = restored.resolve("SSE:600000").unwrap();
+    assert_eq!(restored.ticks(id)[0].price, 15);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 fn temp(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("qdb-engine-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

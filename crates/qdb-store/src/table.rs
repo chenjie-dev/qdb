@@ -107,6 +107,60 @@ pub struct TableSet {
 }
 
 impl TableSet {
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        let names = self.names();
+        push_u16(&mut out, names.len() as u16);
+        for name in names {
+            let schema = &self.schemas[&name];
+            let encoded = Self::encode_schema(schema);
+            out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+            out.extend_from_slice(&encoded);
+            let rows = &self.rows[&name];
+            out.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+            for row in rows {
+                for cell in row {
+                    match cell {
+                        Cell::Int64(value) => out.extend_from_slice(&value.to_le_bytes()),
+                        Cell::Bool(value) => out.push(u8::from(*value)),
+                        Cell::String(value) => push_str(&mut out, value),
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    pub fn from_bytes(&mut self, bytes: &[u8]) -> Result<(), StoreError> {
+        let mut cursor = 0;
+        let count = take_u16(bytes, &mut cursor)? as usize;
+        for _ in 0..count {
+            let len = take_u32(bytes, &mut cursor)? as usize;
+            let end = cursor + len;
+            let schema = Self::decode_schema(
+                bytes
+                    .get(cursor..end)
+                    .ok_or_else(|| StoreError::Schema("truncated".into()))?,
+            )?;
+            cursor = end;
+            let row_count = take_u32(bytes, &mut cursor)? as usize;
+            self.insert_schema(schema.clone())?;
+            for _ in 0..row_count {
+                let mut values = Vec::new();
+                for column in &schema.columns {
+                    values.push(match column.ty {
+                        ColumnType::Int64 => Cell::Int64(take_i64(bytes, &mut cursor)?),
+                        ColumnType::Bool => Cell::Bool(take_u8(bytes, &mut cursor)? == 1),
+                        ColumnType::String => Cell::String(take_str(bytes, &mut cursor)?),
+                    });
+                }
+                let payload = self.encode_row(&schema.name, &values)?;
+                self.insert_encoded(&payload)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn names(&self) -> Vec<String> {
         let mut names: Vec<String> = self.schemas.keys().cloned().collect();
         names.sort();
@@ -425,6 +479,19 @@ fn take_u8(bytes: &[u8], cursor: &mut usize) -> Result<u8, StoreError> {
         .ok_or_else(|| StoreError::Schema("truncated".into()))?;
     *cursor += 1;
     Ok(value)
+}
+
+fn take_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32, StoreError> {
+    let end = cursor
+        .checked_add(4)
+        .ok_or_else(|| StoreError::Schema("truncated".into()))?;
+    let raw: [u8; 4] = bytes
+        .get(*cursor..end)
+        .ok_or_else(|| StoreError::Schema("truncated".into()))?
+        .try_into()
+        .unwrap();
+    *cursor = end;
+    Ok(u32::from_le_bytes(raw))
 }
 
 fn take_u16(bytes: &[u8], cursor: &mut usize) -> Result<u16, StoreError> {

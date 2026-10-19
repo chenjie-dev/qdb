@@ -4,8 +4,8 @@
 use std::collections::BTreeMap;
 
 use qdb_abi::{
-    align_bucket, KlineBody, Period, KLINE_INCOMPLETE, ORIGIN_LIVE, PERIODS,
-    STATE_CLOSED, STATE_OPEN,
+    align_bucket, KlineBody, Period, KLINE_INCOMPLETE, ORIGIN_LIVE, PERIODS, STATE_CLOSED,
+    STATE_OPEN,
 };
 use thiserror::Error;
 
@@ -46,6 +46,14 @@ pub enum ApplyStatus {
     Duplicate,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct AggState {
+    pub last_applied_seq: u64,
+    pub late_tick_total: u64,
+    pub open: Vec<OpenBar>,
+    pub sealed: Vec<((u32, u16), Vec<KlineBody>)>,
+}
+
 pub struct KlineAggregator {
     last_applied_seq: u64,
     open: BTreeMap<(u32, u16), OpenBar>,
@@ -77,6 +85,30 @@ impl KlineAggregator {
         self.open.get(&(symbol_id, period.id()))
     }
 
+    pub fn export_state(&self) -> AggState {
+        AggState {
+            last_applied_seq: self.last_applied_seq,
+            late_tick_total: self.late_tick_total,
+            open: self.open.values().cloned().collect(),
+            sealed: self
+                .sealed
+                .iter()
+                .map(|(key, rows)| (*key, rows.clone()))
+                .collect(),
+        }
+    }
+
+    pub fn import_state(&mut self, state: AggState) {
+        self.last_applied_seq = state.last_applied_seq;
+        self.late_tick_total = state.late_tick_total;
+        self.open = state
+            .open
+            .into_iter()
+            .map(|bar| ((bar.symbol_id, bar.period.id()), bar))
+            .collect();
+        self.sealed = state.sealed.into_iter().collect();
+    }
+
     pub fn sealed(&self, symbol_id: u32, period: Period) -> &[KlineBody] {
         self.sealed
             .get(&(symbol_id, period.id()))
@@ -84,7 +116,11 @@ impl KlineAggregator {
             .unwrap_or(&[])
     }
 
-    pub fn apply_trade(&mut self, seq: u64, trade: &TradeInput) -> Result<(ApplyStatus, Vec<BarEvent>), AggError> {
+    pub fn apply_trade(
+        &mut self,
+        seq: u64,
+        trade: &TradeInput,
+    ) -> Result<(ApplyStatus, Vec<BarEvent>), AggError> {
         if seq <= self.last_applied_seq {
             return Ok((ApplyStatus::Duplicate, Vec::new()));
         }
@@ -104,7 +140,12 @@ impl KlineAggregator {
         Ok((ApplyStatus::Applied, events))
     }
 
-    pub fn apply_clock(&mut self, seq: u64, exchange_id: u16, watermark_ns: i64) -> Result<Vec<BarEvent>, AggError> {
+    pub fn apply_clock(
+        &mut self,
+        seq: u64,
+        exchange_id: u16,
+        watermark_ns: i64,
+    ) -> Result<Vec<BarEvent>, AggError> {
         if seq <= self.last_applied_seq {
             return Ok(Vec::new());
         }
@@ -267,21 +308,57 @@ mod tests {
     #[test]
     fn three_prints_build_one_second_and_one_minute_bars() {
         let mut agg = KlineAggregator::default();
-        agg.apply_trade(1, &trade(ts(9, 30, 0, 100_000_000), 10, 100)).unwrap();
-        agg.apply_trade(2, &trade(ts(9, 30, 0, 200_000_000), 12, 50)).unwrap();
+        agg.apply_trade(1, &trade(ts(9, 30, 0, 100_000_000), 10, 100))
+            .unwrap();
+        agg.apply_trade(2, &trade(ts(9, 30, 0, 200_000_000), 12, 50))
+            .unwrap();
         let sec = agg.open_bar(1, Period::S1).unwrap();
         let min = agg.open_bar(1, Period::M1).unwrap();
-        assert_eq!((sec.body.open, sec.body.high, sec.body.low, sec.body.close, sec.body.volume), (10, 12, 10, 12, 150));
+        assert_eq!(
+            (
+                sec.body.open,
+                sec.body.high,
+                sec.body.low,
+                sec.body.close,
+                sec.body.volume
+            ),
+            (10, 12, 10, 12, 150)
+        );
         assert_eq!(min.body, sec.body);
 
         agg.apply_trade(3, &trade(ts(9, 30, 1, 0), 11, 10)).unwrap();
         let sealed = agg.sealed(1, Period::S1);
         assert_eq!(sealed.len(), 1);
-        assert_eq!((sealed[0].open, sealed[0].high, sealed[0].low, sealed[0].close, sealed[0].volume), (10, 12, 10, 12, 150));
+        assert_eq!(
+            (
+                sealed[0].open,
+                sealed[0].high,
+                sealed[0].low,
+                sealed[0].close,
+                sealed[0].volume
+            ),
+            (10, 12, 10, 12, 150)
+        );
         let open_sec = agg.open_bar(1, Period::S1).unwrap();
-        assert_eq!((open_sec.body.open, open_sec.body.close, open_sec.body.volume), (11, 11, 10));
+        assert_eq!(
+            (
+                open_sec.body.open,
+                open_sec.body.close,
+                open_sec.body.volume
+            ),
+            (11, 11, 10)
+        );
         let minute = agg.open_bar(1, Period::M1).unwrap();
-        assert_eq!((minute.body.open, minute.body.high, minute.body.low, minute.body.close, minute.body.volume), (10, 12, 10, 11, 160));
+        assert_eq!(
+            (
+                minute.body.open,
+                minute.body.high,
+                minute.body.low,
+                minute.body.close,
+                minute.body.volume
+            ),
+            (10, 12, 10, 11, 160)
+        );
         assert!(agg.sealed(1, Period::M1).is_empty());
 
         let frozen = sealed[0];

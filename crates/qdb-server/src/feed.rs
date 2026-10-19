@@ -116,6 +116,7 @@ fn pull_once(
             },
         );
     }
+    guard.flush().map_err(|err| err.to_string())?;
     Ok(())
 }
 
@@ -472,6 +473,7 @@ pub fn apply_trades(engine: &Mutex<Engine>, body: &[u8]) -> Result<String, Strin
             .map_err(|e| e.to_string())?;
         n += 1;
     }
+    guard.flush().map_err(|e| e.to_string())?;
     Ok(format!("{{\"written\":{n}}}"))
 }
 
@@ -522,6 +524,7 @@ pub fn apply_quotes(
         );
         n += 1;
     }
+    guard.flush().map_err(|e| e.to_string())?;
     Ok(format!("{{\"written\":{n}}}"))
 }
 

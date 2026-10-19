@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use qdb_wal::{read_dump, read_path, replace_wal, write_dump, WalAppender};
 use thiserror::Error;
 
+use qdb_shm::RegionConfig;
+
 use crate::{Engine, StoreError};
 
 #[derive(Debug, Error)]
@@ -107,6 +109,16 @@ impl Catalog {
 
     pub fn open_database(&self, name: &str) -> Result<Engine, CatalogError> {
         Ok(Engine::open(&self.path(name)?)?)
+    }
+
+    pub fn open_database_with(
+        &self,
+        name: &str,
+        region: &RegionConfig,
+    ) -> Result<Engine, CatalogError> {
+        let mut engine = Engine::open_with(&self.path(name)?, region)?;
+        engine.set_group_commit(256, 1_000_000);
+        Ok(engine)
     }
 
     pub fn open_database_read(&self, name: &str) -> Result<Engine, CatalogError> {

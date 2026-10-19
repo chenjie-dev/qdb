@@ -1,6 +1,6 @@
 # 服务进程
 
-`qdb` 打开一个实例目录，里面可以有多个库。同一台机器只能有一个 `qdb` 进程，因为共享内存只能有一个写入实例。第二个进程会在打开库之前退出。HTTP 接收成交和报价写入，并提供快照与 K 线读取。查询参数 `db` 选择库，缺省是 `default`。它不接收 SQL。查询用 [客户端](client.md)。进程内采集写入 `default`。EquityLab Compose 设 `QDB_FEED=0`，改由外部采集进程写入。
+`qdb` 打开一个实例目录，里面可以有多个库。同一台机器只能有一个 `qdb` 进程，因为共享内存只能有一个写入实例。第二个进程会在打开库之前退出。HTTP 接收成交和报价写入，并提供快照与 K 线读取。查询参数 `db` 选择库，缺省是 `default`。一批成交或报价只 `fsync` 一次。`GET /v1/changes?symbol=SSE:600000&from_seq=0` 给多个下游读取：`from_seq=0` 返回当前五档快照和 `snapshot_seq`，之后用这个序号拉增量。它不接收 SQL。查询用 [客户端](client.md)。进程内采集写入 `default`。EquityLab Compose 设 `QDB_FEED=0`，改由外部采集进程写入。
 
 ## 启动
 

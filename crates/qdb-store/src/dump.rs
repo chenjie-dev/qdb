@@ -70,33 +70,29 @@ fn replay_records(engine: &mut Engine, records: &[WalRecord]) -> Result<Vec<Chan
                 out.push(snapshot_change(seq, &symbol, ts, trade.price, 0, 0));
             }
             Some(MsgType::TickQuote) if record.payload.len() >= 28 => {
-                let symbol_id = u32::from_le_bytes(record.payload[0..4].try_into().unwrap());
-                let last = i64::from_le_bytes(record.payload[4..12].try_into().unwrap());
-                let bid = i64::from_le_bytes(record.payload[12..20].try_into().unwrap());
-                let ask = i64::from_le_bytes(record.payload[20..28].try_into().unwrap());
+                let (symbol_id, last, bid_px, bid_qty, ask_px, ask_qty) =
+                    crate::decode_quote_payload(&record.payload).ok_or(StoreError::Crc)?;
                 let (exchange, code) = symbols
                     .get(&symbol_id)
                     .cloned()
                     .ok_or(StoreError::NotFound)?;
-                let mut quote = TickQuote {
+                let quote = TickQuote {
                     last,
                     volume: 0,
                     amount: 0,
-                    bid_px: [0; 5],
-                    bid_qty: [0; 5],
-                    ask_px: [0; 5],
-                    ask_qty: [0; 5],
+                    bid_px,
+                    bid_qty,
+                    ask_px,
+                    ask_qty,
                 };
-                quote.bid_px[0] = bid;
-                quote.ask_px[0] = ask;
                 let seq = engine.write_quote(&exchange, &code, 0, &quote)?;
                 out.push(snapshot_change(
                     seq,
                     &format!("{exchange}:{code}"),
                     0,
                     last,
-                    bid,
-                    ask,
+                    bid_px[0],
+                    ask_px[0],
                 ));
             }
             Some(MsgType::ClockTick) if record.payload.len() >= 10 => {

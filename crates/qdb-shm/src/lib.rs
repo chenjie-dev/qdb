@@ -64,6 +64,15 @@ impl RegionConfig {
         }
     }
 
+    /// 行情中心规模：全市场代码和更深的环形缓冲。
+    pub fn market() -> Self {
+        Self {
+            max_symbols: 65_536,
+            ring_capacity: 65_536,
+            reader_slots: 64,
+        }
+    }
+
     pub fn for_test(ring_capacity: u32) -> Self {
         Self {
             max_symbols: 32,

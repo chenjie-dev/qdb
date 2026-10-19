@@ -319,7 +319,17 @@ impl<'a> SqlEngine<'a> {
             .map(|col| match col.as_str() {
                 "last" => quote.last.to_string(),
                 "bid_px1" => quote.bid_px[0].to_string(),
+                "bid_px2" => quote.bid_px[1].to_string(),
+                "bid_px3" => quote.bid_px[2].to_string(),
+                "bid_px4" => quote.bid_px[3].to_string(),
+                "bid_px5" => quote.bid_px[4].to_string(),
                 "ask_px1" => quote.ask_px[0].to_string(),
+                "ask_px2" => quote.ask_px[1].to_string(),
+                "ask_px3" => quote.ask_px[2].to_string(),
+                "ask_px4" => quote.ask_px[3].to_string(),
+                "ask_px5" => quote.ask_px[4].to_string(),
+                "bid_qty1" => quote.bid_qty[0].to_string(),
+                "ask_qty1" => quote.ask_qty[0].to_string(),
                 "seq" => quote.seq.to_string(),
                 _ => String::new(),
             })

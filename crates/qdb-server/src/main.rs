@@ -34,7 +34,7 @@ impl Databases {
         }
         let engine = Arc::new(Mutex::new(
             self.catalog
-                .open_database(name)
+                .open_database_with(name, &qdb_shm::RegionConfig::market())
                 .map_err(|err| err.to_string())?,
         ));
         engines.insert(name.to_string(), engine.clone());
@@ -129,6 +129,52 @@ fn handle(
                 &format!("{{\"error\":\"{err}\"}}"),
             ),
         };
+    }
+    if route == "/v1/changes" {
+        let symbol = query_param(query, "symbol").into_iter().next();
+        let from_seq = query_param(query, "from_seq")
+            .into_iter()
+            .next()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0);
+        let limit = query_param(query, "limit")
+            .into_iter()
+            .next()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1000);
+        let guard = match engine.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                return write_http(
+                    &mut stream,
+                    400,
+                    "application/json",
+                    "{\"error\":\"engine lock\"}",
+                )
+            }
+        };
+        let (snapshot_seq, rows) = guard.changes_since(symbol.as_deref(), from_seq, limit);
+        let mut body =
+            format!("{{\"snapshot_seq\":{snapshot_seq},\"from_seq\":{from_seq},\"changes\":[");
+        for (index, row) in rows.iter().enumerate() {
+            if index > 0 {
+                body.push(',');
+            }
+            body.push_str(&format!(
+                "{{\"seq\":{},\"symbol\":\"{}\",\"kind\":\"{}\",\"ts\":{},\"price\":{},\"volume\":{},\"last\":{},\"bid_px\":[{},{},{},{},{}],\"ask_px\":[{},{},{},{},{}]}}",
+                row.seq,
+                row.symbol,
+                row.kind,
+                row.ts,
+                row.price,
+                row.volume,
+                row.last,
+                row.bid_px[0], row.bid_px[1], row.bid_px[2], row.bid_px[3], row.bid_px[4],
+                row.ask_px[0], row.ask_px[1], row.ask_px[2], row.ask_px[3], row.ask_px[4],
+            ));
+        }
+        body.push_str("]}");
+        return write_http(&mut stream, 200, "application/json", &body);
     }
     if route == "/v1/trades" && req.method == "POST" {
         return match apply_trades(&engine, &req.body) {
