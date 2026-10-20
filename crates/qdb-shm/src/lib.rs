@@ -1,4 +1,6 @@
-//! 共享内存区域、环形缓冲和 seqlock。unsafe 只出现在映射、原子量别名和实例文件锁处。
+//! 共享内存区域、环形缓冲、seqlock 和本机实例锁。
+//!
+//! `unsafe` 只出现在映射、原子量别名和实例文件锁处。每个 `unsafe` 块前有 `// SAFETY:`。
 
 use std::fs::{File, OpenOptions};
 use std::os::unix::io::AsRawFd;
@@ -48,6 +50,7 @@ pub enum ShmError {
     InstanceRunning,
 }
 
+/// 共享内存区域的容量。`ring_capacity` 必须是 2 的幂，否则 [`ShmRegion::create`] 失败。
 #[derive(Clone, Debug)]
 pub struct RegionConfig {
     pub max_symbols: u32,
@@ -56,6 +59,11 @@ pub struct RegionConfig {
 }
 
 impl RegionConfig {
+    /// 开发规模：1024 个符号槽、4096 帧、64 个读者槽。
+    ///
+    /// # Returns
+    ///
+    /// 库接口默认打开库时用这份配置。不适合全市场。
     pub fn dev() -> Self {
         Self {
             max_symbols: 1024,
@@ -64,7 +72,11 @@ impl RegionConfig {
         }
     }
 
-    /// 行情中心规模：全市场代码和更深的环形缓冲。
+    /// 行情中心规模：65536 个符号槽、65536 帧、64 个读者槽。
+    ///
+    /// # Returns
+    ///
+    /// `qdb` 进程打开库时使用的配置。映射文件大约数百兆。
     pub fn market() -> Self {
         Self {
             max_symbols: 65_536,
@@ -73,6 +85,11 @@ impl RegionConfig {
         }
     }
 
+    /// 测试用的小区域。
+    ///
+    /// # Arguments
+    ///
+    /// * `ring_capacity` - 帧槽数，必须是 2 的幂。
     pub fn for_test(ring_capacity: u32) -> Self {
         Self {
             max_symbols: 32,
@@ -103,6 +120,20 @@ pub struct SnapshotView {
 }
 
 impl ShmRegion {
+    /// 截断并重建区域文件，再以可写方式映射。
+    ///
+    /// 已有内容会被清掉。调用方必须是本机唯一写入者。
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - `region.bin` 路径。父目录不存在时会创建。
+    /// * `cfg` - 容量。`ring_capacity` 为 0 或不是 2 的幂时失败。
+    ///
+    /// # Errors
+    ///
+    /// * [`ShmError::BadCapacity`] - 帧槽数不合法。
+    /// * [`ShmError::Io`] - 建文件或映射失败。
+    /// * [`ShmError::BigEndian`] - 本机不是小端。
     pub fn create(path: &Path, cfg: &RegionConfig) -> Result<Self, ShmError> {
         ensure_le()?;
         if cfg.ring_capacity == 0 || !cfg.ring_capacity.is_power_of_two() {
@@ -121,6 +152,7 @@ impl ShmRegion {
         let len = region_len(cfg);
         file.set_len(len as u64)
             .map_err(|err| ShmError::Io(err.to_string()))?;
+        // SAFETY: 文件长度已设为区域长度，映射在 `ShmRegion` 持有期间有效。
         let mut mmap =
             unsafe { MmapMut::map_mut(&file) }.map_err(|err| ShmError::Io(err.to_string()))?;
         mmap.fill(0);
@@ -131,6 +163,15 @@ impl ShmRegion {
         })
     }
 
+    /// 以可写方式打开已有区域，不截断。
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - 已经由 [`ShmRegion::create`] 写好的文件。
+    ///
+    /// # Errors
+    ///
+    /// 文件不存在、魔数不对或字节序不对时返回 [`ShmError`]。
     pub fn open_write(path: &Path) -> Result<Self, ShmError> {
         ensure_le()?;
         let file = OpenOptions::new()
@@ -138,6 +179,7 @@ impl ShmRegion {
             .write(true)
             .open(path)
             .map_err(|err| ShmError::Io(err.to_string()))?;
+        // SAFETY: 打开的是已有区域文件，长度由创建时写定，映射在 `ShmRegion` 持有期间有效。
         let mmap =
             unsafe { MmapMut::map_mut(&file) }.map_err(|err| ShmError::Io(err.to_string()))?;
         check_header(&mmap)?;
@@ -145,6 +187,18 @@ impl ShmRegion {
         Ok(Self { mmap, capacity })
     }
 
+    /// 把一帧按序号写入环形槽，并推进 `write_seq`。
+    ///
+    /// 槽先写成 0，载荷写完后再用 Release 存储序号。读者看到非 0 序号时载荷已经可见。
+    /// 不检查这帧是否已经 `fsync`。调用方应先落盘再发布。
+    ///
+    /// # Arguments
+    ///
+    /// * `frame` - 已封好的 256 字节帧。序号决定槽位。
+    ///
+    /// # Errors
+    ///
+    /// 当前实现不返回错误。签名保留 `Result`，以便以后拒绝非法帧。
     pub fn publish(&mut self, frame: &Frame) -> Result<(), ShmError> {
         let seq = frame.seq();
         let index = (seq & u64::from(self.capacity - 1)) as usize;
@@ -158,6 +212,11 @@ impl ShmRegion {
         Ok(())
     }
 
+    /// 发布已经 `fsync` 的最大序号。读者用它判断能看到的帧是否已落盘。
+    ///
+    /// # Arguments
+    ///
+    /// * `seq` - 已落盘的最大序号。
     pub fn set_durable(&self, seq: u64) {
         atomic_u64(&self.mmap, OFF_DURABLE_SEQ).store(seq, Ordering::Release);
     }
@@ -192,12 +251,22 @@ impl ShmRegion {
 }
 
 impl RingReader {
+    /// 只读打开环形缓冲，游标从 0 开始。
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - 写入者创建的 `region.bin`。
+    ///
+    /// # Errors
+    ///
+    /// 文件不存在或头部不合法时返回 [`ShmError`]。
     pub fn open(path: &Path) -> Result<Self, ShmError> {
         ensure_le()?;
         let file = OpenOptions::new()
             .read(true)
             .open(path)
             .map_err(|err| ShmError::Io(err.to_string()))?;
+        // SAFETY: 只读映射已有区域文件，读者不取得写入权。
         let mmap = unsafe { Mmap::map(&file) }.map_err(|err| ShmError::Io(err.to_string()))?;
         check_header(&mmap)?;
         let epoch = atomic_u64_ro(&mmap, OFF_EPOCH).load(Ordering::Acquire);
@@ -208,6 +277,18 @@ impl RingReader {
         })
     }
 
+    /// 读取下一帧。
+    ///
+    /// 写入序号还没追上游标时返回 `Ok(None)`。写入者重建区域后返回 [`ShmError::EpochChanged`]。
+    /// 读者落后一整圈时返回 [`ShmError::Lapped`]，之后的帧不能再当成连续数据。
+    ///
+    /// # Errors
+    ///
+    /// * [`ShmError::EpochChanged`] - 区域被重建。
+    /// * [`ShmError::Lapped`] - 环形缓冲已经套圈。
+    /// * [`ShmError::Torn`] - 槽里的序号对不上，读到了半帧。
+    /// * [`ShmError::BadCrc`] - 帧校验和不对。
+    /// * [`ShmError::SeqGap`] - 重试后槽里仍不是期望的序号。
     pub fn next(&mut self) -> Result<Option<Frame>, ShmError> {
         let epoch = atomic_u64_ro(&self.mmap, OFF_EPOCH).load(Ordering::Acquire);
         if epoch != self.epoch {
@@ -290,6 +371,9 @@ pub fn write_snapshot(pod: &SnapshotPod, seq: u64, last: i64, bid: i64, ask: i64
     pod.version.fetch_add(1, Ordering::Release);
 }
 
+/// # Safety
+///
+/// `offset` 落在 `pod` 内部，并且按 `T` 对齐。调用时该槽的 `version` 为奇数。
 unsafe fn write_at<T>(pod: &SnapshotPod, offset: usize, value: T) {
     let ptr = (pod as *const SnapshotPod as *const u8).add(offset) as *mut T;
     std::ptr::write(ptr, value);
@@ -386,6 +470,18 @@ pub struct InstanceLock {
 }
 
 impl InstanceLock {
+    /// 非阻塞地独占这把文件锁。
+    ///
+    /// 锁在 [`Drop`] 时释放。进程异常退出后由操作系统释放。同一进程里第二次调用不会失败，因为 `flock` 按进程计。
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - 锁文件。默认是 `/tmp/qdb.instance.lock`，测试用 `QDB_INSTANCE_LOCK` 换路径。
+    ///
+    /// # Errors
+    ///
+    /// * [`ShmError::InstanceRunning`] - 另一个进程已经持有这把锁。
+    /// * [`ShmError::Io`] - 建目录或打开文件失败。
     pub fn try_acquire(path: &Path) -> Result<Self, ShmError> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
@@ -399,6 +495,7 @@ impl InstanceLock {
             .truncate(false)
             .open(path)
             .map_err(|err| ShmError::Io(err.to_string()))?;
+        // SAFETY: `file` 是刚打开的描述符。锁由 `InstanceLock` 持有，Drop 时解锁。
         let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if rc != 0 {
             return Err(ShmError::InstanceRunning);
@@ -409,6 +506,7 @@ impl InstanceLock {
 
 impl Drop for InstanceLock {
     fn drop(&mut self) {
+        // SAFETY: 解锁的是本结构体持有的同一描述符。
         unsafe {
             libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
         }
@@ -421,15 +519,23 @@ extern "C" fn on_shutdown(_: i32) {
     SHUTDOWN.store(true, Ordering::Release);
 }
 
-/// 监听 SIGINT 和 SIGTERM。处理函数只改一个原子标记。
+/// 把 SIGINT 和 SIGTERM 记到 [`shutdown_requested`]。
+///
+/// 处理函数只写一个原子量，不分配内存、不拿锁。重复调用会覆盖这两个信号原来的处理函数。
 pub fn watch_shutdown() {
     let handler = on_shutdown as *const () as libc::sighandler_t;
+    // SAFETY: 处理函数只写原子标记，不分配内存、不拿锁。
     unsafe {
         libc::signal(libc::SIGINT, handler);
         libc::signal(libc::SIGTERM, handler);
     }
 }
 
+/// 是否已经收到 SIGINT 或 SIGTERM。
+///
+/// # Returns
+///
+/// 还没调用 [`watch_shutdown`]，或信号还没到时，返回 `false`。
 pub fn shutdown_requested() -> bool {
     SHUTDOWN.load(Ordering::Acquire)
 }

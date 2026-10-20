@@ -1,3 +1,5 @@
+//! 行情进程。一台机器只运行一个实例，退出时卸下共享内存并清掉行情表。
+
 mod feed;
 
 use std::collections::HashMap;

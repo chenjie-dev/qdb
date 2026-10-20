@@ -9,6 +9,24 @@ use qdb_wal::{read_dump, WalRecord};
 
 use crate::{Change, Engine, StoreError};
 
+/// 把转储文件里的成交、报价和时钟按顺序重新写入。
+///
+/// 每条记录分配新的 `seq`，不保留文件里的原序号。建表和插入记录会被跳过。
+///
+/// # Arguments
+///
+/// * `engine` - 可写引擎。已有数据会留着，新记录接在后面。
+/// * `file` - `QDBDUMP1` 文件。
+///
+/// # Returns
+///
+/// 这次回放产生的变更。同一笔成交会出现在 `ticks` 和 `snapshots`。
+///
+/// # Errors
+///
+/// * [`StoreError::Io`] - 文件打不开，或文件头不是转储格式。
+/// * [`StoreError::Crc`] - 转储文件校验失败。
+/// * [`StoreError::ReadOnly`] - 引擎只读。
 pub fn replay_file(engine: &mut Engine, file: &Path) -> Result<Vec<Change>, StoreError> {
     let dump = read_dump(file).map_err(as_io)?;
     if dump.crc_failed {
@@ -17,6 +35,16 @@ pub fn replay_file(engine: &mut Engine, file: &Path) -> Result<Vec<Change>, Stor
     replay_records(engine, &dump.records)
 }
 
+/// 与 [`replay_file`] 相同，输入是已经读入内存的转储字节。
+///
+/// # Arguments
+///
+/// * `engine` - 可写引擎。
+/// * `bytes` - 含 `QDBDUMP1` 魔数的完整文件内容。
+///
+/// # Errors
+///
+/// 魔数不对时返回 [`StoreError::Io`]。校验失败时返回 [`StoreError::Crc`]。
 pub fn replay_bytes(engine: &mut Engine, bytes: &[u8]) -> Result<Vec<Change>, StoreError> {
     if bytes.len() < 8 || &bytes[..8] != qdb_wal::DUMP_MAGIC {
         return Err(StoreError::Io("not a qdb dump".into()));
@@ -28,6 +56,17 @@ pub fn replay_bytes(engine: &mut Engine, bytes: &[u8]) -> Result<Vec<Change>, St
     replay_records(engine, &dump.records)
 }
 
+/// 在临时库里回放转储文件，只返回变更，不改源库。
+///
+/// 临时目录在返回前删除。回放使用新的 `seq`。
+///
+/// # Arguments
+///
+/// * `file` - `QDBDUMP1` 文件。
+///
+/// # Errors
+///
+/// 同 [`replay_file`]。临时目录创建失败时返回 [`StoreError::Io`]。
 pub fn playback(file: &Path) -> Result<Vec<Change>, StoreError> {
     let n = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

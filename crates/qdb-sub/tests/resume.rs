@@ -23,8 +23,14 @@ fn a_hole_between_matching_frames_is_a_gap() {
     let trade_seq = engine.applied_seq();
     let start = engine.klines(id, Period::M1)[0].bucket_start_ns;
     engine.write_clock("BINANCE", start + 1_000_000).unwrap();
-    engine.write_trade("BINANCE", "BTCUSDT", start + 2_000_000_000, 120, 1).unwrap();
-    let resumed = catch_up(&engine, &filter("BINANCE:BTCUSDT", Some(Period::M1), trade_seq)).unwrap();
+    engine
+        .write_trade("BINANCE", "BTCUSDT", start + 2_000_000_000, 120, 1)
+        .unwrap();
+    let resumed = catch_up(
+        &engine,
+        &filter("BINANCE:BTCUSDT", Some(Period::M1), trade_seq),
+    )
+    .unwrap();
     assert!(resumed.iter().any(|msg| matches!(msg, SubMsg::Gap { .. })));
     assert!(is_ordered(&resumed));
     let _ = std::fs::remove_dir_all(dir);
@@ -48,7 +54,9 @@ fn sample() -> (std::path::PathBuf, Engine) {
     let mut engine = Engine::open(&dir).unwrap();
     let days = days_from_civil(2024, 1, 2);
     let ts = days * 86_400 * 1_000_000_000;
-    engine.write_trade("BINANCE", "BTCUSDT", ts + 10_000_000_000, 100, 1).unwrap();
+    engine
+        .write_trade("BINANCE", "BTCUSDT", ts + 10_000_000_000, 100, 1)
+        .unwrap();
     engine.write_trade("SSE", "000001", ts, 1, 1).unwrap();
     engine.write_trade("SZSE", "000001", ts, 1, 1).unwrap();
     (dir, engine)

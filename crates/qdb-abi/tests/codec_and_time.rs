@@ -1,8 +1,7 @@
 use qdb_abi::{
     align_bucket, checksum_frame, code_str, decode_kline, decode_trade, encode_kline, encode_trade,
-    fixed_code, frame_from_bytes, frame_to_bytes,
-    seal_frame, symbol_key, FrameHeader, KlineBody, MsgType, Period, TickTrade, FRAME_SIZE,
-    PERIOD_D1_ID,
+    fixed_code, frame_from_bytes, frame_to_bytes, seal_frame, symbol_key, FrameHeader, KlineBody,
+    MsgType, Period, TickTrade, FRAME_SIZE, PERIOD_D1_ID,
 };
 
 #[test]
@@ -79,7 +78,10 @@ fn symbol_key_is_caller_text_and_days_are_utc() {
     assert_eq!(symbol_key("ANY", "BTCUSDT"), "ANY:BTCUSDT");
     let midnight = utc_ns(2024, 1, 3, 0, 0, 0);
     assert_eq!(align_bucket(Period::D1, midnight), midnight);
-    assert_eq!(align_bucket(Period::D1, midnight - 1), midnight - Period::D1.nanos());
+    assert_eq!(
+        align_bucket(Period::D1, midnight - 1),
+        midnight - Period::D1.nanos()
+    );
 }
 
 #[test]

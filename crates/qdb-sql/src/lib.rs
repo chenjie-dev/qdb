@@ -1,4 +1,6 @@
-//! 第一版 SQL 子集：SELECT / WHERE / ORDER BY / LIMIT / GROUP BY / BETWEEN。
+//! 只读 SQL 子集，以及 `CREATE TABLE` 和 `INSERT`。
+//!
+//! 语法边界见 `docs/manual/sql.md`。`ORDER BY` 可以被解析，结果仍按存储顺序返回。
 #![forbid(unsafe_code)]
 
 use qdb_abi::{KlineBody, Period};
@@ -19,21 +21,52 @@ pub enum SqlError {
     Store(String),
 }
 
+/// 在一个 [`Engine`] 上跑 SQL。
+///
+/// [`SqlEngine::query`] 只读。`CREATE TABLE` 和 `INSERT` 走 [`SqlEngine::execute`]，需要可写引擎。
+/// 语法以 `docs/manual/sql.md` 为准。
 pub struct SqlEngine<'a> {
     engine: &'a Engine,
 }
 
+/// 一次查询的文本结果。
+///
+/// 价格和时间保持定点整数的十进制文本，不转成浮点。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueryResult {
+    /// 列名，顺序与 `rows` 里每一行一致。
     pub columns: Vec<String>,
+    /// 每一行按列顺序排好的文本。没有命中时为空。
     pub rows: Vec<Vec<String>>,
 }
 
 impl<'a> SqlEngine<'a> {
+    /// 绑定一个引擎，用来执行只读语句。
+    ///
+    /// # Arguments
+    ///
+    /// * `engine` - 可写或只读打开都可以。查询不会 `fsync`。
     pub fn new(engine: &'a Engine) -> Self {
         Self { engine }
     }
 
+    /// 执行一条语句。`CREATE` 和 `INSERT` 写入 WAL，其余交给 [`SqlEngine::query`]。
+    ///
+    /// 末尾分号会被去掉。`CREATE`/`INSERT` 在默认组提交下会 `fsync`。
+    ///
+    /// # Arguments
+    ///
+    /// * `engine` - 可写引擎。只读引擎上的建表和插入会失败。
+    /// * `sql` - 一条语句。
+    ///
+    /// # Returns
+    ///
+    /// 查询返回行。建表和插入成功时 `rows` 为空。
+    ///
+    /// # Errors
+    ///
+    /// * [`SqlError::Syntax`] - 语句无法解析。
+    /// * [`SqlError::Store`] - 表已存在、主键冲突、类型不对，或引擎只读。
     pub fn execute(engine: &mut Engine, sql: &str) -> Result<QueryResult, SqlError> {
         let sql = sql.trim().trim_end_matches(';').trim();
         let tokens = tokenize(sql);
@@ -50,6 +83,22 @@ impl<'a> SqlEngine<'a> {
         SqlEngine::new(engine).query(sql)
     }
 
+    /// 执行 `SELECT`、`SHOW` 或 `DESCRIBE`。不写 WAL。
+    ///
+    /// `ORDER BY` 可以被解析，结果仍按存储顺序返回。`LIMIT` 不能超过 100000。
+    /// 不带 `symbol` 的 `ticks` 会多一列 `symbol`。
+    ///
+    /// # Arguments
+    ///
+    /// * `sql` - 一条只读语句。末尾分号会被去掉。
+    ///
+    /// # Errors
+    ///
+    /// * [`SqlError::Syntax`] - 语句无法解析，或 `CREATE`/`INSERT` 走到了这里。
+    /// * [`SqlError::NotFound`] - `symbol` 不存在。
+    /// * [`SqlError::Ambiguous`] - 裸代码对应多只证券。
+    /// * [`SqlError::Limit`] - `LIMIT` 大于 100000。
+    /// * [`SqlError::Store`] - 用户表不存在，或过滤类型不对。
     pub fn query(&self, sql: &str) -> Result<QueryResult, SqlError> {
         let sql = sql.trim().trim_end_matches(';').trim();
         let tokens = tokenize(sql);

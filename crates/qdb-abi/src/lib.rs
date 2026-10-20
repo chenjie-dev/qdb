@@ -1,4 +1,6 @@
-//! 跨进程定长布局。本 crate 无 unsafe、无 serde。
+//! 跨进程定长布局。小端、无指针、无 `unsafe`、无 serde。
+//!
+//! 帧、成交、报价和 K 线槽的字节含义以 `docs/design.md` 为准。价格用 `i64`。
 #![forbid(unsafe_code)]
 
 use std::sync::atomic::AtomicU64;
@@ -24,7 +26,6 @@ pub const OFF_HEARTBEAT_NS: usize = 448;
 pub const OFF_EPOCH: usize = 512;
 pub const OFF_SYMBOL_COUNT: usize = 520;
 
-
 pub const FLAG_FROM_WAL: u16 = 1 << 0;
 pub const FLAG_TS_REGRESSION: u16 = 1 << 1;
 pub const FLAG_CORRECTION: u16 = 1 << 2;
@@ -36,6 +37,7 @@ pub const ORIGIN_LIVE: u8 = 0;
 pub const ORIGIN_IMPORT: u8 = 1;
 pub const ORIGIN_CORRECTION: u8 = 2;
 
+/// 帧和 WAL 记录的消息类型。未知编号用 [`MsgType::from_u16`] 得到 `None`，不当成连续数据。
 #[repr(u16)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MsgType {
@@ -51,6 +53,15 @@ pub enum MsgType {
 }
 
 impl MsgType {
+    /// 把帧头里的 `u16` 还原成消息类型。
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - 1 到 9。其余值没有对应类型。
+    ///
+    /// # Returns
+    ///
+    /// 未知编号返回 `None`。调用方应停止把后续帧当成连续数据。
     pub fn from_u16(value: u16) -> Option<Self> {
         Some(match value {
             1 => Self::TickTrade,
@@ -67,6 +78,7 @@ impl MsgType {
     }
 }
 
+/// K 线周期。桶起点按 UTC 对齐，库不做时区换算。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Period {
     S1,
@@ -92,6 +104,13 @@ pub const PERIODS: [Period; ACTIVE_PERIODS] = [
 ];
 
 impl Period {
+    /// 写入帧头 `period_id` 的编号。
+    ///
+    /// 秒和分钟周期的编号就是秒数。日线是 [`PERIOD_D1_ID`]，因为 86400 放不进 `u16`。
+    ///
+    /// # Returns
+    ///
+    /// `1s` 为 1，`1m` 为 60，`1d` 为 `u16::MAX`。
     pub fn id(self) -> u16 {
         match self {
             Self::S1 => 1,
@@ -104,10 +123,28 @@ impl Period {
         }
     }
 
+    /// 按 [`Period::id`] 还原周期。
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - 帧头里的 `period_id`。
+    ///
+    /// # Returns
+    ///
+    /// 不是七个周期之一时返回 `None`。
     pub fn from_u16(value: u16) -> Option<Self> {
         PERIODS.into_iter().find(|period| period.id() == value)
     }
 
+    /// 解析 SQL 和订阅里使用的周期名。
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - `1s`、`1m`、`5m`、`15m`、`1h`、`4h` 或 `1d`。大小写敏感。
+    ///
+    /// # Returns
+    ///
+    /// 名字不在这七个里时返回 `None`。
     pub fn parse(name: &str) -> Option<Self> {
         Some(match name {
             "1s" => Self::S1,
@@ -121,6 +158,11 @@ impl Period {
         })
     }
 
+    /// 周期名，与 [`Period::parse`] 互逆。
+    ///
+    /// # Returns
+    ///
+    /// `1s`、`1m`、`5m`、`15m`、`1h`、`4h` 或 `1d`。
     pub fn as_str(self) -> &'static str {
         match self {
             Self::S1 => "1s",
@@ -134,9 +176,17 @@ impl Period {
     }
 
     pub fn index(self) -> usize {
-        PERIODS.iter().position(|period| *period == self).expect("period")
+        PERIODS
+            .iter()
+            .position(|period| *period == self)
+            .expect("period")
     }
 
+    /// 一个桶的长度，单位纳秒。日线是 86400 秒，不用 `u16` 编号去乘。
+    ///
+    /// # Returns
+    ///
+    /// 正的纳秒数。`1d` 为 `86_400_000_000_000`。
     pub fn nanos(self) -> i64 {
         match self {
             Self::D1 => 86_400 * 1_000_000_000,
@@ -145,6 +195,7 @@ impl Period {
     }
 }
 
+/// 256 字节帧的前 48 字节。字段小端、无指针，布局变更必须同时改 `docs/design.md`。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FrameHeader {
@@ -179,6 +230,7 @@ impl Frame {
     }
 }
 
+/// 成交载荷。价格和金额是定点 `i64`，不使用浮点。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TickTrade {
@@ -188,6 +240,7 @@ pub struct TickTrade {
     pub trade_id: u64,
 }
 
+/// 五档报价。数组下标 0 是第一档，未使用的档填 0。
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TickQuote {
@@ -276,12 +329,32 @@ pub fn symbol_key(exchange: &str, code: &str) -> String {
     format!("{exchange}:{code}")
 }
 
-/// 按 UTC 把事件时间对齐到周期桶起点。时区换算由业务系统在写入前完成。
+/// 按 UTC 把事件时间对齐到周期桶起点。
+///
+/// 不做时区、夏令时或交易时段换算。负时间戳用欧几里得余数，结果仍是不大于事件时间的桶起点。
+///
+/// # Arguments
+///
+/// * `period` - 桶长度来自 [`Period::nanos`]。
+/// * `event_ts_ns` - 事件时间，UTC 纳秒。可以为负。
+///
+/// # Returns
+///
+/// 小于等于 `event_ts_ns` 的桶起点。
 pub fn align_bucket(period: Period, event_ts_ns: i64) -> i64 {
     let step = period.nanos();
     event_ts_ns - event_ts_ns.rem_euclid(step)
 }
 
+/// 把成交编成 32 字节小端载荷：价格、成交量、金额、成交编号。
+///
+/// # Arguments
+///
+/// * `trade` - 定点价格和成交量。
+///
+/// # Returns
+///
+/// 可放进 WAL 或帧载荷的 32 字节。
 pub fn encode_trade(trade: &TickTrade) -> [u8; 32] {
     let mut out = [0u8; 32];
     out[0..8].copy_from_slice(&trade.price.to_le_bytes());
@@ -291,6 +364,15 @@ pub fn encode_trade(trade: &TickTrade) -> [u8; 32] {
     out
 }
 
+/// 还原 [`encode_trade`] 的 32 字节。
+///
+/// # Arguments
+///
+/// * `bytes` - 至少 32 字节。更长时只读前 32 字节。
+///
+/// # Returns
+///
+/// 长度不足时返回 `None`。
 pub fn decode_trade(bytes: &[u8]) -> Option<TickTrade> {
     if bytes.len() < 32 {
         return None;
@@ -349,7 +431,10 @@ pub fn fixed_code(code: &str) -> [u8; 32] {
 }
 
 pub fn code_str(code: &[u8]) -> String {
-    let end = code.iter().position(|byte| *byte == 0).unwrap_or(code.len());
+    let end = code
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(code.len());
     String::from_utf8_lossy(&code[..end]).into_owned()
 }
 
@@ -414,6 +499,18 @@ pub fn frame_from_bytes(bytes: &[u8]) -> Option<Frame> {
     Some(Frame { header, payload })
 }
 
+/// 填上载荷长度和 CRC，得到一帧。
+///
+/// 载荷超过 [`FRAME_PAYLOAD_SIZE`] 时截断。CRC 覆盖头里 CRC 字段以外的字节和载荷。
+///
+/// # Arguments
+///
+/// * `header` - 序号、时间和消息类型已填好。`payload_len` 和 `crc32` 会被改写。
+/// * `payload` - 消息体。
+///
+/// # Returns
+///
+/// 固定 256 字节的帧。
 pub fn seal_frame(mut header: FrameHeader, payload: &[u8]) -> Frame {
     let len = payload.len().min(FRAME_PAYLOAD_SIZE);
     header.payload_len = len as u32;
@@ -453,7 +550,10 @@ mod tests {
     fn one_second_and_one_minute_buckets_follow_utc() {
         let ts = utc_ns(2024, 1, 2, 1, 30, 0, 100_000_000);
         let next = utc_ns(2024, 1, 2, 1, 30, 1, 0);
-        assert_eq!(align_bucket(Period::S1, ts), utc_ns(2024, 1, 2, 1, 30, 0, 0));
+        assert_eq!(
+            align_bucket(Period::S1, ts),
+            utc_ns(2024, 1, 2, 1, 30, 0, 0)
+        );
         assert_ne!(align_bucket(Period::S1, ts), align_bucket(Period::S1, next));
         assert_eq!(align_bucket(Period::M1, ts), align_bucket(Period::M1, next));
         assert_eq!(align_bucket(Period::D1, ts), utc_ns(2024, 1, 2, 0, 0, 0, 0));
@@ -461,7 +561,8 @@ mod tests {
 
     fn utc_ns(y: i32, m: u32, d: u32, h: u32, min: u32, s: u32, nanos: i64) -> i64 {
         let days = days_from_civil(y, m, d);
-        (days * 86_400 + i64::from(h) * 3600 + i64::from(min) * 60 + i64::from(s)) * 1_000_000_000 + nanos
+        (days * 86_400 + i64::from(h) * 3600 + i64::from(min) * 60 + i64::from(s)) * 1_000_000_000
+            + nanos
     }
 
     fn days_from_civil(mut y: i32, m: u32, d: u32) -> i64 {

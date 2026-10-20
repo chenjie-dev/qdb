@@ -1,4 +1,4 @@
-//! 只读命令行客户端。查看表结构，并查询已经落盘的数据。
+//! 命令行客户端。查询、订阅和转储走只读打开；建表和插入会短暂成为该库的写入者。
 
 use std::cell::RefCell;
 use std::io::{self, BufRead, IsTerminal, Write};

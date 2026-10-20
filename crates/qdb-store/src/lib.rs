@@ -1,4 +1,7 @@
 //! 内存表、WAL 应用和启动恢复。
+//!
+//! [`Engine`] 是一个库的写入或只读视图。先把记录写入 WAL，再更新内存，最后发布共享内存。
+//! 使用者说明见 `docs/manual/library.md`。
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
@@ -24,6 +27,9 @@ pub use catalog::{Catalog, CatalogError};
 pub use dump::{playback, replay_bytes, replay_file};
 pub use table::{Cell, ColumnDef, ColumnType, IndexDef, TableSchema};
 
+/// 写入、查询或恢复失败。
+///
+/// [`StoreError::Io`] 和 [`StoreError::Schema`] 的字符串说明具体原因。其余变体各自对应一种固定失败。
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("io: {0}")]
@@ -52,6 +58,7 @@ pub enum StoreError {
     Agg(#[from] qdb_agg::AggError),
 }
 
+/// 已登记的证券。`id` 从 1 起，在本库内不变。`exchange` 只是调用方标签。
 #[derive(Clone, Debug)]
 pub struct Symbol {
     pub id: u32,
@@ -61,6 +68,7 @@ pub struct Symbol {
     pub exchange: String,
 }
 
+/// 一笔成交。价格和金额是定点 `i64`，`ts` 是 UTC 纳秒，`amount` 为价格乘成交量。
 #[derive(Clone, Debug)]
 pub struct TickRow {
     pub seq: u64,
@@ -70,6 +78,7 @@ pub struct TickRow {
     pub amount: i64,
 }
 
+/// [`Engine::changes_since`] 返回的一行。`kind` 为 `snapshot`、`trade` 或 `quote`。
 #[derive(Clone, Debug)]
 pub struct LiveRow {
     pub seq: u64,
@@ -83,6 +92,7 @@ pub struct LiveRow {
     pub ask_px: [i64; 5],
 }
 
+/// 最新报价。数组下标 0 是买一或卖一，未使用的档为 0。
 #[derive(Clone, Debug)]
 pub struct QuoteRow {
     pub seq: u64,
@@ -93,6 +103,7 @@ pub struct QuoteRow {
     pub ask_qty: [i64; 5],
 }
 
+/// [`Engine::poll`] 或回放返回的一条变更。`table` 是 `ticks`、`snapshots` 或 `klines`。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Change {
     pub seq: u64,
@@ -111,6 +122,7 @@ pub struct Change {
     pub close: i64,
 }
 
+/// 可跨线程读取的计数。原子量与引擎共享，读取不阻塞写入。
 #[derive(Clone, Debug)]
 pub struct Metrics {
     pub durable_seq: Arc<AtomicU64>,
@@ -138,6 +150,10 @@ impl Metrics {
     }
 }
 
+/// 一个库的内存表。
+///
+/// 写入者持有 WAL 追加器和 `region.bin` 映射。只读打开只重放 WAL，不创建、不删除共享内存文件。
+/// 同一台机器上只有一个 `qdb` 进程可以成为写入者。
 pub struct Engine {
     root: PathBuf,
     wal: Option<WalAppender>,
@@ -164,10 +180,42 @@ pub struct Engine {
 }
 
 impl Engine {
+    /// 用开发规模的共享内存打开库，并成为写入者。
+    ///
+    /// 等价于 [`Engine::open_with`]，区域是 [`RegionConfig::dev`]：1024 个符号槽、4096 帧。
+    ///
+    /// # Arguments
+    ///
+    /// * `root` - 库目录。不存在时会创建 `wal/` 和 `snap/`。
+    ///
+    /// # Returns
+    ///
+    /// 可写引擎。默认每条写入都 `fsync` 并发布共享内存。
+    ///
+    /// # Errors
+    ///
+    /// 创建目录、读写 WAL 或映射共享内存失败时返回 [`StoreError::Io`]。
+    /// 坏 CRC 时仍返回引擎，[`Engine::crc_failed`] 为真，后续写入返回 [`StoreError::Crc`]。
     pub fn open(root: &Path) -> Result<Self, StoreError> {
         Self::open_with(root, &RegionConfig::dev())
     }
 
+    /// 按给定共享内存规模打开库，并成为写入者。
+    ///
+    /// 会删除已有的 `region.bin` 再按 `region` 重建。有效检查点存在时先装入检查点，再只重放其后的 WAL。
+    ///
+    /// # Arguments
+    ///
+    /// * `root` - 库目录。
+    /// * `region` - 符号槽数和环形缓冲容量。容量必须是 2 的幂。
+    ///
+    /// # Returns
+    ///
+    /// 可写引擎。
+    ///
+    /// # Errors
+    ///
+    /// 同 [`Engine::open`]。容量不合法时，错误来自共享内存创建，包在 [`StoreError::Io`] 里。
     pub fn open_with(root: &Path, region: &RegionConfig) -> Result<Self, StoreError> {
         fs::create_dir_all(root.join("wal")).map_err(io)?;
         fs::create_dir_all(root.join("snap")).map_err(io)?;
@@ -180,7 +228,21 @@ impl Engine {
         Ok(engine)
     }
 
-    /// 重放 WAL 供查询。不创建目录，不追加日志，不重建 `region.bin`。
+    /// 只读打开库。
+    ///
+    /// 重放 WAL 或检查点加尾部记录。不创建目录，不追加日志，不删除 `region.bin`。
+    ///
+    /// # Arguments
+    ///
+    /// * `root` - 已经存在的库目录。
+    ///
+    /// # Returns
+    ///
+    /// 只读引擎。写入方法返回 [`StoreError::ReadOnly`]。
+    ///
+    /// # Errors
+    ///
+    /// 目录不存在或 WAL 读失败时返回 [`StoreError::Io`]。
     pub fn open_read(root: &Path) -> Result<Self, StoreError> {
         if !root.is_dir() {
             return Err(StoreError::Io(format!(
@@ -244,22 +306,68 @@ impl Engine {
         Ok(engine)
     }
 
+    /// 复制当前指标句柄。
+    ///
+    /// 返回的原子量和引擎共享。调用后可以在别的线程读取序号和心跳。
+    ///
+    /// # Returns
+    ///
+    /// 克隆后的 [`Metrics`]。不增加落盘次数。
     pub fn metrics(&self) -> Metrics {
         self.metrics.clone()
     }
 
+    /// 打开或后续重放是否见过坏 CRC。
+    ///
+    /// # Returns
+    ///
+    /// 坏 CRC 之后引擎拒绝新的写入。已经重放的记录仍可查询。
     pub fn crc_failed(&self) -> bool {
         self.crc_failed
     }
 
+    /// 列出用户用 `CREATE TABLE` 建的表。
+    ///
+    /// 不含 `symbols`、`ticks`、`snapshots`、`klines`。
+    ///
+    /// # Returns
+    ///
+    /// 按名字排序的表名。
     pub fn table_names(&self) -> Vec<String> {
         self.tables.names()
     }
 
+    /// 读取一张用户表的列和索引定义。
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - 表名，与建表时的小写名字一致。
+    ///
+    /// # Returns
+    ///
+    /// 表不存在时返回 `None`。
     pub fn table_schema(&self, name: &str) -> Option<&TableSchema> {
         self.tables.schema(name)
     }
 
+    /// 创建一张用户表，并把定义写入 WAL。
+    ///
+    /// 不能覆盖行情内置表。默认会 `fsync`。组提交打开时，定义要等 [`Engine::flush`] 才落盘。
+    ///
+    /// # Arguments
+    ///
+    /// * `schema` - 至少一列，最多一个主键。`STRING` 列的值以后不能超过 1024 字节。
+    ///
+    /// # Returns
+    ///
+    /// 这条建表记录的 `seq`。
+    ///
+    /// # Errors
+    ///
+    /// * [`StoreError::TableExists`] - 同名表已经存在。
+    /// * [`StoreError::Schema`] - 没有列、列名重复、主键超过一个、索引指向不存在的列，或表名是 `symbols`、`ticks`、`snapshots`、`klines`。
+    /// * [`StoreError::ReadOnly`] - 只读引擎。
+    /// * [`StoreError::Crc`] - WAL 已损坏。
     pub fn create_table(&mut self, schema: TableSchema) -> Result<u64, StoreError> {
         self.ensure_writable()?;
         table::TableSet::validate_new(&schema)?;
@@ -270,12 +378,52 @@ impl Engine {
         self.commit(MsgType::TableSchema, 0, 0, 0, 0, &payload, 0)
     }
 
+    /// 按建表时的列顺序插入一行。
+    ///
+    /// 主键重复时不写入。二级索引不要求唯一。
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - 已存在的用户表名。
+    /// * `values` - 与列数、类型一一对应。
+    ///
+    /// # Returns
+    ///
+    /// 这条插入记录的 `seq`。
+    ///
+    /// # Errors
+    ///
+    /// * [`StoreError::NotFound`] - 表不存在。
+    /// * [`StoreError::TypeMismatch`] - 某个值的类型和列定义不一致。
+    /// * [`StoreError::DuplicateKey`] - 主键已经有相同的值。
+    /// * [`StoreError::Schema`] - 列数不对，或字符串超过 1024 字节。
+    /// * [`StoreError::ReadOnly`] - 只读引擎。
     pub fn insert_row(&mut self, table: &str, values: &[Cell]) -> Result<u64, StoreError> {
         self.ensure_writable()?;
         let payload = self.tables.encode_row(table, values)?;
         self.commit(MsgType::RowInsert, 0, 0, 0, 0, &payload, 0)
     }
 
+    /// 扫描一张用户表。
+    ///
+    /// 给出列名和期望值时，主键或二级索引走等值查找；没有索引则扫全表。
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - 用户表名。
+    /// * `column` - 过滤列。`None` 表示不过滤。
+    /// * `expected` - 与 `column` 一起使用的等值。类型必须和列一致。
+    /// * `limit` - 最多返回的行数。
+    ///
+    /// # Returns
+    ///
+    /// 列名，以及每行按列顺序排好的文本。
+    ///
+    /// # Errors
+    ///
+    /// * [`StoreError::NotFound`] - 表不存在。
+    /// * [`StoreError::Schema`] - 过滤列不存在。
+    /// * [`StoreError::TypeMismatch`] - 过滤值的类型不对。
     pub fn scan_table(
         &self,
         table: &str,
@@ -286,7 +434,17 @@ impl Engine {
         self.tables.scan(table, column, expected, limit)
     }
 
-    /// 读入写入者新 `fsync` 的记录，并更新本进程里的表。
+    /// 读入打开之后新 `fsync` 的 WAL，并更新本进程里的表。
+    ///
+    /// 没有新记录时返回空向量。只读引擎用它跟随写入者。
+    ///
+    /// # Returns
+    ///
+    /// 新应用到的成交、报价和 K 线变更。同一笔成交会同时出现在 `ticks` 和 `snapshots`。
+    ///
+    /// # Errors
+    ///
+    /// WAL 出现坏 CRC 时返回 [`StoreError::Crc`]。短尾留到下一次再读。
     pub fn poll(&mut self) -> Result<Vec<Change>, StoreError> {
         if self.crc_failed {
             return Err(StoreError::Crc);
@@ -310,26 +468,73 @@ impl Engine {
         Ok(changes)
     }
 
+    /// 已经应用到内存表的最后一个序号。
+    ///
+    /// # Returns
+    ///
+    /// 还没有记录时为 0。序号从 1 起。
     pub fn applied_seq(&self) -> u64 {
         self.agg.last_applied_seq()
     }
 
+    /// 本进程里按写入顺序保存的帧，含触发帧和派生 K 线帧。
+    ///
+    /// 共享内存里只有触发帧。组提交尚未 `flush` 的帧也会出现在这里。
+    ///
+    /// # Returns
+    ///
+    /// 帧切片。调用方不要假定它跨过下一次写入仍然有效。
     pub fn frames(&self) -> &[Frame] {
         &self.frames
     }
 
+    /// 已登记的证券。
+    ///
+    /// # Returns
+    ///
+    /// 按首次出现顺序排列。`id` 从 1 起。
     pub fn symbols(&self) -> &[Symbol] {
         &self.symbols
     }
 
+    /// 一只证券的成交，按写入顺序。
+    ///
+    /// # Arguments
+    ///
+    /// * `symbol_id` - [`Engine::resolve`] 或 [`Engine::upsert_symbol`] 返回的编号。
+    ///
+    /// # Returns
+    ///
+    /// 没有成交时返回空切片，不报错。
     pub fn ticks(&self, symbol_id: u32) -> &[TickRow] {
         self.ticks.get(&symbol_id).map(Vec::as_slice).unwrap_or(&[])
     }
 
+    /// 一只证券的最新报价，含五档价格和数量。
+    ///
+    /// # Arguments
+    ///
+    /// * `symbol_id` - 证券编号。
+    ///
+    /// # Returns
+    ///
+    /// 还没有报价也没有成交时返回 `None`。成交会更新 `last`，不清买卖档。
     pub fn quote(&self, symbol_id: u32) -> Option<&QuoteRow> {
         self.quotes.get(&symbol_id)
     }
 
+    /// 一只证券某个周期的 K 线。
+    ///
+    /// 已闭合的桶在前，当前未闭合桶在最后。桶起点按 UTC 对齐。
+    ///
+    /// # Arguments
+    ///
+    /// * `symbol_id` - 证券编号。
+    /// * `period` - `1s`、`1m`、`5m`、`15m`、`1h`、`4h` 或 `1d`。
+    ///
+    /// # Returns
+    ///
+    /// 没有数据时返回空向量。
     pub fn klines(&self, symbol_id: u32, period: Period) -> Vec<KlineBody> {
         let mut rows = self.agg.sealed(symbol_id, period).to_vec();
         if let Some(open) = self.agg.open_bar(symbol_id, period) {
@@ -338,6 +543,20 @@ impl Engine {
         rows
     }
 
+    /// 把 `交易所:代码` 或唯一的裸代码解析成证券编号。
+    ///
+    /// # Arguments
+    ///
+    /// * `text` - `SSE:600000` 这种完整键，或全库唯一的代码。
+    ///
+    /// # Returns
+    ///
+    /// 从 1 起的 `symbol_id`。
+    ///
+    /// # Errors
+    ///
+    /// * [`StoreError::NotFound`] - 没有这只证券。
+    /// * [`StoreError::Ambiguous`] - 裸代码对应多只证券。
     pub fn resolve(&self, text: &str) -> Result<u32, StoreError> {
         if let Some((ex, code)) = text.split_once(':') {
             let exchange_id = self.exchange_id(ex).ok_or(StoreError::NotFound)?;
@@ -360,6 +579,24 @@ impl Engine {
         }
     }
 
+    /// 登记证券。已经存在时返回原来的编号，不再分配 `seq`。
+    ///
+    /// 新证券会写一条 WAL。交易所标签最长按 16 字节、代码按 32 字节保存。
+    ///
+    /// # Arguments
+    ///
+    /// * `exchange_code` - 非空的调用方标签，库不解释其含义。
+    /// * `code` - 证券代码。
+    ///
+    /// # Returns
+    ///
+    /// `symbol_id`。
+    ///
+    /// # Errors
+    ///
+    /// * [`StoreError::EmptyExchange`] - 标签为空。
+    /// * [`StoreError::ReadOnly`] - 只读引擎。
+    /// * [`StoreError::Crc`] - WAL 已损坏。
     pub fn upsert_symbol(&mut self, exchange_code: &str, code: &str) -> Result<u32, StoreError> {
         if exchange_code.is_empty() {
             return Err(StoreError::EmptyExchange);
@@ -379,6 +616,29 @@ impl Engine {
         Ok(id)
     }
 
+    /// 写入一笔成交，并更新全部周期的未闭合 K 线。
+    ///
+    /// 证券不存在时先登记。金额是 `price.saturating_mul(volume)`。成交编号固定为 0。
+    /// 早于当前桶起点的成交仍进入成交表，但不改 K 线。
+    ///
+    /// # Arguments
+    ///
+    /// * `exchange_code` - 非空交易所标签。
+    /// * `code` - 证券代码。
+    /// * `event_ts_ns` - 事件时间，UTC 纳秒。
+    /// * `price` - 定点价格。
+    /// * `volume` - 成交量。
+    ///
+    /// # Returns
+    ///
+    /// 这笔成交的 `seq`。登记新证券时，登记本身另占一个更小的序号。
+    ///
+    /// # Errors
+    ///
+    /// * [`StoreError::EmptyExchange`] - 标签为空。
+    /// * [`StoreError::ReadOnly`] - 只读引擎。
+    /// * [`StoreError::Crc`] - WAL 已损坏。
+    /// * [`StoreError::Io`] - 落盘或发布失败。
     pub fn write_trade(
         &mut self,
         exchange_code: &str,
@@ -415,6 +675,24 @@ impl Engine {
         )
     }
 
+    /// 写入五档报价。不改变 K 线的 OHLC 和成交量。
+    ///
+    /// WAL 保存 `last`、五档买价、五档买量、五档卖价、五档卖量。
+    ///
+    /// # Arguments
+    ///
+    /// * `exchange_code` - 非空交易所标签。
+    /// * `code` - 证券代码。
+    /// * `event_ts_ns` - 事件时间，UTC 纳秒，写在 WAL 记录头。报价载荷只保存价格和数量。
+    /// * `quote` - 五档价格和数量。未使用的档填 0。
+    ///
+    /// # Returns
+    ///
+    /// 这条报价的 `seq`。
+    ///
+    /// # Errors
+    ///
+    /// 同 [`Engine::write_trade`]。
     pub fn write_quote(
         &mut self,
         exchange_code: &str,
@@ -456,7 +734,24 @@ impl Engine {
         )
     }
 
-    /// 连续交易的时间水位。水位越过桶结束时间就闭合 K 线，不需要等待下一笔成交。
+    /// 写入某个交易所标签的 UTC 水位，用来闭合已经走完的 K 线。
+    ///
+    /// 只闭合 `exchange_code` 下仍开着、且桶结束时间不晚于水位的 K 线。不产生成交。
+    ///
+    /// # Arguments
+    ///
+    /// * `exchange_code` - 非空标签。还没见过时会分配内部编号。
+    /// * `watermark_ns` - UTC 纳秒水位。
+    ///
+    /// # Returns
+    ///
+    /// 这条时钟记录的 `seq`。
+    ///
+    /// # Errors
+    ///
+    /// * [`StoreError::EmptyExchange`] - 标签为空。
+    /// * [`StoreError::ReadOnly`] - 只读引擎。
+    /// * [`StoreError::Crc`] - WAL 已损坏。
     pub fn write_clock(
         &mut self,
         exchange_code: &str,
@@ -532,15 +827,37 @@ impl Engine {
         Ok(seq)
     }
 
+    /// 设置组提交。达到条数或间隔后，下一条写入触发一次 `fsync` 并发布这批帧。
+    ///
+    /// `qdb` 进程使用 256 条或 1 毫秒。库接口默认是 1 条，也就是每次写入都落盘。
+    ///
+    /// # Arguments
+    ///
+    /// * `max_records` - 一批最多多少条。小于 1 时按 1 处理。
+    /// * `interval_ns` - 第一批未落盘记录已经等待的纳秒数。0 表示不按时间触发。
     pub fn set_group_commit(&mut self, max_records: u64, interval_ns: u64) {
         self.group_limit = max_records.max(1);
         self.group_interval_ns = interval_ns;
     }
 
+    /// 已经完成的 `fsync` 次数。
+    ///
+    /// 组提交把多条写入并成一次时，这个数小于写入次数。
+    ///
+    /// # Returns
+    ///
+    /// 从这次打开算起的落盘次数。
     pub fn flush_count(&self) -> u64 {
         self.flush_count
     }
 
+    /// 先 [`Engine::flush`]，再把内存状态写到 `snap/checkpoint.qsnap`。
+    ///
+    /// 下次打开会装入这份状态，并只重放检查点之后的 WAL。文件写坏时打开仍会全量重放。
+    ///
+    /// # Errors
+    ///
+    /// 落盘或写检查点文件失败时返回 [`StoreError::Io`]。
     pub fn checkpoint(&mut self) -> Result<(), StoreError> {
         self.flush()?;
         let ticks = self
@@ -567,6 +884,19 @@ impl Engine {
         )
     }
 
+    /// 给一个下游拉取快照或增量。每个调用方自带 `from_seq`，不消耗别人的游标。
+    ///
+    /// `from_seq` 为 0 时返回当前报价，调用方下次应传入返回的序号。大于 0 时返回序号更大的成交和报价帧。
+    ///
+    /// # Arguments
+    ///
+    /// * `symbol` - `交易所:代码`。`None` 表示不按代码过滤。
+    /// * `from_seq` - 已经确认过的序号。0 表示还没有接上。
+    /// * `limit` - 最多返回多少条。
+    ///
+    /// # Returns
+    ///
+    /// 建议作为下次 `from_seq` 的序号，以及这次拿到的行。
     pub fn changes_since(
         &self,
         symbol: Option<&str>,
@@ -664,6 +994,13 @@ impl Engine {
         Ok(())
     }
 
+    /// 把组提交缓冲区里的记录 `fsync`，并发布到共享内存。
+    ///
+    /// 缓冲区为空时什么也不做。
+    ///
+    /// # Errors
+    ///
+    /// 同步文件或发布帧失败时返回 [`StoreError::Io`]。
     pub fn flush(&mut self) -> Result<(), StoreError> {
         self.flush_pending()
     }
@@ -1074,7 +1411,9 @@ fn io<E: std::fmt::Display>(err: E) -> StoreError {
 }
 
 impl Engine {
-    /// 把未落盘的记录写完，卸下共享内存，并清掉行情表。WAL 文件保留。
+    /// 把未落盘的记录写完并做检查点，然后卸下共享内存、清掉内存里的行情表。
+    ///
+    /// WAL 文件保留。再次 [`Engine::open`] 可以恢复。调用后本对象上的查询为空。
     pub fn release(&mut self) {
         let _ = self.flush_pending();
         let _ = self.checkpoint();

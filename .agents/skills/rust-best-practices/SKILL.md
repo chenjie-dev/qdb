@@ -42,6 +42,10 @@ Before reviewing, familiarize yourself with Apollo's Rust best practices. Read A
 - Small `Copy` types (≤24 bytes) can be passed by value
 - Use `Cow<'_, T>` when ownership is ambiguous
 
+### 本仓注释
+
+公开 API 用中文 `///` / `//!`，函数要有 `# Arguments`、`# Returns`、`# Errors`。块内注释只写不变量和 `// SAFETY:`。完整约定在 skill `qdb-dev` 的「注释」节。
+
 ### Error Handling
 - Return `Result<T, E>` for fallible operations; avoid `panic!` in production
 - Never use `unwrap()`/`expect()` outside tests

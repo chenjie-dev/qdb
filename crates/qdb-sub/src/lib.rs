@@ -1,4 +1,6 @@
-//! 按代码和周期过滤，并用 from_seq 续传。落后过多时先快照再增量。
+//! 按代码和周期过滤，并用 `from_seq` 续传。
+//!
+//! `from_seq` 为 0 时先给快照边界。过滤后的序号对不上时返回 `Gap`，不把后续帧当成连续行情。
 #![forbid(unsafe_code)]
 
 use qdb_abi::{Frame, MsgType, Period};
@@ -28,18 +30,37 @@ pub enum SubMsg {
 }
 
 pub fn catch_up(engine: &Engine, filter: &SubFilter) -> Result<Vec<SubMsg>, SubError> {
-    let symbol_id = engine.resolve(&filter.symbol).map_err(|_| SubError::Symbol)?;
+    let symbol_id = engine
+        .resolve(&filter.symbol)
+        .map_err(|_| SubError::Symbol)?;
     let matched: Vec<&Frame> = engine
         .frames()
         .iter()
         .filter(|frame| frame_matches(frame, symbol_id, filter.period))
         .collect();
-    let max_seq = engine.frames().iter().map(|frame| frame.seq()).max().unwrap_or(0);
-    if filter.from_seq == 0 || (filter.from_seq > 0 && matched.iter().all(|frame| frame.seq() > filter.from_seq + 1) && filter.from_seq + 1 < max_seq) {
+    let max_seq = engine
+        .frames()
+        .iter()
+        .map(|frame| frame.seq())
+        .max()
+        .unwrap_or(0);
+    if filter.from_seq == 0
+        || (filter.from_seq > 0
+            && matched
+                .iter()
+                .all(|frame| frame.seq() > filter.from_seq + 1)
+            && filter.from_seq + 1 < max_seq)
+    {
         let mut out = vec![SubMsg::SnapshotBegin];
         let snapshot_seq = engine.applied_seq();
         out.push(SubMsg::SnapshotEnd { snapshot_seq });
-        out.extend(matched.into_iter().filter(|frame| frame.seq() > snapshot_seq).cloned().map(SubMsg::Data));
+        out.extend(
+            matched
+                .into_iter()
+                .filter(|frame| frame.seq() > snapshot_seq)
+                .cloned()
+                .map(SubMsg::Data),
+        );
         return Ok(out);
     }
     let mut expected = filter.from_seq + 1;
@@ -91,15 +112,22 @@ mod tests {
     use qdb_abi::Period;
 
     fn sample() -> (std::path::PathBuf, qdb_store::Engine) {
-        let n = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let dir = std::env::temp_dir().join(format!("qdb-sub-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let mut engine = qdb_store::Engine::open(&dir).unwrap();
         let base = ts(100_000_000);
         engine.write_trade("SZSE", "000001", base, 10, 100).unwrap();
-        engine.write_trade("SZSE", "000001", base + 100_000_000, 12, 50).unwrap();
-        engine.write_trade("SZSE", "000001", base + 900_000_000, 11, 10).unwrap();
+        engine
+            .write_trade("SZSE", "000001", base + 100_000_000, 12, 50)
+            .unwrap();
+        engine
+            .write_trade("SZSE", "000001", base + 900_000_000, 11, 10)
+            .unwrap();
         engine.write_trade("SSE", "600000", base, 8, 1).unwrap();
         (dir, engine)
     }

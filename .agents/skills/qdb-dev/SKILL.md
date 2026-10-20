@@ -57,9 +57,56 @@ description: >-
 
 有 crate 后运行 `cargo test -p <crate>`。还没有目标 crate 时，先补 crate 再写测试，不把验收留到口头。
 
+## 注释
+
+公开接口用文档注释，块内说明用普通注释。说明用中文，标识符保持英文。详细程度对齐 Javadoc：读注释就能调用，不必先翻实现。
+
+`//!` 写在 crate 或模块开头，说明这个模块负责什么、不负责什么。
+
+`///` 写在每个公开类型、公开函数和公开字段上。函数按这个顺序写，没有的节就省略：
+
+1. 第一句是摘要，说明它做什么。
+2. 空一行后写调用方需要知道的行为：是否 `fsync`、是否映射或删除共享内存、是否只读、序号怎么分配。
+3. `# Arguments`：每个参数一条。写合法取值和单位，例如纳秒、定点数。不要只重复参数名。
+4. `# Returns`：成功时拿到什么。`()` 可省略。
+5. `# Errors`：每种会返回的错误以及触发条件，对应 `@throws`。
+6. `# Panics`：只有真的会 panic 时才写。
+7. `# Safety`：`unsafe` 函数写调用方必须保证的前提。
+8. `# Examples`：只给主要入口。示例要能编译，并放进文档测试太重时就不要包成会运行的代码块。
+
+```rust
+/// 写入一笔成交，并更新各周期未闭合 K 线。
+///
+/// 证券不存在时会先登记。默认每次调用都 `fsync`；组提交打开后要再调用 [`Engine::flush`]。
+///
+/// # Arguments
+///
+/// * `exchange_code` - 调用方给出的交易所标签，不能为空。
+/// * `code` - 证券代码。
+/// * `event_ts_ns` - 事件时间，UTC 纳秒。
+/// * `price` - 成交价，定点 `i64`。
+/// * `volume` - 成交量。
+///
+/// # Returns
+///
+/// 分配到的 `seq`。序号从 1 起。
+///
+/// # Errors
+///
+/// * [`StoreError::EmptyExchange`] - 交易所标签为空。
+/// * [`StoreError::ReadOnly`] - 引擎是只读打开的。
+/// * [`StoreError::Crc`] - 打开时 WAL 已损坏，拒绝再写。
+/// * [`StoreError::Io`] - 落盘或发布共享内存失败。
+```
+
+`//` 只解释代码本身看不出来的原因：不变量、平台差异、故意不用另一种做法。`unsafe` 块前写 `// SAFETY:`，说明这段代码依赖的前提。
+
+注释和 [`docs/manual/`](../../../docs/manual/index.md) 或 [`docs/design.md`](../../../docs/design.md) 冲突时，先改设计和手册，再改注释。
+
 ## 收尾
 
 - 使用者能看见的行为变了，就地更新 [`docs/manual/`](../../../docs/manual/index.md) 里对应章节。未实现的能力不写进手册。
+- 新增或修改的公开函数带上中文 `///`，包含 `# Arguments`、`# Returns`、`# Errors` 中适用的节。`unsafe` 带上 `// SAFETY:`。
 - 新术语写进 `CONTEXT.md`（skill `domain-modeling`）。难反转的新决策才写 ADR；已在 `docs/design.md` 第 14 节的决定不另抄一份。
 - 用户要求提交时走 skill `commit`。
 - 大设计分歧先用 `grill-with-docs`，再改设计正文。

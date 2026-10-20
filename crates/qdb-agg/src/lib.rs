@@ -1,4 +1,6 @@
-//! 多周期 K 线。闭合只由下一桶成交或日志里的 ClockTick 触发。
+//! 多周期 K 线。桶按 UTC 对齐。
+//!
+//! 闭合只由下一桶成交或日志里的 `ClockTick` 触发。缺号时停止聚合。
 #![forbid(unsafe_code)]
 
 use std::collections::BTreeMap;

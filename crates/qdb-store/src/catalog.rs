@@ -27,12 +27,28 @@ pub enum CatalogError {
     Store(#[from] StoreError),
 }
 
+/// 一个实例目录下的多个库。每个库有自己的 WAL、序号和共享内存文件。
 pub struct Catalog {
     root: PathBuf,
 }
 
 impl Catalog {
-    /// 打开实例。没有 `default` 时在 `db/default` 建一个空库。
+    /// 打开实例目录。
+    ///
+    /// 目录不存在时会创建。还没有名为 `default` 的库时，在 `db/default` 建一个空 WAL。
+    /// 根目录下已有旧的 `wal/wal-1.qwal` 时，那个文件就是 `default`，不再另建。
+    ///
+    /// # Arguments
+    ///
+    /// * `root` - 实例目录，通常是 `data`。
+    ///
+    /// # Returns
+    ///
+    /// 目录句柄。这一步不映射共享内存，也不持有写入锁。
+    ///
+    /// # Errors
+    ///
+    /// 创建目录或空 WAL 失败时返回 [`CatalogError::Io`]。
     pub fn open(root: &Path) -> Result<Self, CatalogError> {
         fs::create_dir_all(root).map_err(io)?;
         let catalog = Self {
@@ -44,7 +60,17 @@ impl Catalog {
         Ok(catalog)
     }
 
-    /// 只查看实例。目录不存在时返回错误，不创建库。
+    /// 只查看已经存在的实例目录。
+    ///
+    /// 不创建 `default`，也不建任何文件。
+    ///
+    /// # Arguments
+    ///
+    /// * `root` - 实例目录。
+    ///
+    /// # Errors
+    ///
+    /// 目录不存在时返回 [`CatalogError::Io`]。
     pub fn open_read(root: &Path) -> Result<Self, CatalogError> {
         if !root.is_dir() {
             return Err(CatalogError::Io(format!(
@@ -57,6 +83,15 @@ impl Catalog {
         })
     }
 
+    /// 列出已有 WAL 的库名。
+    ///
+    /// # Returns
+    ///
+    /// 按名字排序、去重后的库名。旧布局的根目录 WAL 记为 `default`。
+    ///
+    /// # Errors
+    ///
+    /// 读 `db/` 目录失败时返回 [`CatalogError::Io`]。
     pub fn list(&self) -> Result<Vec<String>, CatalogError> {
         let mut names = Vec::new();
         if self.legacy_default() && !self.named_wal("default") {
@@ -80,10 +115,34 @@ impl Catalog {
         Ok(names)
     }
 
+    /// 该名字是否已经有 WAL 文件。
+    ///
+    /// 非法名字返回 `false`，不报错。
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - 库名。合法形式是字母或 `_` 开头，后接字母、数字或 `_`，最长 32。
     pub fn exists(&self, name: &str) -> bool {
         valid_name(name) && self.wal_file(name).is_file()
     }
 
+    /// 新建一个空库。
+    ///
+    /// 只创建目录和空的 `wal/wal-1.qwal`。不映射共享内存。打开后才会建 `region.bin`。
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - 库名。规则见 [`Catalog::exists`]。
+    ///
+    /// # Returns
+    ///
+    /// 新库目录，位于 `db/<name>`。不映射共享内存。
+    ///
+    /// # Errors
+    ///
+    /// * [`CatalogError::InvalidName`] - 名字不合法。
+    /// * [`CatalogError::Exists`] - 同名库已经有 WAL。
+    /// * [`CatalogError::Io`] - 建目录或 WAL 失败。
     pub fn create(&self, name: &str) -> Result<PathBuf, CatalogError> {
         if !valid_name(name) {
             return Err(CatalogError::InvalidName);
@@ -97,6 +156,20 @@ impl Catalog {
         Ok(path)
     }
 
+    /// 已存在库的目录。
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - 库名。
+    ///
+    /// # Returns
+    ///
+    /// 旧布局的 `default` 返回实例根目录，其余返回 `db/<name>`。
+    ///
+    /// # Errors
+    ///
+    /// * [`CatalogError::InvalidName`] - 名字不合法。
+    /// * [`CatalogError::NotFound`] - 还没有这个库。
     pub fn path(&self, name: &str) -> Result<PathBuf, CatalogError> {
         if !valid_name(name) {
             return Err(CatalogError::InvalidName);
@@ -107,10 +180,33 @@ impl Catalog {
         Ok(self.resolved_path(name))
     }
 
+    /// 以写入者打开库，使用开发规模的共享内存，并且每条写入都 `fsync`。
+    ///
+    /// 会删除并重建该库的 `region.bin`。同一库不要在 `qdb` 进程持有时再调用。
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - 已存在的库名。
+    ///
+    /// # Errors
+    ///
+    /// 库不存在时返回 [`CatalogError::NotFound`]。打开失败时返回 [`CatalogError::Store`]。
     pub fn open_database(&self, name: &str) -> Result<Engine, CatalogError> {
         Ok(Engine::open(&self.path(name)?)?)
     }
 
+    /// 以写入者打开库，并打开行情中心用的组提交。
+    ///
+    /// 共享内存按 `region` 重建。组提交是 256 条或 1 毫秒，内存先更新，`fsync` 和共享内存发布在 [`Engine::flush`]。
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - 已存在的库名。
+    /// * `region` - 符号槽数和帧容量。`qdb` 进程传入 [`RegionConfig::market`]。
+    ///
+    /// # Errors
+    ///
+    /// 同 [`Catalog::open_database`]。
     pub fn open_database_with(
         &self,
         name: &str,
@@ -121,11 +217,37 @@ impl Catalog {
         Ok(engine)
     }
 
+    /// 只读打开库。不删除 `region.bin`，也不追加 WAL。
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - 已存在的库名。
+    ///
+    /// # Errors
+    ///
+    /// 同 [`Catalog::open_database`]。
     pub fn open_database_read(&self, name: &str) -> Result<Engine, CatalogError> {
         Ok(Engine::open_read(&self.path(name)?)?)
     }
 
-    /// 把该库已经提交的行情写成转储文件。
+    /// 把该库已经 `fsync` 的 WAL 记录写成 `QDBDUMP1` 文件。
+    ///
+    /// 不打开共享内存。文件里的序号与源库相同。
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - 已存在的库名。
+    /// * `file` - 转储文件路径。已有文件会被覆盖。
+    ///
+    /// # Returns
+    ///
+    /// 写入的记录条数。
+    ///
+    /// # Errors
+    ///
+    /// * [`CatalogError::NotFound`] - 库不存在。
+    /// * [`CatalogError::Store`] - WAL 的 CRC 已经损坏。
+    /// * [`CatalogError::Io`] - 读 WAL 或写文件失败。
     pub fn dump(&self, name: &str, file: &Path) -> Result<u64, CatalogError> {
         let loaded = read_path(&self.path(name)?.join("wal/wal-1.qwal")).map_err(io)?;
         if loaded.crc_failed {
@@ -135,7 +257,25 @@ impl Catalog {
         Ok(loaded.records.len() as u64)
     }
 
-    /// 把转储文件写回一个空库的 WAL。打开该库后得到原来的序号和 K 线。
+    /// 把转储文件覆盖进一个空库的 WAL。
+    ///
+    /// 记录原样写回，序号不变。目标库里已有记录时拒绝覆盖。
+    ///
+    /// # Arguments
+    ///
+    /// * `name` - 已存在且 WAL 为空的库。
+    /// * `file` - `QDBDUMP1` 文件。
+    ///
+    /// # Returns
+    ///
+    /// 写回的记录条数。
+    ///
+    /// # Errors
+    ///
+    /// * [`CatalogError::NotEmpty`] - 目标库已经有记录。
+    /// * [`CatalogError::NotFound`] - 库不存在。
+    /// * [`CatalogError::Store`] - 源 WAL 或转储文件 CRC 损坏。
+    /// * [`CatalogError::Io`] - 读写失败，或文件头不是 `QDBDUMP1`。
     pub fn restore(&self, name: &str, file: &Path) -> Result<u64, CatalogError> {
         let wal_path = self.path(name)?.join("wal/wal-1.qwal");
         let existing = read_path(&wal_path).map_err(io)?;

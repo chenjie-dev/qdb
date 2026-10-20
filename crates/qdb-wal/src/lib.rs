@@ -1,4 +1,6 @@
-//! 追加 WAL。坏 CRC 停在最后一条完好记录之前。
+//! 追加 WAL。记录是小端的 `crc32 | body_len | body`。
+//!
+//! 坏 CRC 停在最后一条完好记录之前。文件尾部不足一条时不当成损坏。
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -37,6 +39,17 @@ pub struct WalRead {
 }
 
 impl WalAppender {
+    /// 打开或创建 WAL 文件，写在末尾。
+    ///
+    /// 不截断已有记录。父目录不存在时会创建。
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - 通常是 `wal/wal-1.qwal`。
+    ///
+    /// # Errors
+    ///
+    /// 建目录或打开文件失败时返回 [`WalError::Io`]。
     pub fn open(path: &Path) -> Result<Self, WalError> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).map_err(|err| WalError::Io(err.to_string()))?;
@@ -53,6 +66,17 @@ impl WalAppender {
         })
     }
 
+    /// 追加一条记录。只写入页缓存，不 `fsync`。
+    ///
+    /// 记录格式是小端的 `crc32 | body_len | body`。
+    ///
+    /// # Arguments
+    ///
+    /// * `record` - 序号、消息类型和载荷。序号由调用方分配。
+    ///
+    /// # Errors
+    ///
+    /// 写失败时返回 [`WalError::Io`]。
     pub fn append(&mut self, record: &WalRecord) -> Result<(), WalError> {
         let bytes = encode_framed(record);
         self.file
@@ -61,6 +85,13 @@ impl WalAppender {
         Ok(())
     }
 
+    /// 把已追加的字节 `fsync` 到磁盘。
+    ///
+    /// 读者能看见的序号必须先经过这一步。组提交把多次 [`WalAppender::append`] 并成一次调用。
+    ///
+    /// # Errors
+    ///
+    /// 同步失败时返回 [`WalError::Io`]。
     pub fn flush(&mut self) -> Result<(), WalError> {
         self.file
             .flush()
@@ -80,7 +111,18 @@ pub fn read_path(path: &Path) -> Result<WalRead, WalError> {
     read_from(path, 0)
 }
 
-/// 从 `from` 读取新写完的记录。文件后部不足一条时不前进 `consumed`。
+/// 从字节偏移 `from` 读取已经写完的记录。
+///
+/// 文件尾部不足一条时停在那条之前，`consumed` 不越过它。坏 CRC 时返回已读到的完好记录，并把 [`WalRead::crc_failed`] 设为真。
+///
+/// # Arguments
+///
+/// * `path` - WAL 文件。不存在时返回空结果，`consumed` 等于 `from`。
+/// * `from` - 上次的 [`WalRead::consumed`]。0 表示从头读。
+///
+/// # Errors
+///
+/// * [`WalError::Io`] - 打开失败，或 `from` 已经超过文件长度。
 pub fn read_from(path: &Path, from: u64) -> Result<WalRead, WalError> {
     if !path.exists() {
         return Ok(WalRead {
@@ -143,6 +185,16 @@ fn parse_bytes(bytes: &[u8], base: u64) -> Result<WalRead, WalError> {
 
 pub const DUMP_MAGIC: &[u8; 8] = b"QDBDUMP1";
 
+/// 写成 `QDBDUMP1` 文件并 `fsync`。已有文件会被截断。
+///
+/// # Arguments
+///
+/// * `path` - 转储路径。父目录不存在时会创建。
+/// * `records` - 按原序号写出。空切片只写魔数。
+///
+/// # Errors
+///
+/// 建目录、写文件或同步失败时返回 [`WalError::Io`]。
 pub fn write_dump(path: &Path, records: &[WalRecord]) -> Result<(), WalError> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -179,7 +231,18 @@ pub fn read_dump(path: &Path) -> Result<WalRead, WalError> {
     parse_bytes(&bytes, 0)
 }
 
-/// 用这些记录替换 WAL 文件。调用方要保证没有别的写入者正打开它。
+/// 用这些记录替换 WAL 文件，并 `fsync`。
+///
+/// 调用方要保证没有别的写入者正打开它。已有内容被截断。文件不含 `QDBDUMP1` 魔数。
+///
+/// # Arguments
+///
+/// * `path` - `wal/wal-1.qwal`。
+/// * `records` - 按原序号写回。
+///
+/// # Errors
+///
+/// 写文件或同步失败时返回 [`WalError::Io`]。
 pub fn replace_wal(path: &Path, records: &[WalRecord]) -> Result<(), WalError> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|err| WalError::Io(err.to_string()))?;
