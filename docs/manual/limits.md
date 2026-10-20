@@ -30,7 +30,7 @@
 - 早于当前桶的成交进入 `ticks`，不进入 K 线。
 - SQL 的 `ORDER BY` 不改变行序。`GROUP BY` 不产生分组。
 - `klines` 的 SQL `seq` 列恒为 `0`。
-- `symbols.exchange` 列是内部编号，不是标签文本。标签在 `symbol` 列的冒号左边。
+- `symbols.exchange` 是调用方标签。内部编号在 `exchange_id` 和 `symbol_id`。展示代码在 `symbol`。
 - 同一 `seq` 的多帧里，续传只交付过滤后的第一条。
 - 订阅的 `from_seq = 0` 只给出快照边界和尚未应用的帧，不回放历史帧。
 - 健康检查在 2 秒没有新写入后变为 503。采集线程的写入会刷新心跳；`QDB_FEED=0` 时仍没有后台时钟。

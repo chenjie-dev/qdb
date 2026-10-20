@@ -1,7 +1,10 @@
-//! 用户表。类型只有 INT64、STRING、BOOL。主键唯一，二级索引用于等值查找。
+//! 普通表。类型只有 INT64、STRING、BOOL。主键可以多列，合起来唯一。二级索引用于等值查找。
+//!
+//! `symbols`、`ticks`、`snapshots`、`klines` 由引擎登记成这种表。行仍由行情写入路径维护。
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use crate::StoreError;
 
@@ -109,7 +112,11 @@ pub struct TableSet {
 impl TableSet {
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        let names = self.names();
+        let names: Vec<String> = self
+            .names()
+            .into_iter()
+            .filter(|name| !BUILTIN_TABLES.contains(&name.as_str()))
+            .collect();
         push_u16(&mut out, names.len() as u16);
         for name in names {
             let schema = &self.schemas[&name];
@@ -175,21 +182,10 @@ impl TableSet {
         if BUILTIN_TABLES.contains(&schema.name.as_str()) {
             return Err(StoreError::Schema("reserved table".into()));
         }
-        if schema.name.is_empty() || schema.columns.is_empty() {
-            return Err(StoreError::Schema("table needs a name and a column".into()));
-        }
+        Self::validate_shape(schema)?;
         let mut seen = HashMap::new();
-        let mut primary = 0;
         for column in &schema.columns {
-            if column.name.is_empty() || seen.insert(column.name.clone(), ()).is_some() {
-                return Err(StoreError::Schema("duplicate column".into()));
-            }
-            if column.primary_key {
-                primary += 1;
-            }
-        }
-        if primary > 1 {
-            return Err(StoreError::Schema("one primary key".into()));
+            seen.insert(column.name.clone(), ());
         }
         let mut index_names = HashMap::new();
         for index in &schema.indexes {
@@ -258,6 +254,61 @@ impl TableSet {
         Ok(schema)
     }
 
+    /// 登记一张表。已经存在则保持原定义。
+    ///
+    /// 引擎用它登记内置表。调用方的 `CREATE TABLE` 仍不能占用这些名字。
+    ///
+    /// # Errors
+    ///
+    /// 列定义不合法时返回 [`StoreError::Schema`]。
+    pub fn ensure(&mut self, schema: TableSchema) -> Result<(), StoreError> {
+        if self.schemas.contains_key(&schema.name) {
+            return Ok(());
+        }
+        Self::validate_shape(&schema)?;
+        self.insert_new(schema)
+    }
+
+    pub fn clear_rows(&mut self, table: &str) {
+        if let Some(rows) = self.rows.get_mut(table) {
+            rows.clear();
+        }
+        if let Some(index) = self.primary.get_mut(table) {
+            index.clear();
+        }
+        if let Some(indexes) = self.secondary.get_mut(table) {
+            for index in indexes.values_mut() {
+                index.clear();
+            }
+        }
+    }
+
+    /// 按主键写入一行。主键已存在时覆盖该行。
+    ///
+    /// # Errors
+    ///
+    /// 表不存在、列数或类型不对时返回错误。没有主键的表不能覆盖，只能追加。
+    pub fn upsert(&mut self, table: &str, values: Vec<Cell>) -> Result<(), StoreError> {
+        let schema = self
+            .schemas
+            .get(table)
+            .cloned()
+            .ok_or(StoreError::NotFound)?;
+        check_cells(&schema, &values)?;
+        let Some(key) = primary_key(&schema, &values) else {
+            return self.insert_values(table, values);
+        };
+        if let Some(index) = self
+            .primary
+            .get(table)
+            .and_then(|index| index.get(&key).copied())
+        {
+            self.replace_row(table, &schema, index, values);
+            return Ok(());
+        }
+        self.insert_values(table, values)
+    }
+
     pub fn insert_schema(&mut self, schema: TableSchema) -> Result<(), StoreError> {
         if self.schemas.contains_key(&schema.name) {
             return Err(StoreError::TableExists);
@@ -289,15 +340,14 @@ impl TableSet {
                     return Err(StoreError::Schema("string longer than 1024 bytes".into()));
                 }
             }
-            if column.primary_key {
-                let key = value.key_bytes();
-                if self
-                    .primary
-                    .get(table)
-                    .is_some_and(|index| index.contains_key(&key))
-                {
-                    return Err(StoreError::DuplicateKey);
-                }
+        }
+        if let Some(key) = primary_key(schema, values) {
+            if self
+                .primary
+                .get(table)
+                .is_some_and(|index| index.contains_key(&key))
+            {
+                return Err(StoreError::DuplicateKey);
             }
         }
         let mut out = Vec::new();
@@ -336,15 +386,12 @@ impl TableSet {
             values.push(cell);
         }
         let row_index = self.rows.get(&table).map(Vec::len).unwrap_or(0);
-        for (value, column) in values.iter().zip(&schema.columns) {
-            if column.primary_key {
-                let key = value.key_bytes();
-                let index = self.primary.entry(table.clone()).or_default();
-                if index.contains_key(&key) {
-                    return Err(StoreError::DuplicateKey);
-                }
-                index.insert(key, row_index);
+        if let Some(key) = primary_key(&schema, &values) {
+            let index = self.primary.entry(table.clone()).or_default();
+            if index.contains_key(&key) {
+                return Err(StoreError::DuplicateKey);
             }
+            index.insert(key, row_index);
         }
         for index in &schema.indexes {
             let position = schema
@@ -432,7 +479,12 @@ impl TableSet {
             return Err(StoreError::TypeMismatch);
         }
         let key = expected.key_bytes();
-        if definition.primary_key {
+        let primary_columns = schema
+            .columns
+            .iter()
+            .filter(|column| column.primary_key)
+            .count();
+        if definition.primary_key && primary_columns == 1 {
             return Ok(self
                 .primary
                 .get(table)
@@ -462,6 +514,262 @@ impl TableSet {
             .map(|(index, _)| index)
             .collect())
     }
+}
+
+/// 行情四表的字典。调用方不能用 `CREATE TABLE` 替换它们。
+///
+/// # Arguments
+///
+/// * `name` - `symbols`、`ticks`、`snapshots` 或 `klines`。
+///
+/// # Returns
+///
+/// 表不在这四张里时返回 `None`。
+pub fn quote_schema(name: &str) -> Option<&'static TableSchema> {
+    static SCHEMAS: OnceLock<Vec<TableSchema>> = OnceLock::new();
+    let schemas = SCHEMAS.get_or_init(quote_schemas);
+    schemas.iter().find(|schema| schema.name == name)
+}
+
+fn quote_schemas() -> Vec<TableSchema> {
+    vec![
+        TableSchema {
+            name: "symbols".into(),
+            columns: vec![
+                col("symbol_id", ColumnType::Int64, true),
+                col("symbol", ColumnType::String, false),
+                col("exchange", ColumnType::String, false),
+                col("code", ColumnType::String, false),
+                col("exchange_id", ColumnType::Int64, false),
+            ],
+            indexes: vec![idx("idx_code", "code")],
+        },
+        TableSchema {
+            name: "ticks".into(),
+            columns: vec![
+                col("seq", ColumnType::Int64, true),
+                col("symbol_id", ColumnType::Int64, false),
+                col("symbol", ColumnType::String, false),
+                col("ts", ColumnType::Int64, false),
+                col("price", ColumnType::Int64, false),
+                col("volume", ColumnType::Int64, false),
+                col("amount", ColumnType::Int64, false),
+            ],
+            indexes: vec![idx("idx_symbol", "symbol_id")],
+        },
+        TableSchema {
+            name: "snapshots".into(),
+            columns: snapshot_columns(),
+            indexes: vec![idx("idx_symbol", "symbol")],
+        },
+        TableSchema {
+            name: "klines".into(),
+            columns: vec![
+                col("symbol_id", ColumnType::Int64, true),
+                col("period_id", ColumnType::Int64, true),
+                col("ts", ColumnType::Int64, true),
+                col("symbol", ColumnType::String, false),
+                col("period", ColumnType::String, false),
+                col("open", ColumnType::Int64, false),
+                col("high", ColumnType::Int64, false),
+                col("low", ColumnType::Int64, false),
+                col("close", ColumnType::Int64, false),
+                col("volume", ColumnType::Int64, false),
+                col("amount", ColumnType::Int64, false),
+                col("seq", ColumnType::Int64, false),
+            ],
+            indexes: vec![idx("idx_symbol", "symbol_id")],
+        },
+    ]
+}
+
+fn snapshot_columns() -> Vec<ColumnDef> {
+    let mut columns = vec![
+        col("symbol_id", ColumnType::Int64, true),
+        col("symbol", ColumnType::String, false),
+        col("last", ColumnType::Int64, false),
+    ];
+    for level in 1..=5 {
+        columns.push(col(&format!("bid_px{level}"), ColumnType::Int64, false));
+        columns.push(col(&format!("bid_qty{level}"), ColumnType::Int64, false));
+        columns.push(col(&format!("ask_px{level}"), ColumnType::Int64, false));
+        columns.push(col(&format!("ask_qty{level}"), ColumnType::Int64, false));
+    }
+    columns.push(col("seq", ColumnType::Int64, false));
+    columns
+}
+
+fn col(name: &str, ty: ColumnType, primary_key: bool) -> ColumnDef {
+    ColumnDef {
+        name: name.into(),
+        ty,
+        primary_key,
+    }
+}
+
+fn idx(name: &str, column: &str) -> IndexDef {
+    IndexDef {
+        name: name.into(),
+        column: column.into(),
+    }
+}
+
+impl TableSet {
+    fn validate_shape(schema: &TableSchema) -> Result<(), StoreError> {
+        if schema.name.is_empty() || schema.columns.is_empty() {
+            return Err(StoreError::Schema("table needs a name and a column".into()));
+        }
+        let mut seen = HashMap::new();
+        for column in &schema.columns {
+            if column.name.is_empty() || seen.insert(column.name.clone(), ()).is_some() {
+                return Err(StoreError::Schema("duplicate column".into()));
+            }
+        }
+        Ok(())
+    }
+
+    fn insert_new(&mut self, schema: TableSchema) -> Result<(), StoreError> {
+        let name = schema.name.clone();
+        self.rows.insert(name.clone(), Vec::new());
+        self.primary.insert(name.clone(), HashMap::new());
+        let mut secondary = HashMap::new();
+        for index in &schema.indexes {
+            secondary.insert(index.column.clone(), HashMap::new());
+        }
+        self.secondary.insert(name.clone(), secondary);
+        self.schemas.insert(name, schema);
+        Ok(())
+    }
+
+    fn insert_values(&mut self, table: &str, values: Vec<Cell>) -> Result<(), StoreError> {
+        let schema = self
+            .schemas
+            .get(table)
+            .cloned()
+            .ok_or(StoreError::NotFound)?;
+        let row_index = self.rows.get(table).map(Vec::len).unwrap_or(0);
+        if let Some(key) = primary_key(&schema, &values) {
+            let index = self.primary.entry(table.to_string()).or_default();
+            if index.contains_key(&key) {
+                return Err(StoreError::DuplicateKey);
+            }
+            index.insert(key, row_index);
+        }
+        self.index_secondary(table, &schema, row_index, &values);
+        self.rows.entry(table.to_string()).or_default().push(values);
+        Ok(())
+    }
+
+    fn replace_row(&mut self, table: &str, schema: &TableSchema, index: usize, values: Vec<Cell>) {
+        if let Some(old) = self
+            .rows
+            .get(table)
+            .and_then(|rows| rows.get(index))
+            .cloned()
+        {
+            self.unindex_secondary(table, schema, index, &old);
+        }
+        if let Some(rows) = self.rows.get_mut(table) {
+            if let Some(slot) = rows.get_mut(index) {
+                *slot = values.clone();
+            }
+        }
+        self.index_secondary(table, schema, index, &values);
+    }
+
+    fn index_secondary(
+        &mut self,
+        table: &str,
+        schema: &TableSchema,
+        row_index: usize,
+        values: &[Cell],
+    ) {
+        for index in &schema.indexes {
+            let Some(position) = schema
+                .columns
+                .iter()
+                .position(|column| column.name == index.column)
+            else {
+                continue;
+            };
+            let key = values[position].key_bytes();
+            self.secondary
+                .entry(table.to_string())
+                .or_default()
+                .entry(index.column.clone())
+                .or_default()
+                .entry(key)
+                .or_default()
+                .push(row_index);
+        }
+    }
+
+    fn unindex_secondary(
+        &mut self,
+        table: &str,
+        schema: &TableSchema,
+        row_index: usize,
+        values: &[Cell],
+    ) {
+        for index in &schema.indexes {
+            let Some(position) = schema
+                .columns
+                .iter()
+                .position(|column| column.name == index.column)
+            else {
+                continue;
+            };
+            let key = values[position].key_bytes();
+            let Some(bucket) = self
+                .secondary
+                .get_mut(table)
+                .and_then(|indexes| indexes.get_mut(&index.column))
+                .and_then(|index| index.get_mut(&key))
+            else {
+                continue;
+            };
+            bucket.retain(|found| *found != row_index);
+        }
+    }
+}
+
+fn check_cells(schema: &TableSchema, values: &[Cell]) -> Result<(), StoreError> {
+    if values.len() != schema.columns.len() {
+        return Err(StoreError::Schema("column count".into()));
+    }
+    for (value, column) in values.iter().zip(&schema.columns) {
+        if !value.matches(column.ty) {
+            return Err(StoreError::TypeMismatch);
+        }
+        if let Cell::String(text) = value {
+            if text.len() > MAX_STRING {
+                return Err(StoreError::Schema("string longer than 1024 bytes".into()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn primary_key(schema: &TableSchema, values: &[Cell]) -> Option<Vec<u8>> {
+    let marked: Vec<&Cell> = values
+        .iter()
+        .zip(&schema.columns)
+        .filter(|(_, column)| column.primary_key)
+        .map(|(value, _)| value)
+        .collect();
+    if marked.is_empty() {
+        return None;
+    }
+    if marked.len() == 1 {
+        return Some(marked[0].key_bytes());
+    }
+    let mut key = Vec::new();
+    for value in marked {
+        let bytes = value.key_bytes();
+        key.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        key.extend_from_slice(&bytes);
+    }
+    Some(key)
 }
 
 fn push_u16(out: &mut Vec<u8>, value: u16) {

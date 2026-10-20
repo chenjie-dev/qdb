@@ -6,7 +6,7 @@
 
 ## 建表
 
-用户表使用三种类型：`INT64`、`STRING`、`BOOL`。价格和时间用 `INT64`，不用浮点。`STRING` 最长 1024 字节。一张表最多一个 `PRIMARY KEY`。`INDEX` 是不唯一的二级索引，供 `WHERE 列 = 值` 查找。
+用户表使用三种类型：`INT64`、`STRING`、`BOOL`。价格和时间用 `INT64`，不用浮点。`STRING` 最长 1024 字节。`PRIMARY KEY` 可以写在多列上，这几列合起来唯一。`INDEX` 是不唯一的二级索引，供 `WHERE 列 = 值` 查找。
 
 ```sql
 CREATE TABLE note (
@@ -29,7 +29,7 @@ DESCRIBE klines;
 DESC ticks;
 ```
 
-`SHOW TABLES` 返回 `table` 和 `filter`。`filter` 是查询该表时必须写的条件。`DESCRIBE` 和 `DESC` 返回 `column` 和 `note`，列出当前查询实际能返回的列。未知表名是语法错误。
+`SHOW TABLES` 返回 `table` 和 `filter`。`filter` 是查询该表时必须写的条件。`DESCRIBE` 和 `DESC` 返回 `column` 和 `note`。`note` 是 `INT64`、`STRING` 或 `BOOL`，主键列再加 `PRIMARY KEY`，有二级索引再加 `INDEX` 和索引名。行情四表和用户表用同一种字典。未知表名是语法错误。
 
 ## 语法
 
@@ -70,8 +70,13 @@ SELECT * FROM symbols
 
 | 列 | 内容 |
 |---|---|
+| `symbol_id` | 内部编号，主键 |
 | `symbol` | `交易所:代码` |
-| `exchange` | 内部 `exchange_id` 的十进制文本 |
+| `exchange` | 调用方给出的来源标签 |
+| `code` | 代码 |
+| `exchange_id` | 标签第一次出现时分配的内部编号 |
+
+`SELECT symbol, exchange_id` 仍能只取这两列。`*` 返回上表全部列。
 
 ### ticks
 
@@ -79,7 +84,7 @@ SELECT * FROM symbols
 SELECT * FROM ticks
 ```
 
-不写 `symbol` 时，`*` 的列是 `symbol`、`ts`、`price`、`volume`、`seq`，包含库里全部成交，仍受 `LIMIT` 约束。写了 `symbol` 时列是 `ts`、`price`、`volume`、`seq`。指定其他列名不会改变这些列。
+`*` 的列是 `seq`、`symbol_id`、`symbol`、`ts`、`price`、`volume`、`amount`。`seq` 是主键。不写 `symbol` 时包含库里全部成交，仍受 `LIMIT` 约束。可以只点名其中几列，未知列名是语法错误。
 
 ```sql
 SELECT * FROM ticks
@@ -92,7 +97,7 @@ WHERE symbol = 'SSE:600000' AND ts BETWEEN 1704160200000000000 AND 1704160260000
 SELECT last, bid_px1, ask_px1, seq FROM snapshots WHERE symbol = 'BINANCE:BTCUSDT'
 ```
 
-`*` 展开为 `last`、`bid_px1`、`ask_px1`、`seq`。没有报价时返回 `symbol not found`。
+`*` 展开为 `symbol_id`、`symbol`、`last`、五档 `bid_px` / `bid_qty` / `ask_px` / `ask_qty` 和 `seq`。`symbol_id` 是主键。没有报价时返回 `symbol not found`。可以只点名其中几列。
 
 ### klines
 
@@ -102,7 +107,7 @@ FROM klines
 WHERE symbol = 'SSE:600000' AND period = '1m'
 ```
 
-`*` 展开为 `ts`、`open`、`high`、`low`、`close`、`volume`、`amount`、`seq`。`ts` 是桶起点 `bucket_start_ns`。这张表的 `seq` 列当前总是 `0`。
+`*` 展开为 `symbol_id`、`period_id`、`ts`、`symbol`、`period`、`open`、`high`、`low`、`close`、`volume`、`amount`、`seq`。主键是 `symbol_id`、`period_id`、`ts`。`ts` 是桶起点。`seq` 当前总是 `0`。可以只点名其中几列。
 
 缺少 `symbol` 或 `period` 时返回语法错误。
 

@@ -283,7 +283,7 @@ fn symbol_matches(engine: &Engine, filter: &str, change_symbol: &str) -> bool {
 
 fn project_change(engine: &Engine, stmt: &Stmt, change: &qdb_store::Change) -> Vec<Vec<String>> {
     match stmt.table.as_str() {
-        "ticks" => vec![tick_live_row(stmt, change)],
+        "ticks" => vec![tick_live_row(engine, stmt, change)],
         "snapshots" => snapshot_live_row(engine, stmt, change)
             .into_iter()
             .collect(),
@@ -292,23 +292,27 @@ fn project_change(engine: &Engine, stmt: &Stmt, change: &qdb_store::Change) -> V
     }
 }
 
-fn tick_live_row(stmt: &Stmt, change: &qdb_store::Change) -> Vec<String> {
-    if stmt.symbol.is_none() {
-        vec![
-            change.symbol.clone(),
-            change.ts.to_string(),
-            change.price.to_string(),
-            change.volume.to_string(),
-            change.seq.to_string(),
-        ]
-    } else {
-        vec![
-            change.ts.to_string(),
-            change.price.to_string(),
-            change.volume.to_string(),
-            change.seq.to_string(),
-        ]
-    }
+fn tick_live_row(engine: &Engine, stmt: &Stmt, change: &qdb_store::Change) -> Vec<String> {
+    let columns = listed_columns(engine, "ticks", &stmt.columns).unwrap_or_default();
+    let symbol_id = engine.resolve(&change.symbol).unwrap_or(0);
+    let amount = engine
+        .ticks(symbol_id)
+        .iter()
+        .find(|tick| tick.seq == change.seq)
+        .map(|tick| tick.amount)
+        .unwrap_or_else(|| change.price.saturating_mul(change.volume));
+    project(
+        &columns,
+        &[
+            ("seq", change.seq.to_string()),
+            ("symbol_id", symbol_id.to_string()),
+            ("symbol", change.symbol.clone()),
+            ("ts", change.ts.to_string()),
+            ("price", change.price.to_string()),
+            ("volume", change.volume.to_string()),
+            ("amount", amount.to_string()),
+        ],
+    )
 }
 
 fn snapshot_live_row(
@@ -318,38 +322,11 @@ fn snapshot_live_row(
 ) -> Option<Vec<String>> {
     let symbol_id = engine.resolve(&change.symbol).ok()?;
     let quote = engine.quote(symbol_id)?;
-    let columns: Vec<String> = if stmt.columns == ["*"] {
-        vec![
-            "last".into(),
-            "bid_px1".into(),
-            "ask_px1".into(),
-            "seq".into(),
-        ]
-    } else {
-        stmt.columns.clone()
-    };
-    Some(
-        columns
-            .iter()
-            .map(|col| match col.as_str() {
-                "last" => quote.last.to_string(),
-                "bid_px1" => quote.bid_px[0].to_string(),
-                "bid_px2" => quote.bid_px[1].to_string(),
-                "bid_px3" => quote.bid_px[2].to_string(),
-                "bid_px4" => quote.bid_px[3].to_string(),
-                "bid_px5" => quote.bid_px[4].to_string(),
-                "ask_px1" => quote.ask_px[0].to_string(),
-                "ask_px2" => quote.ask_px[1].to_string(),
-                "ask_px3" => quote.ask_px[2].to_string(),
-                "ask_px4" => quote.ask_px[3].to_string(),
-                "ask_px5" => quote.ask_px[4].to_string(),
-                "bid_qty1" => quote.bid_qty[0].to_string(),
-                "ask_qty1" => quote.ask_qty[0].to_string(),
-                "seq" => quote.seq.to_string(),
-                _ => String::new(),
-            })
-            .collect(),
-    )
+    let columns = listed_columns(engine, "snapshots", &stmt.columns).ok()?;
+    Some(project(
+        &columns,
+        &snapshot_fields(symbol_id, &change.symbol, quote),
+    ))
 }
 
 fn kline_live_rows(engine: &Engine, stmt: &Stmt, change: &qdb_store::Change) -> Vec<Vec<String>> {
@@ -360,34 +337,37 @@ fn kline_live_rows(engine: &Engine, stmt: &Stmt, change: &qdb_store::Change) -> 
         return Vec::new();
     };
     let bars = engine.klines(symbol_id, period);
-    let columns: Vec<String> = if stmt.columns == ["*"] {
-        vec![
-            "ts".into(),
-            "open".into(),
-            "high".into(),
-            "low".into(),
-            "close".into(),
-            "volume".into(),
-            "amount".into(),
-            "seq".into(),
-        ]
-    } else {
-        stmt.columns.clone()
-    };
-    let project = |bar: &qdb_abi::KlineBody| -> Vec<String> {
-        columns
-            .iter()
-            .map(|column| kline_value(bar, column))
-            .collect()
+    let columns = listed_columns(engine, "klines", &stmt.columns).unwrap_or_default();
+    let symbol_text = change.symbol.clone();
+    let period_id = i64::from(period.id());
+    let period_name = period.as_str();
+    let project_bar = |bar: &qdb_abi::KlineBody| -> Vec<String> {
+        project(
+            &columns,
+            &[
+                ("symbol_id", symbol_id.to_string()),
+                ("period_id", period_id.to_string()),
+                ("ts", bar.bucket_start_ns.to_string()),
+                ("symbol", symbol_text.clone()),
+                ("period", period_name.into()),
+                ("open", bar.open.to_string()),
+                ("high", bar.high.to_string()),
+                ("low", bar.low.to_string()),
+                ("close", bar.close.to_string()),
+                ("volume", bar.volume.to_string()),
+                ("amount", bar.amount.to_string()),
+                ("seq", "0".into()),
+            ],
+        )
     };
     let mut rows = Vec::new();
     if let Some(bar) = bars.iter().find(|row| row.bucket_start_ns == change.ts) {
-        rows.push(project(bar));
+        rows.push(project_bar(bar));
     }
     // 跨桶时这一条变更只带上被闭合的桶。同一笔成交新开的桶也要打印。
     if let Some(open) = bars.last() {
         if open.bucket_start_ns != change.ts {
-            rows.push(project(open));
+            rows.push(project_bar(open));
         }
     }
     rows
@@ -564,6 +544,29 @@ impl<'a> SqlEngine<'a> {
         let period = stmt
             .period
             .ok_or_else(|| SqlError::Syntax("period required".into()))?;
+        if stmt.aggregates.is_empty() {
+            let columns = listed_columns(self.engine, "klines", &stmt.columns)?;
+            let (names, mut stored) = self.stored("klines")?;
+            let id_text = symbol_id.to_string();
+            stored.retain(|row| {
+                field(&names, row, "symbol_id") == id_text
+                    && field(&names, row, "period") == period.as_str()
+                    && stmt
+                        .ts_from
+                        .map(|from| field_i64(&names, row, "ts") >= from)
+                        .unwrap_or(true)
+                    && stmt
+                        .ts_to
+                        .map(|to| field_i64(&names, row, "ts") <= to)
+                        .unwrap_or(true)
+            });
+            stored.truncate(stmt.limit as usize);
+            let rows = stored
+                .iter()
+                .map(|row| project_stored(&names, row, &columns))
+                .collect();
+            return Ok(QueryResult { columns, rows });
+        }
         let mut rows = self.engine.klines(symbol_id, period);
         if let Some(from) = stmt.ts_from {
             rows.retain(|row| row.bucket_start_ns >= from);
@@ -572,27 +575,7 @@ impl<'a> SqlEngine<'a> {
             rows.retain(|row| row.bucket_start_ns <= to);
         }
         rows.truncate(stmt.limit as usize);
-        if stmt.aggregates.is_empty() {
-            let columns = if stmt.columns == ["*"] {
-                vec![
-                    "ts".into(),
-                    "open".into(),
-                    "high".into(),
-                    "low".into(),
-                    "close".into(),
-                    "volume".into(),
-                    "amount".into(),
-                    "seq".into(),
-                ]
-            } else {
-                stmt.columns.clone()
-            };
-            let out = rows
-                .iter()
-                .map(|row| columns.iter().map(|col| kline_value(row, col)).collect())
-                .collect();
-            Ok(QueryResult { columns, rows: out })
-        } else {
+        {
             let columns = stmt
                 .aggregates
                 .iter()
@@ -616,103 +599,61 @@ impl<'a> SqlEngine<'a> {
             .clone()
             .ok_or_else(|| SqlError::Syntax("symbol required".into()))?;
         let symbol_id = map_resolve(self.engine.resolve(&symbol))?;
-        let quote = self.engine.quote(symbol_id).ok_or(SqlError::NotFound)?;
-        let columns = if stmt.columns == ["*"] {
-            vec![
-                "last".into(),
-                "bid_px1".into(),
-                "ask_px1".into(),
-                "seq".into(),
-            ]
-        } else {
-            stmt.columns.clone()
+        let columns = listed_columns(self.engine, "snapshots", &stmt.columns)?;
+        let (names, mut stored) = self.stored("snapshots")?;
+        let id_text = symbol_id.to_string();
+        stored.retain(|row| field(&names, row, "symbol_id") == id_text);
+        let Some(row) = stored.into_iter().next() else {
+            return Err(SqlError::NotFound);
         };
-        let row = columns
-            .iter()
-            .map(|col| match col.as_str() {
-                "last" => quote.last.to_string(),
-                "bid_px1" => quote.bid_px[0].to_string(),
-                "bid_px2" => quote.bid_px[1].to_string(),
-                "bid_px3" => quote.bid_px[2].to_string(),
-                "bid_px4" => quote.bid_px[3].to_string(),
-                "bid_px5" => quote.bid_px[4].to_string(),
-                "ask_px1" => quote.ask_px[0].to_string(),
-                "ask_px2" => quote.ask_px[1].to_string(),
-                "ask_px3" => quote.ask_px[2].to_string(),
-                "ask_px4" => quote.ask_px[3].to_string(),
-                "ask_px5" => quote.ask_px[4].to_string(),
-                "bid_qty1" => quote.bid_qty[0].to_string(),
-                "ask_qty1" => quote.ask_qty[0].to_string(),
-                "seq" => quote.seq.to_string(),
-                _ => String::new(),
-            })
-            .collect();
         Ok(QueryResult {
-            columns,
-            rows: vec![row],
+            columns: columns.clone(),
+            rows: vec![project_stored(&names, &row, &columns)],
         })
     }
 
     fn query_symbols(&self, stmt: &Stmt) -> Result<QueryResult, SqlError> {
-        let columns = vec!["symbol".into(), "exchange".into()];
-        let mut rows = Vec::new();
-        for symbol in self.engine.symbols() {
-            let name = format!("{}:{}", symbol.exchange, symbol.code);
-            rows.push(vec![name, symbol.exchange_id.to_string()]);
-        }
-        rows.truncate(stmt.limit as usize);
+        let columns = listed_columns(self.engine, "symbols", &stmt.columns)?;
+        let (names, mut stored) = self.stored("symbols")?;
+        stored.truncate(stmt.limit as usize);
+        let rows = stored
+            .iter()
+            .map(|row| project_stored(&names, row, &columns))
+            .collect();
         Ok(QueryResult { columns, rows })
     }
 
     fn query_ticks(&self, stmt: &Stmt) -> Result<QueryResult, SqlError> {
-        let targets = if let Some(symbol) = &stmt.symbol {
-            vec![(symbol.clone(), map_resolve(self.engine.resolve(symbol))?)]
-        } else {
-            self.engine
-                .symbols()
-                .iter()
-                .map(|symbol| (format!("{}:{}", symbol.exchange, symbol.code), symbol.id))
-                .collect()
-        };
-        let columns = if stmt.symbol.is_none() {
-            vec![
-                "symbol".into(),
-                "ts".into(),
-                "price".into(),
-                "volume".into(),
-                "seq".into(),
-            ]
-        } else {
-            vec!["ts".into(), "price".into(), "volume".into(), "seq".into()]
-        };
-        let mut rows = Vec::new();
-        for (name, symbol_id) in targets {
-            for tick in self.engine.ticks(symbol_id) {
-                if stmt.ts_from.is_some_and(|from| tick.ts < from)
-                    || stmt.ts_to.is_some_and(|to| tick.ts > to)
-                {
-                    continue;
-                }
-                if stmt.symbol.is_none() {
-                    rows.push(vec![
-                        name.clone(),
-                        tick.ts.to_string(),
-                        tick.price.to_string(),
-                        tick.volume.to_string(),
-                        tick.seq.to_string(),
-                    ]);
-                } else {
-                    rows.push(vec![
-                        tick.ts.to_string(),
-                        tick.price.to_string(),
-                        tick.volume.to_string(),
-                        tick.seq.to_string(),
-                    ]);
-                }
-            }
+        if let Some(symbol) = &stmt.symbol {
+            map_resolve(self.engine.resolve(symbol))?;
         }
-        rows.truncate(stmt.limit as usize);
+        let columns = listed_columns(self.engine, "ticks", &stmt.columns)?;
+        let (names, mut stored) = self.stored("ticks")?;
+        if let Some(symbol) = &stmt.symbol {
+            let id_text = map_resolve(self.engine.resolve(symbol))?.to_string();
+            stored.retain(|row| field(&names, row, "symbol_id") == id_text);
+        }
+        stored.retain(|row| {
+            stmt.ts_from
+                .map(|from| field_i64(&names, row, "ts") >= from)
+                .unwrap_or(true)
+                && stmt
+                    .ts_to
+                    .map(|to| field_i64(&names, row, "ts") <= to)
+                    .unwrap_or(true)
+        });
+        stored.truncate(stmt.limit as usize);
+        let rows = stored
+            .iter()
+            .map(|row| project_stored(&names, row, &columns))
+            .collect();
         Ok(QueryResult { columns, rows })
+    }
+
+    fn stored(&self, table: &str) -> Result<(Vec<String>, Vec<Vec<String>>), SqlError> {
+        self.engine
+            .scan_table(table, None, None, 100_000)
+            .map_err(map_store)
     }
 
     fn query_user(&self, table: &str, stmt: &Stmt) -> Result<QueryResult, SqlError> {
@@ -823,6 +764,98 @@ fn format_avg(sum: i128, count: i128) -> String {
         }
     }
     format!("{whole}.{digits}")
+}
+
+fn listed_columns(
+    engine: &Engine,
+    table: &str,
+    requested: &[String],
+) -> Result<Vec<String>, SqlError> {
+    let schema = engine
+        .table_schema(table)
+        .ok_or_else(|| SqlError::Syntax(format!("unknown table {table}")))?;
+    if requested == ["*"] {
+        return Ok(schema
+            .columns
+            .iter()
+            .map(|column| column.name.clone())
+            .collect());
+    }
+    for name in requested {
+        if !schema.columns.iter().any(|column| &column.name == name) {
+            return Err(SqlError::Syntax(format!("unknown column {name}")));
+        }
+    }
+    Ok(requested.to_vec())
+}
+
+fn field<'a>(names: &[String], row: &'a [String], name: &str) -> &'a str {
+    names
+        .iter()
+        .position(|column| column == name)
+        .and_then(|index| row.get(index))
+        .map(String::as_str)
+        .unwrap_or("")
+}
+
+fn field_i64(names: &[String], row: &[String], name: &str) -> i64 {
+    field(names, row, name).parse().unwrap_or(0)
+}
+
+fn project_stored(names: &[String], row: &[String], requested: &[String]) -> Vec<String> {
+    requested
+        .iter()
+        .map(|name| field(names, row, name).to_string())
+        .collect()
+}
+
+fn project(columns: &[String], fields: &[(&str, String)]) -> Vec<String> {
+    columns
+        .iter()
+        .map(|name| {
+            fields
+                .iter()
+                .find(|(field, _)| *field == name)
+                .map(|(_, value)| value.clone())
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+fn snapshot_fields(
+    symbol_id: u32,
+    symbol: &str,
+    quote: &qdb_store::QuoteRow,
+) -> Vec<(&'static str, String)> {
+    let mut fields = vec![
+        ("symbol_id", symbol_id.to_string()),
+        ("symbol", symbol.to_string()),
+        ("last", quote.last.to_string()),
+        ("seq", quote.seq.to_string()),
+    ];
+    fields.extend([
+        ("bid_px1", quote.bid_px[0].to_string()),
+        ("bid_qty1", quote.bid_qty[0].to_string()),
+        ("ask_px1", quote.ask_px[0].to_string()),
+        ("ask_qty1", quote.ask_qty[0].to_string()),
+        ("bid_px2", quote.bid_px[1].to_string()),
+        ("bid_qty2", quote.bid_qty[1].to_string()),
+        ("ask_px2", quote.ask_px[1].to_string()),
+        ("ask_qty2", quote.ask_qty[1].to_string()),
+        ("bid_px3", quote.bid_px[2].to_string()),
+        ("bid_qty3", quote.bid_qty[2].to_string()),
+        ("ask_px3", quote.ask_px[2].to_string()),
+        ("ask_qty3", quote.ask_qty[2].to_string()),
+        ("bid_px4", quote.bid_px[3].to_string()),
+        ("bid_qty4", quote.bid_qty[3].to_string()),
+        ("ask_px4", quote.ask_px[3].to_string()),
+        ("ask_qty4", quote.ask_qty[3].to_string()),
+        ("bid_px5", quote.bid_px[4].to_string()),
+        ("bid_qty5", quote.bid_qty[4].to_string()),
+        ("ask_px5", quote.ask_px[4].to_string()),
+        ("ask_qty5", quote.ask_qty[4].to_string()),
+    ]);
+    fields
 }
 
 fn kline_value(row: &KlineBody, column: &str) -> String {
@@ -1252,17 +1285,34 @@ mod tests {
         let (_dir, engine) = engine();
         let sql = SqlEngine::new(&engine);
         let all = sql.query("SELECT * FROM ticks;").unwrap();
-        assert_eq!(all.columns, ["symbol", "ts", "price", "volume", "seq"]);
+        assert_eq!(
+            all.columns,
+            [
+                "seq",
+                "symbol_id",
+                "symbol",
+                "ts",
+                "price",
+                "volume",
+                "amount"
+            ]
+        );
+        let symbol_at = all
+            .columns
+            .iter()
+            .position(|name| name == "symbol")
+            .unwrap();
+        let price_at = all.columns.iter().position(|name| name == "price").unwrap();
         assert!(all
             .rows
             .iter()
-            .any(|row| row[0] == "SZSE:000001" && row[2] == "10"));
-        assert!(all.rows.iter().any(|row| row[0] == "SSE:000001"));
+            .any(|row| row[symbol_at] == "SZSE:000001" && row[price_at] == "10"));
+        assert!(all.rows.iter().any(|row| row[symbol_at] == "SSE:000001"));
         let one = sql
-            .query("SELECT * FROM ticks WHERE symbol = 'SZSE:000001'")
+            .query("SELECT price, volume FROM ticks WHERE symbol = 'SZSE:000001'")
             .unwrap();
-        assert_eq!(one.columns, ["ts", "price", "volume", "seq"]);
-        assert!(one.rows.iter().all(|row| row.len() == 4));
+        assert_eq!(one.columns, ["price", "volume"]);
+        assert!(one.rows.iter().all(|row| row.len() == 2));
     }
 
     #[test]
@@ -1274,8 +1324,11 @@ mod tests {
         assert_eq!(tables.rows.len(), 4);
         assert_eq!(tables.rows[3][0], "klines");
         let described = sql.query("DESCRIBE klines;").unwrap();
-        assert_eq!(described.rows[0][0], "ts");
-        assert_eq!(described.rows.len(), 8);
+        assert_eq!(described.rows[0][0], "symbol_id");
+        assert!(described.rows[0][1].contains("PRIMARY KEY"));
+        assert!(described.rows.iter().any(|row| row[0] == "ts"));
+        let symbols = sql.query("DESCRIBE symbols").unwrap();
+        assert!(symbols.rows.iter().any(|row| row[0] == "symbol_id"));
         assert!(sql.query("DESC nope").is_err());
     }
 
@@ -1307,14 +1360,12 @@ mod tests {
         assert_eq!(snap[0][0], "20");
         let ticks = live_rows(
             &reader,
-            "SELECT * FROM ticks WHERE symbol = 'SZSE:000001'",
+            "SELECT price, volume FROM ticks WHERE symbol = 'SZSE:000001'",
             &changes,
             &[],
         )
         .unwrap();
-        assert_eq!(ticks.len(), 1);
-        assert_eq!(ticks[0][1], "20");
-        assert_eq!(ticks[0][2], "3");
+        assert_eq!(ticks, vec![vec![String::from("20"), String::from("3")]]);
         let bars = live_rows(
             &reader,
             "SELECT close FROM klines WHERE symbol = 'SZSE:000001' AND period = '1m'",

@@ -177,6 +177,8 @@ pub struct Engine {
     group_started_ns: u64,
     pending: Vec<Frame>,
     flush_count: u64,
+    /// 重放期间先只更新内部结构，结束时再整表重建。
+    defer_rows: bool,
 }
 
 impl Engine {
@@ -287,6 +289,7 @@ impl Engine {
             group_started_ns: 0,
             pending: Vec::new(),
             flush_count: 0,
+            defer_rows: true,
         };
         if let Some(checkpoint) = checkpoint {
             engine.install_checkpoint(checkpoint)?;
@@ -294,6 +297,8 @@ impl Engine {
         for record in &loaded.records {
             engine.apply_record(record)?;
         }
+        engine.defer_rows = false;
+        engine.rebuild_business_rows();
         if loaded.crc_failed {
             engine.crc_failed = true;
             engine.metrics.crc_failed.store(true, Ordering::Release);
@@ -334,20 +339,26 @@ impl Engine {
     ///
     /// 按名字排序的表名。
     pub fn table_names(&self) -> Vec<String> {
-        self.tables.names()
+        self.tables
+            .names()
+            .into_iter()
+            .filter(|name| !table::BUILTIN_TABLES.contains(&name.as_str()))
+            .collect()
     }
 
-    /// 读取一张用户表的列和索引定义。
+    /// 读取一张表的列和索引定义。
+    ///
+    /// `symbols`、`ticks`、`snapshots`、`klines` 是引擎登记的普通表。其余名字来自 `CREATE TABLE`。
     ///
     /// # Arguments
     ///
-    /// * `name` - 表名，与建表时的小写名字一致。
+    /// * `name` - 表名，小写。
     ///
     /// # Returns
     ///
     /// 表不存在时返回 `None`。
     pub fn table_schema(&self, name: &str) -> Option<&TableSchema> {
-        self.tables.schema(name)
+        table::quote_schema(name).or_else(|| self.tables.schema(name))
     }
 
     /// 创建一张用户表，并把定义写入 WAL。
@@ -356,7 +367,7 @@ impl Engine {
     ///
     /// # Arguments
     ///
-    /// * `schema` - 至少一列，最多一个主键。`STRING` 列的值以后不能超过 1024 字节。
+    /// * `schema` - 至少一列。多个 `PRIMARY KEY` 列合成一个键。`STRING` 列的值以后不能超过 1024 字节。
     ///
     /// # Returns
     ///
@@ -365,7 +376,7 @@ impl Engine {
     /// # Errors
     ///
     /// * [`StoreError::TableExists`] - 同名表已经存在。
-    /// * [`StoreError::Schema`] - 没有列、列名重复、主键超过一个、索引指向不存在的列，或表名是 `symbols`、`ticks`、`snapshots`、`klines`。
+    /// * [`StoreError::Schema`] - 没有列、列名重复、索引指向不存在的列，或表名是 `symbols`、`ticks`、`snapshots`、`klines`。主键可以有多列，合起来是一个键。
     /// * [`StoreError::ReadOnly`] - 只读引擎。
     /// * [`StoreError::Crc`] - WAL 已损坏。
     pub fn create_table(&mut self, schema: TableSchema) -> Result<u64, StoreError> {
@@ -1063,6 +1074,7 @@ impl Engine {
                     });
                 }
                 self.agg.note_seq(record.seq)?;
+                self.mirror_symbol(id);
                 Ok(Vec::new())
             }
             Some(MsgType::TickTrade) => {
@@ -1103,6 +1115,7 @@ impl Engine {
                 });
                 quote.seq = record.seq;
                 quote.last = trade.price;
+                self.mirror_symbol(symbol_id);
                 Ok(events)
             }
             Some(MsgType::TickQuote) => {
@@ -1120,6 +1133,7 @@ impl Engine {
                     },
                 );
                 self.agg.note_seq(record.seq)?;
+                self.mirror_symbol(symbol_id);
                 Ok(Vec::new())
             }
             Some(MsgType::TableSchema) => {
@@ -1136,7 +1150,9 @@ impl Engine {
             Some(MsgType::ClockTick) => {
                 let exchange_id = u16::from_le_bytes(record.payload[0..2].try_into().unwrap());
                 let watermark = i64::from_le_bytes(record.payload[2..10].try_into().unwrap());
-                Ok(self.agg.apply_clock(record.seq, exchange_id, watermark)?)
+                let events = self.agg.apply_clock(record.seq, exchange_id, watermark)?;
+                self.mirror_exchange(exchange_id);
+                Ok(events)
             }
             _ => {
                 self.agg.note_seq(record.seq)?;
@@ -1315,6 +1331,118 @@ fn bar_frame(seq: u64, ts: i64, event: &BarEvent, out_idx: u16) -> Frame {
 }
 
 impl Engine {
+    fn rebuild_business_rows(&mut self) {
+        self.ensure_business_tables();
+        for name in table::BUILTIN_TABLES {
+            self.tables.clear_rows(name);
+        }
+        let ids: Vec<u32> = self.symbols.iter().map(|symbol| symbol.id).collect();
+        let saved = self.defer_rows;
+        self.defer_rows = false;
+        for id in ids {
+            self.mirror_symbol(id);
+        }
+        self.defer_rows = saved;
+    }
+
+    fn ensure_business_tables(&mut self) {
+        for name in table::BUILTIN_TABLES {
+            if let Some(schema) = table::quote_schema(name) {
+                let _ = self.tables.ensure(schema.clone());
+            }
+        }
+    }
+
+    fn mirror_exchange(&mut self, exchange_id: u16) {
+        let ids: Vec<u32> = self
+            .symbols
+            .iter()
+            .filter(|symbol| symbol.exchange_id == exchange_id)
+            .map(|symbol| symbol.id)
+            .collect();
+        for id in ids {
+            self.mirror_symbol(id);
+        }
+    }
+
+    fn mirror_symbol(&mut self, symbol_id: u32) {
+        if self.defer_rows {
+            return;
+        }
+        self.ensure_business_tables();
+        let Some(symbol) = self
+            .symbols
+            .iter()
+            .find(|symbol| symbol.id == symbol_id)
+            .cloned()
+        else {
+            return;
+        };
+        let label = format!("{}:{}", symbol.exchange, symbol.code);
+        let _ = self.tables.upsert(
+            "symbols",
+            vec![
+                Cell::Int64(i64::from(symbol.id)),
+                Cell::String(label.clone()),
+                Cell::String(symbol.exchange.clone()),
+                Cell::String(symbol.code.clone()),
+                Cell::Int64(i64::from(symbol.exchange_id)),
+            ],
+        );
+        if let Some(ticks) = self.ticks.get(&symbol_id).cloned() {
+            for tick in ticks {
+                let _ = self.tables.upsert(
+                    "ticks",
+                    vec![
+                        Cell::Int64(tick.seq as i64),
+                        Cell::Int64(i64::from(symbol_id)),
+                        Cell::String(label.clone()),
+                        Cell::Int64(tick.ts),
+                        Cell::Int64(tick.price),
+                        Cell::Int64(tick.volume),
+                        Cell::Int64(tick.amount),
+                    ],
+                );
+            }
+        }
+        if let Some(quote) = self.quotes.get(&symbol_id).cloned() {
+            let mut values = vec![
+                Cell::Int64(i64::from(symbol_id)),
+                Cell::String(label.clone()),
+                Cell::Int64(quote.last),
+            ];
+            for level in 0..5 {
+                values.push(Cell::Int64(quote.bid_px[level]));
+                values.push(Cell::Int64(quote.bid_qty[level]));
+                values.push(Cell::Int64(quote.ask_px[level]));
+                values.push(Cell::Int64(quote.ask_qty[level]));
+            }
+            values.push(Cell::Int64(quote.seq as i64));
+            let _ = self.tables.upsert("snapshots", values);
+        }
+        for period in qdb_abi::PERIODS {
+            for bar in self.klines(symbol_id, period) {
+                let _ = self.tables.upsert(
+                    "klines",
+                    vec![
+                        Cell::Int64(i64::from(symbol_id)),
+                        Cell::Int64(i64::from(period.id())),
+                        Cell::Int64(bar.bucket_start_ns),
+                        Cell::String(label.clone()),
+                        Cell::String(period.as_str().to_string()),
+                        Cell::Int64(bar.open),
+                        Cell::Int64(bar.high),
+                        Cell::Int64(bar.low),
+                        Cell::Int64(bar.close),
+                        Cell::Int64(bar.volume),
+                        Cell::Int64(bar.amount),
+                        Cell::Int64(0),
+                    ],
+                );
+            }
+        }
+    }
+
     fn intern_exchange(&mut self, name: &str) -> u16 {
         if let Some(index) = self.exchanges.iter().position(|existing| existing == name) {
             return (index as u16) + 1;
