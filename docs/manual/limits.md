@@ -40,8 +40,8 @@
 
 这些项在设计文档里有位置，调用当前版本不会得到对应行为：
 
-- PostgreSQL 线协议，以及任何接收 SQL 的网络端口。本机查询、`.watch` 和 `SELECT ... SUBSCRIBE` 见 [客户端](client.md)
-- WebSocket、gRPC、TCP 订阅推送
+- PostgreSQL 线协议。本机查询、`.watch` 和 `SELECT ... SUBSCRIBE` 见 [客户端](client.md)。WebSocket 推送见 [服务进程](server.md)
+- gRPC、TCP 长度前缀订阅
 - 账号、权限和审计
 - 历史导入、复权、公司行为和多档订单簿
 - 组提交、K 线快照、写者文件锁

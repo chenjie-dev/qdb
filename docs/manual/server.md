@@ -50,6 +50,24 @@ JSON：`{"items":[{"key":"binance:ticker:BTCUSDT","value":{}}]}`。值原样保�
 
 `period` 取 `1s` `1m` `5m` `15m` `1h` `4h` `1d`。`state` 为 0 表示未闭合。价格已按 `scale` 还原成十进制。
 
+### GET /v1/ws?db=
+
+把一条 `SELECT` 变成推送。查询参数 `db` 缺省 `default`。请求头需要 `Upgrade: websocket` 和 `Sec-WebSocket-Key`。握手成功后，客户端发送一条文本帧，内容是 `SELECT`，末尾的 `SUBSCRIBE` 可写可不写。
+
+服务端先发一条 JSON：
+
+```json
+{"type":"snapshot","columns":["price"],"rows":[["10"]]}
+```
+
+之后每出现一行新的匹配数据，再发一条：
+
+```json
+{"type":"row","values":["20"]}
+```
+
+证券还不存在时先发 `{"type":"waiting"}`。语句错误发 `{"type":"error","message":"..."}` 并关闭。这是只读连接，读已经 `fsync` 的 WAL，大约每 50 毫秒看一次。写失败或客户端关闭就结束这条连接，不挡住写入线程。
+
 ### GET /health
 
 正文是 `text/plain`。

@@ -1,6 +1,7 @@
 //! 行情进程。一台机器只运行一个实例，退出时卸下共享内存并清掉行情表。
 
 mod feed;
+mod ws;
 
 use std::collections::HashMap;
 use std::io::ErrorKind;
@@ -25,6 +26,10 @@ struct Databases {
 }
 
 impl Databases {
+    fn database_path(&self, name: &str) -> Result<std::path::PathBuf, String> {
+        self.catalog.path(name).map_err(|err| err.to_string())
+    }
+
     fn get(&self, name: &str) -> Result<Arc<Mutex<Engine>>, String> {
         let mut engines = self
             .engines
@@ -149,6 +154,27 @@ fn handle(
             );
         }
     };
+    if route == "/v1/ws" {
+        let name = query_param(query, "db")
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| "default".into());
+        let path = match databases.database_path(&name) {
+            Ok(path) => path,
+            Err(err) => {
+                return write_http(
+                    &mut stream,
+                    404,
+                    "application/json",
+                    &format!("{{\"error\":\"{err}\"}}"),
+                );
+            }
+        };
+        std::thread::spawn(move || {
+            let _ = ws::accept(stream, &req, &path);
+        });
+        return Ok(());
+    }
     if route == "/v1/replay" && req.method == "POST" {
         let mut guard = match engine.lock() {
             Ok(guard) => guard,

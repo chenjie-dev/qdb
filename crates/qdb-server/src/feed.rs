@@ -359,6 +359,7 @@ pub struct HttpRequest {
     pub method: String,
     pub path: String,
     pub body: Vec<u8>,
+    pub headers: HashMap<String, String>,
 }
 
 pub fn read_request(stream: &mut TcpStream) -> std::io::Result<HttpRequest> {
@@ -390,7 +391,12 @@ pub fn read_request(stream: &mut TcpStream) -> std::io::Result<HttpRequest> {
             let mut parts = request_line.split_whitespace();
             let method = parts.next().unwrap_or("GET").to_string();
             let path = parts.next().unwrap_or("/").to_string();
-            return Ok(HttpRequest { method, path, body });
+            return Ok(HttpRequest {
+                method,
+                path,
+                body,
+                headers: header_map(&header),
+            });
         }
         if buf.len() > 2_000_000 {
             break;
@@ -404,6 +410,17 @@ pub fn read_request(stream: &mut TcpStream) -> std::io::Result<HttpRequest> {
 
 fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+fn header_map(header: &str) -> HashMap<String, String> {
+    let mut headers = HashMap::new();
+    for line in header.lines().skip(1) {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
+    }
+    headers
 }
 
 fn content_length(header: &str) -> usize {

@@ -24,7 +24,7 @@ QDB 是单机优先的结构化内存数据库。同一台机器上，唯一写�
 - 在引擎里命名或实现某种业务。业务用表和列表达，库不解释列的含义
 - 把共享内存当跨机器传输
 - 同一主键多个写入者
-- 第一版实现 Raft、WebSocket、gRPC、完整 PostgreSQL 协议、跨表连接
+- 第一版实现 Raft、gRPC、完整 PostgreSQL 协议、跨表连接
 
 ### 1.1 底层能力
 
@@ -603,7 +603,7 @@ from_seq      希望收到的下一条 seq。0 表示从当前快照开始
 | --- | --- | --- |
 | 共享内存 | 第一版 | 读者自己维护 `cursor`，按 3.4 读帧 |
 | TCP 长度前缀帧 | 第一版 | 网关过滤后推送，payload 与共享内存帧相同 |
-| WebSocket 二进制 | 后续 | 同一套帧，不另定义业务字段 |
+| WebSocket 文本 | 已实现 | `GET /v1/ws`。客户端发一条 `SELECT`。服务端先推当前结果，再推新落盘且匹配的行。正文是 JSON，列与 `SELECT` 相同。慢连接只断开自己，不挡住写入 |
 | gRPC server stream | 后续 | 同一套字段的 protobuf 映射 |
 
 TCP 帧：
@@ -998,7 +998,7 @@ qdb-pgwire  后续。简单查询线协议
 - 断开后用 `from_seq` 补齐
 - 落后过多时先 `SnapshotEnd`，再只有更大的 `seq`
 
-M1 到 M5 构成最低可用版本。之后才是 PostgreSQL 简单查询、WebSocket、gRPC、历史导入、账号级别权限、审计文件和 D1 复制。
+M1 到 M5 构成最低可用版本。WebSocket 文本推送已接在同一套 `SELECT` 上。之后才是 PostgreSQL 简单查询、gRPC、历史导入、账号级别权限、审计文件和 D1 复制。
 
 ## 14. 决策
 
@@ -1036,7 +1036,7 @@ M1 到 M5 构成最低可用版本。之后才是 PostgreSQL 简单查询、WebS
 | `MAX/MIN/SUM/AVG/FIRST/LAST` | 第 5.2 节 | 是 |
 | PostgreSQL 线协议 | 第 5.3 节 | 否，只留模块边界 |
 | 条件订阅、有序、断点、快照加增量 | 第 6 节 | 是，TCP 与共享内存 |
-| WebSocket 与 gRPC | 第 6.2 节 | 否 |
+| WebSocket 文本推送 | 第 6.2 节 | 是。gRPC 仍否 |
 | Tick 转多周期 K 线、未闭合更新、闭合不覆盖、幂等 | 第 7 节 | 是 |
 | 原子序号、版本校验、内存屏障、乱序检测 | 第 8 节 | 是 |
 | WAL、快照、启动恢复 | 第 9 节 | 是 |
