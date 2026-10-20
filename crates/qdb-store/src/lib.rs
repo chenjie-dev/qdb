@@ -1073,11 +1073,37 @@ fn io<E: std::fmt::Display>(err: E) -> StoreError {
     StoreError::Io(err.to_string())
 }
 
+impl Engine {
+    /// 把未落盘的记录写完，卸下共享内存，并清掉行情表。WAL 文件保留。
+    pub fn release(&mut self) {
+        let _ = self.flush_pending();
+        let _ = self.checkpoint();
+        self.ticks.clear();
+        self.ticks.shrink_to_fit();
+        self.quotes.clear();
+        self.quotes.shrink_to_fit();
+        self.symbols.clear();
+        self.symbols.shrink_to_fit();
+        self.by_key.clear();
+        self.by_key.shrink_to_fit();
+        self.exchanges.clear();
+        self.exchanges.shrink_to_fit();
+        self.frames.clear();
+        self.frames.shrink_to_fit();
+        self.pending.clear();
+        self.pending.shrink_to_fit();
+        self.tables = table::TableSet::default();
+        self.agg = KlineAggregator::new();
+        self.shm = None;
+    }
+}
+
 impl Drop for Engine {
     fn drop(&mut self) {
         if self.wal.is_some() {
             let _ = self.flush_pending();
         }
+        self.shm = None;
     }
 }
 

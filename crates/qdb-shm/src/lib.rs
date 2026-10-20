@@ -415,6 +415,25 @@ impl Drop for InstanceLock {
     }
 }
 
+static SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn on_shutdown(_: i32) {
+    SHUTDOWN.store(true, Ordering::Release);
+}
+
+/// 监听 SIGINT 和 SIGTERM。处理函数只改一个原子标记。
+pub fn watch_shutdown() {
+    let handler = on_shutdown as *const () as libc::sighandler_t;
+    unsafe {
+        libc::signal(libc::SIGINT, handler);
+        libc::signal(libc::SIGTERM, handler);
+    }
+}
+
+pub fn shutdown_requested() -> bool {
+    SHUTDOWN.load(Ordering::Acquire)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

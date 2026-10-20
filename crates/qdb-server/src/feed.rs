@@ -32,25 +32,32 @@ pub struct LiveQuote {
     pub seq: u64,
 }
 
-pub fn spawn(engine: Arc<Mutex<Engine>>, live: Arc<Mutex<HashMap<String, LiveQuote>>>) {
+pub fn spawn(
+    engine: Arc<Mutex<Engine>>,
+    live: Arc<Mutex<HashMap<String, LiveQuote>>>,
+) -> Option<thread::JoinHandle<()>> {
     if std::env::var("QDB_FEED").ok().as_deref() == Some("0") {
         eprintln!("qdb feed disabled");
-        return;
+        return None;
     }
     let codes = std::env::var("QDB_FEED_CODES").unwrap_or_else(|_| default_codes());
     let interval_ms: u64 = std::env::var("QDB_FEED_MS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(1000);
-    thread::spawn(move || {
+    Some(thread::spawn(move || {
         let mut last_vol: HashMap<String, i64> = HashMap::new();
-        loop {
+        while !qdb_shm::shutdown_requested() {
             if let Err(err) = pull_once(&codes, &engine, &live, &mut last_vol) {
                 eprintln!("qdb feed: {err}");
             }
-            thread::sleep(Duration::from_millis(interval_ms));
+            let mut waited = 0;
+            while waited < interval_ms && !qdb_shm::shutdown_requested() {
+                thread::sleep(Duration::from_millis(50.min(interval_ms - waited)));
+                waited += 50;
+            }
         }
-    });
+    }))
 }
 
 fn default_codes() -> String {

@@ -1,10 +1,12 @@
 mod feed;
 
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread::JoinHandle;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use qdb_shm::InstanceLock;
 use qdb_store::{replay_bytes, Catalog, Engine, Metrics};
@@ -43,6 +45,7 @@ impl Databases {
 }
 
 fn main() {
+    qdb_shm::watch_shutdown();
     let lock_path =
         std::env::var("QDB_INSTANCE_LOCK").unwrap_or_else(|_| "/tmp/qdb.instance.lock".into());
     let _instance = match InstanceLock::try_acquire(std::path::Path::new(&lock_path)) {
@@ -62,25 +65,66 @@ fn main() {
     let metrics = engine.lock().expect("default database").metrics();
     let live: Arc<Mutex<HashMap<String, LiveQuote>>> = Arc::new(Mutex::new(HashMap::new()));
     let docs: Arc<Mutex<HashMap<String, Value>>> = Arc::new(Mutex::new(HashMap::new()));
-    feed::spawn(engine, live.clone());
+    let feed = feed::spawn(engine, live.clone());
     let addr = std::env::var("QDB_HTTP_ADDR").unwrap_or_else(|_| "127.0.0.1".into());
     let port: u16 = std::env::var("QDB_HTTP_PORT")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(9090);
     let listener = TcpListener::bind((addr.as_str(), port)).expect("bind health port");
+    listener.set_nonblocking(true).expect("nonblocking");
     eprintln!("qdb listening on {addr}:{port}");
-    for conn in listener.incoming() {
-        if let Ok(stream) = conn {
-            let _ = handle(
-                stream,
-                metrics.clone(),
-                &databases,
-                live.clone(),
-                docs.clone(),
-            );
+    loop {
+        if qdb_shm::shutdown_requested() {
+            break;
+        }
+        match listener.accept() {
+            Ok((stream, _)) => {
+                let _ = stream.set_nonblocking(false);
+                let _ = handle(
+                    stream,
+                    metrics.clone(),
+                    &databases,
+                    live.clone(),
+                    docs.clone(),
+                );
+            }
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(_) => break,
         }
     }
+    release_memory(feed, &databases, &live, &docs);
+}
+
+fn release_memory(
+    feed: Option<JoinHandle<()>>,
+    databases: &Databases,
+    live: &Mutex<HashMap<String, LiveQuote>>,
+    docs: &Mutex<HashMap<String, Value>>,
+) {
+    if let Some(feed) = feed {
+        let _ = feed.join();
+    }
+    if let Ok(mut engines) = databases.engines.lock() {
+        for engine in engines.values() {
+            if let Ok(mut guard) = engine.lock() {
+                guard.release();
+            }
+        }
+        engines.clear();
+        engines.shrink_to_fit();
+    }
+    if let Ok(mut live) = live.lock() {
+        live.clear();
+        live.shrink_to_fit();
+    }
+    if let Ok(mut docs) = docs.lock() {
+        docs.clear();
+        docs.shrink_to_fit();
+    }
+    eprintln!("qdb 已释放内存并退出");
 }
 
 fn handle(

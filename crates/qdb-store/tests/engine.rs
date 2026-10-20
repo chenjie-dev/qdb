@@ -181,6 +181,23 @@ fn quote_keeps_five_levels_and_changes_start_from_the_snapshot() {
 }
 
 #[test]
+fn release_clears_memory_and_reopen_reads_the_wal() {
+    let dir = temp("rel");
+    let mut engine = Engine::open(&dir).unwrap();
+    engine
+        .write_trade("SSE", "600000", utc(3, 0, 0), 18, 2)
+        .unwrap();
+    engine.release();
+    assert!(engine.symbols().is_empty());
+    assert!(engine.resolve("SSE:600000").is_err());
+    drop(engine);
+    let restored = Engine::open(&dir).unwrap();
+    let id = restored.resolve("SSE:600000").unwrap();
+    assert_eq!(restored.ticks(id)[0].price, 18);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn checkpoint_survives_a_corrupt_wal_prefix() {
     let dir = temp("ck");
     let mut engine = Engine::open(&dir).unwrap();

@@ -18,6 +18,8 @@ QDB_HTTP_PORT=19090 cargo run -p qdb-server --bin qdb -- /var/lib/qdb
 
 标准错误输出一行：`qdb listening on 127.0.0.1:9090`。
 
+收到 SIGINT 或 SIGTERM 后，进程先停止采集，把未落盘的记录写完，卸下共享内存，清掉成交、报价、K 线和订阅缓存，然后退出。WAL 文件保留，下次启动可以恢复。
+
 进程持有打开后的 `Engine`，直到退出。退出不截断 WAL。
 
 ## HTTP
