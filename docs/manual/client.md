@@ -79,7 +79,17 @@ qdb> SELECT ts, open, high, low, close, volume FROM klines WHERE symbol = 'SSE:6
 
 ## 订阅
 
-`.watch` 先打印当前一行，再持续打印新变更。`Ctrl-C` 结束。`.sub` 和 `SUBSCRIBE` 是同一条命令。
+`.watch` 先打印当前一行，再持续打印新变更。`Ctrl-C` 结束。`.sub` 和单独的 `SUBSCRIBE` 命令是同一条命令。
+
+`SELECT` 末尾加上 `SUBSCRIBE` 时，按查询的列来订阅。先打印当前结果表，之后每一行新数据是用制表符隔开的列值，列顺序与第一屏相同。
+
+```text
+qdb> SELECT last, bid_px1, ask_px1, seq FROM snapshots WHERE symbol = 'SSE:600000' SUBSCRIBE
+qdb> SELECT ts, price, volume, seq FROM ticks WHERE symbol = 'SSE:600000' SUBSCRIBE
+qdb> SELECT ts, open, high, low, close, volume FROM klines WHERE symbol = 'SSE:600000' AND period = '1m' SUBSCRIBE
+```
+
+`LIMIT` 只限制第一屏。之后新写入的匹配行都会打印。证券还不存在时先打印 `waiting`，等第一笔匹配记录再打印结果表。大约每 50 毫秒看一次已经 `fsync` 的 WAL。
 
 ```text
 qdb> .watch SSE:600000

@@ -39,7 +39,10 @@ FROM table_name
 [WHERE predicate [AND predicate ...]]
 [ORDER BY column]
 [LIMIT n]
+[SUBSCRIBE]
 ```
+
+`SUBSCRIBE` 只在客户端生效。它先执行去掉该关键字后的 `SELECT`，再持续打印匹配的新行。库接口里的 `SqlEngine::query` 遇到这个关键字会返回语法错误；跟随用 `split_subscribe` 和 `live_rows`。
 
 `select_list` 是 `*`，或逗号分隔的列名，或聚合 `func(column)`。
 

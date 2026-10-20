@@ -94,13 +94,18 @@ impl<'a> SqlEngine<'a> {
     ///
     /// # Errors
     ///
-    /// * [`SqlError::Syntax`] - 语句无法解析，或 `CREATE`/`INSERT` 走到了这里。
+    /// * [`SqlError::Syntax`] - 语句无法解析，末尾带有 `SUBSCRIBE`，或 `CREATE`/`INSERT` 走到了这里。
     /// * [`SqlError::NotFound`] - `symbol` 不存在。
     /// * [`SqlError::Ambiguous`] - 裸代码对应多只证券。
     /// * [`SqlError::Limit`] - `LIMIT` 大于 100000。
     /// * [`SqlError::Store`] - 用户表不存在，或过滤类型不对。
     pub fn query(&self, sql: &str) -> Result<QueryResult, SqlError> {
         let sql = sql.trim().trim_end_matches(';').trim();
+        if split_subscribe(sql)?.is_some() {
+            return Err(SqlError::Syntax(
+                "SUBSCRIBE follows in the client; use split_subscribe".into(),
+            ));
+        }
         let tokens = tokenize(sql);
         if tokens
             .first()
@@ -118,19 +123,277 @@ impl<'a> SqlEngine<'a> {
             return self.query_user_describe(&tokens);
         }
         let stmt = parse(sql)?;
+        self.execute_stmt(&stmt)
+    }
+
+    fn execute_stmt(&self, stmt: &Stmt) -> Result<QueryResult, SqlError> {
         if stmt.limit > 100_000 {
             return Err(SqlError::Limit(stmt.limit));
         }
         match stmt.table.as_str() {
-            "klines" => self.query_klines(&stmt),
-            "snapshots" => self.query_snapshots(&stmt),
-            "symbols" => self.query_symbols(&stmt),
-            "ticks" => self.query_ticks(&stmt),
-            other => self.query_user(other, &stmt),
+            "klines" => self.query_klines(stmt),
+            "snapshots" => self.query_snapshots(stmt),
+            "symbols" => self.query_symbols(stmt),
+            "ticks" => self.query_ticks(stmt),
+            other => self.query_user(other, stmt),
         }
     }
 }
 
+/// 若 `SELECT` 以 `SUBSCRIBE` 结尾，返回去掉该关键字后的语句。
+///
+/// 关键字不区分大小写，必须是最后一个词。这是客户端的订阅读取，不是网络推送。
+///
+/// # Arguments
+///
+/// * `sql` - 一条语句。末尾分号会被去掉。
+///
+/// # Returns
+///
+/// 没有 `SUBSCRIBE` 时返回 `None`。有则返回剩余的 `SELECT` 文本。
+///
+/// # Errors
+///
+/// [`SqlError::Syntax`] - 末尾是 `SUBSCRIBE`，但语句不是 `SELECT`。
+pub fn split_subscribe(sql: &str) -> Result<Option<String>, SqlError> {
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    let Some(pos) = trimmed.rfind(char::is_whitespace) else {
+        return Ok(None);
+    };
+    let word = trimmed[pos..].trim();
+    if !word.eq_ignore_ascii_case("subscribe") {
+        return Ok(None);
+    }
+    let head = trimmed[..pos].trim();
+    if !head
+        .split_whitespace()
+        .next()
+        .is_some_and(|token| token.eq_ignore_ascii_case("select"))
+    {
+        return Err(SqlError::Syntax("subscribe requires select".into()));
+    }
+    Ok(Some(head.to_string()))
+}
+
+/// 把新变更投影成与这条 `SELECT` 相同的列。
+///
+/// 成交、报价和 K 线按 `changes` 逐条投影，同一价格的新成交也会返回。`symbols`、用户表和聚合不看单条变更的列，而是重算后返回 `seen` 里没有的行。`LIMIT` 不截断这里的增量。
+///
+/// # Arguments
+///
+/// * `engine` - 已经 `poll` 过这些变更的引擎。
+/// * `sql` - 不含 `SUBSCRIBE` 的 `SELECT`。
+/// * `changes` - [`Engine::poll`] 刚返回的变更。
+/// * `seen` - 已经打印过的行。只用于 `symbols`、用户表和聚合。
+///
+/// # Returns
+///
+/// 这一批要追加打印的行，列顺序与 [`SqlEngine::query`] 一致。
+///
+/// # Errors
+///
+/// 与 [`SqlEngine::query`] 相同。过滤不成匹配时返回空向量，而不是 `NotFound`。
+pub fn live_rows(
+    engine: &Engine,
+    sql: &str,
+    changes: &[qdb_store::Change],
+    seen: &[Vec<String>],
+) -> Result<Vec<Vec<String>>, SqlError> {
+    let stmt = parse(sql)?;
+    if !stmt.aggregates.is_empty() || stmt.table == "symbols" || !builtin_table(&stmt.table) {
+        let mut wide = stmt.clone();
+        wide.limit = 100_000;
+        let rows = SqlEngine::new(engine).execute_stmt(&wide)?.rows;
+        return Ok(rows
+            .into_iter()
+            .filter(|row| !seen.iter().any(|old| old == row))
+            .collect());
+    }
+    let mut out = Vec::new();
+    for change in changes {
+        if !change_matches(engine, &stmt, change) {
+            continue;
+        }
+        for row in project_change(engine, &stmt, change) {
+            if stmt.table == "snapshots" && out.last() == Some(&row) {
+                continue;
+            }
+            out.push(row);
+        }
+    }
+    Ok(out)
+}
+
+/// 这条 `SELECT` 当前能返回的行，最多 100000 行。
+///
+/// 订阅读取用它记住已经看见的 `symbols`、用户表和聚合，避免 `LIMIT` 把旧行再打印一遍。
+///
+/// # Arguments
+///
+/// * `engine` - 只读或可写引擎。本函数不写 WAL。
+/// * `sql` - 不含 `SUBSCRIBE` 的 `SELECT`。
+///
+/// # Errors
+///
+/// 与 [`SqlEngine::query`] 相同。
+pub fn captured_rows(engine: &Engine, sql: &str) -> Result<Vec<Vec<String>>, SqlError> {
+    let mut stmt = parse(sql)?;
+    stmt.limit = 100_000;
+    Ok(SqlEngine::new(engine).execute_stmt(&stmt)?.rows)
+}
+
+fn builtin_table(table: &str) -> bool {
+    matches!(table, "symbols" | "ticks" | "snapshots" | "klines")
+}
+
+fn change_matches(engine: &Engine, stmt: &Stmt, change: &qdb_store::Change) -> bool {
+    if change.table != stmt.table {
+        return false;
+    }
+    if let Some(symbol) = &stmt.symbol {
+        if !symbol_matches(engine, symbol, &change.symbol) {
+            return false;
+        }
+    }
+    if stmt.table == "klines" {
+        let Some(period) = stmt.period else {
+            return false;
+        };
+        if change.period != period.as_str() {
+            return false;
+        }
+    }
+    if stmt.ts_from.is_some_and(|from| change.ts < from)
+        || stmt.ts_to.is_some_and(|to| change.ts > to)
+    {
+        return false;
+    }
+    true
+}
+
+fn symbol_matches(engine: &Engine, filter: &str, change_symbol: &str) -> bool {
+    if filter.eq_ignore_ascii_case(change_symbol) {
+        return true;
+    }
+    match (engine.resolve(filter), engine.resolve(change_symbol)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn project_change(engine: &Engine, stmt: &Stmt, change: &qdb_store::Change) -> Vec<Vec<String>> {
+    match stmt.table.as_str() {
+        "ticks" => vec![tick_live_row(stmt, change)],
+        "snapshots" => snapshot_live_row(engine, stmt, change)
+            .into_iter()
+            .collect(),
+        "klines" => kline_live_rows(engine, stmt, change),
+        _ => Vec::new(),
+    }
+}
+
+fn tick_live_row(stmt: &Stmt, change: &qdb_store::Change) -> Vec<String> {
+    if stmt.symbol.is_none() {
+        vec![
+            change.symbol.clone(),
+            change.ts.to_string(),
+            change.price.to_string(),
+            change.volume.to_string(),
+            change.seq.to_string(),
+        ]
+    } else {
+        vec![
+            change.ts.to_string(),
+            change.price.to_string(),
+            change.volume.to_string(),
+            change.seq.to_string(),
+        ]
+    }
+}
+
+fn snapshot_live_row(
+    engine: &Engine,
+    stmt: &Stmt,
+    change: &qdb_store::Change,
+) -> Option<Vec<String>> {
+    let symbol_id = engine.resolve(&change.symbol).ok()?;
+    let quote = engine.quote(symbol_id)?;
+    let columns: Vec<String> = if stmt.columns == ["*"] {
+        vec![
+            "last".into(),
+            "bid_px1".into(),
+            "ask_px1".into(),
+            "seq".into(),
+        ]
+    } else {
+        stmt.columns.clone()
+    };
+    Some(
+        columns
+            .iter()
+            .map(|col| match col.as_str() {
+                "last" => quote.last.to_string(),
+                "bid_px1" => quote.bid_px[0].to_string(),
+                "bid_px2" => quote.bid_px[1].to_string(),
+                "bid_px3" => quote.bid_px[2].to_string(),
+                "bid_px4" => quote.bid_px[3].to_string(),
+                "bid_px5" => quote.bid_px[4].to_string(),
+                "ask_px1" => quote.ask_px[0].to_string(),
+                "ask_px2" => quote.ask_px[1].to_string(),
+                "ask_px3" => quote.ask_px[2].to_string(),
+                "ask_px4" => quote.ask_px[3].to_string(),
+                "ask_px5" => quote.ask_px[4].to_string(),
+                "bid_qty1" => quote.bid_qty[0].to_string(),
+                "ask_qty1" => quote.ask_qty[0].to_string(),
+                "seq" => quote.seq.to_string(),
+                _ => String::new(),
+            })
+            .collect(),
+    )
+}
+
+fn kline_live_rows(engine: &Engine, stmt: &Stmt, change: &qdb_store::Change) -> Vec<Vec<String>> {
+    let Some(period) = stmt.period else {
+        return Vec::new();
+    };
+    let Ok(symbol_id) = engine.resolve(&change.symbol) else {
+        return Vec::new();
+    };
+    let bars = engine.klines(symbol_id, period);
+    let columns: Vec<String> = if stmt.columns == ["*"] {
+        vec![
+            "ts".into(),
+            "open".into(),
+            "high".into(),
+            "low".into(),
+            "close".into(),
+            "volume".into(),
+            "amount".into(),
+            "seq".into(),
+        ]
+    } else {
+        stmt.columns.clone()
+    };
+    let project = |bar: &qdb_abi::KlineBody| -> Vec<String> {
+        columns
+            .iter()
+            .map(|column| kline_value(bar, column))
+            .collect()
+    };
+    let mut rows = Vec::new();
+    if let Some(bar) = bars.iter().find(|row| row.bucket_start_ns == change.ts) {
+        rows.push(project(bar));
+    }
+    // 跨桶时这一条变更只带上被闭合的桶。同一笔成交新开的桶也要打印。
+    if let Some(open) = bars.last() {
+        if open.bucket_start_ns != change.ts {
+            rows.push(project(open));
+        }
+    }
+    rows
+}
+
+#[derive(Clone)]
 struct Stmt {
     columns: Vec<String>,
     aggregates: Vec<Agg>,
@@ -144,6 +407,7 @@ struct Stmt {
     limit: u64,
 }
 
+#[derive(Clone)]
 struct Agg {
     func: String,
     column: String,
@@ -1013,5 +1277,62 @@ mod tests {
         assert_eq!(described.rows[0][0], "ts");
         assert_eq!(described.rows.len(), 8);
         assert!(sql.query("DESC nope").is_err());
+    }
+
+    #[test]
+    fn subscribe_projects_only_the_matching_new_rows() {
+        let (dir, mut writer) = engine();
+        let sql = "SELECT last, seq FROM snapshots WHERE symbol = 'SZSE:000001'";
+        assert_eq!(
+            split_subscribe(&format!("{sql} SUBSCRIBE;"))
+                .unwrap()
+                .as_deref(),
+            Some(sql)
+        );
+        assert!(split_subscribe("SHOW TABLES SUBSCRIBE").is_err());
+        assert!(SqlEngine::new(&writer)
+            .query(&format!("{sql} SUBSCRIBE"))
+            .is_err());
+        let mut reader = Engine::open_read(&dir).unwrap();
+        let seen = captured_rows(&reader, sql).unwrap();
+        writer
+            .write_trade("SSE", "000001", ts(2_000_000_000), 99, 1)
+            .unwrap();
+        writer
+            .write_trade("SZSE", "000001", ts(2_000_000_000), 20, 3)
+            .unwrap();
+        let changes = reader.poll().unwrap();
+        let snap = live_rows(&reader, sql, &changes, &seen).unwrap();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0][0], "20");
+        let ticks = live_rows(
+            &reader,
+            "SELECT * FROM ticks WHERE symbol = 'SZSE:000001'",
+            &changes,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(ticks.len(), 1);
+        assert_eq!(ticks[0][1], "20");
+        assert_eq!(ticks[0][2], "3");
+        let bars = live_rows(
+            &reader,
+            "SELECT close FROM klines WHERE symbol = 'SZSE:000001' AND period = '1m'",
+            &changes,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(bars.len(), 1);
+        assert_eq!(bars[0][0], "20");
+        let other = live_rows(
+            &reader,
+            "SELECT close FROM klines WHERE symbol = 'SZSE:000001' AND period = '1s'",
+            &changes,
+            &[],
+        )
+        .unwrap();
+        assert!(other.iter().any(|row| row[0] == "20"));
+        assert!(other.iter().all(|row| row[0] != "99"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

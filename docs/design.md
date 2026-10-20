@@ -508,6 +508,14 @@ ERR <code> <message>\n
 
 `.watch` 先打印该表的当前行，再从上次读到的位置跟随新 `fsync` 的记录。`snapshots` 看最新价、买一和卖一，`ticks` 看逐笔，`klines` 还要给周期。这是本机轮询，不是网络推送。
 
+`SELECT` 末尾的 `SUBSCRIBE` 把这条查询变成订阅读取。客户端先按这条 `SELECT` 打印当前结果，再跟随新 `fsync` 的记录，把匹配的新行按同一列顺序打印。`LIMIT` 只约束第一屏。聚合在匹配变更到达后重算，值变了才再打印一行。`Ctrl-C` 结束。没有网络推送。
+
+```sql
+SELECT last, bid_px1, ask_px1, seq
+FROM snapshots
+WHERE symbol = 'SSE:600000' SUBSCRIBE
+```
+
 除第 5 节的 `SELECT` 外，客户端接受：
 
 ```text

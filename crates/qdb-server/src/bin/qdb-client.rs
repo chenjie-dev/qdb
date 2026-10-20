@@ -285,6 +285,9 @@ fn complete_line(line: &str, pos: usize, words: &CompletionWords) -> (usize, Vec
         _ if before.len() >= 2 && before[before.len() - 2] == "PERIOD" && last == Some("=") => {
             quote_values(&words.periods)
         }
+        _ if before.first().is_some_and(|word| word == "SELECT") => {
+            vec!["SUBSCRIBE".into()]
+        }
         _ => Vec::new(),
     };
     let typed = current.trim_start_matches('\'').to_ascii_lowercase();
@@ -370,6 +373,14 @@ fn finish(session: &mut Session, line: &str) -> ExitCode {
             return ExitCode::from(1);
         }
         None => {}
+    }
+    match qdb_sql::split_subscribe(line) {
+        Ok(Some(sql)) => return follow_select(session, &sql),
+        Ok(None) => {}
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::from(1);
+        }
     }
     match execute(session, line) {
         Ok(text) => {
@@ -650,6 +661,74 @@ fn parse_watch(line: &str) -> Option<Result<Watch, String>> {
     Some(Ok(watch))
 }
 
+fn follow_select(session: &Session, sql: &str) -> ExitCode {
+    let mut engine = match session
+        .path()
+        .and_then(|path| Engine::open_read(&path).map_err(|err| err.to_string()))
+    {
+        Ok(engine) => engine,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut seen = Vec::new();
+    let mut primed = false;
+    match SqlEngine::new(&engine).query(sql) {
+        Ok(result) => {
+            print!("{}", format_result(&result));
+            seen = qdb_sql::captured_rows(&engine, sql).unwrap_or(result.rows);
+            primed = true;
+        }
+        Err(err) if err.to_string().contains("symbol not found") => {
+            println!("waiting");
+        }
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::from(1);
+        }
+    }
+    let _ = io::stdout().flush();
+    loop {
+        let before = engine.applied_seq();
+        let changes = match engine.poll() {
+            Ok(changes) => changes,
+            Err(err) => {
+                eprintln!("{err}");
+                return ExitCode::from(1);
+            }
+        };
+        if changes.is_empty() && engine.applied_seq() == before {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            continue;
+        }
+        if !primed {
+            if let Ok(result) = SqlEngine::new(&engine).query(sql) {
+                print!("{}", format_result(&result));
+                seen = qdb_sql::captured_rows(&engine, sql).unwrap_or(result.rows);
+                primed = true;
+                let _ = io::stdout().flush();
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            continue;
+        }
+        match qdb_sql::live_rows(&engine, sql, &changes, &seen) {
+            Ok(rows) => {
+                for row in rows {
+                    println!("{}", row.join("\t"));
+                    seen.push(row);
+                }
+                let _ = io::stdout().flush();
+            }
+            Err(err) => {
+                eprintln!("{err}");
+                return ExitCode::from(1);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 fn follow(session: &Session, watch: &Watch) -> ExitCode {
     let mut engine = match session
         .path()
@@ -767,6 +846,7 @@ qdb-client [数据目录] [-c 语句]
   SHOW TABLES
   DESCRIBE 表名
   SELECT ...
+  SELECT ... SUBSCRIBE   先打印当前结果，再持续打印匹配的新行
   .dump 文件
   .restore 文件
   .replay 文件
@@ -780,7 +860,7 @@ qdb-client [数据目录] [-c 语句]
   .help
   .quit
 
-.watch 先打印当前行，再持续打印变更。Ctrl-C 结束。
+.watch 先打印当前行，再持续打印变更。SELECT ... SUBSCRIBE 按查询列做同样的事。Ctrl-C 结束。
 交互时按 Tab 补全。
 "
     .to_string()
@@ -879,6 +959,8 @@ mod tests {
         assert_eq!(&"SELECT * FROM klines WHERE symbol = 'SS"[start..], "'SS");
         let (_, periods) = complete_line(".watch klines SSE:600000 ", 25, &words);
         assert_eq!(periods, vec!["1m".to_string(), "1d".to_string()]);
+        let (_, subscribe) = complete_line("SELECT * FROM ticks ", 20, &words);
+        assert_eq!(subscribe, vec!["SUBSCRIBE".to_string()]);
     }
 
     #[test]
@@ -887,6 +969,7 @@ mod tests {
         let mut session = Session::new(dir.clone());
         let help = catalog_command(&mut session, "help").unwrap().unwrap();
         assert!(help.contains("SHOW TABLES"));
+        assert!(help.contains("SUBSCRIBE"));
         assert!(help.contains("ll"));
         let listed = catalog_command(&mut session, "ll").unwrap().unwrap();
         assert!(listed.contains("default"));
