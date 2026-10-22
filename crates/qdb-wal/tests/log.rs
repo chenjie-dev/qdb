@@ -1,4 +1,4 @@
-use qdb_wal::{read_path, WalAppender, WalRecord};
+use qdb_wal::{read_path, read_span, WalAppender, WalRecord};
 
 #[test]
 fn missing_file_is_an_empty_log() {
@@ -57,6 +57,13 @@ fn a_short_tail_is_not_reported_as_crc_damage() {
     assert!(!read.crc_failed);
     assert_eq!(read.records.len(), 1);
     assert_eq!(read.last_good_seq, 1);
+    let full = std::fs::metadata(&path).unwrap().len();
+    let span = read_span(&path, 0, full.saturating_sub(4)).unwrap();
+    assert_eq!(span.records.len(), 1);
+    assert!(!span.crc_failed);
+    let empty = read_span(&path, full, full).unwrap();
+    assert!(empty.records.is_empty());
+    assert!(read_span(&path, full + 1, full + 1).is_err());
     let _ = std::fs::remove_dir_all(dir);
 }
 

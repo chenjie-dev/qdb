@@ -312,8 +312,11 @@ mod tests {
     fn slots_match_redis_and_hash_tags_stay_together() {
         assert_eq!(slot_of("foo"), 12182);
         assert_eq!(slot_of("bar"), 5061);
+        assert_eq!(slot_of(""), 0);
         assert_eq!(slot_of("{user}.a"), slot_of("{user}.b"));
         assert_ne!(slot_of("a"), slot_of("b"));
+        assert_ne!(slot_of("{}foo"), slot_of("foo"));
+        assert!(slot_of("foo") < SLOT_COUNT);
     }
 
     #[test]

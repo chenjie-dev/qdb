@@ -71,6 +71,28 @@ fn rejects_missing_filters_unknown_tables_and_oversized_limits() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[test]
+fn order_and_group_keep_storage_order_and_kline_seq_is_zero() {
+    let (dir, engine) = sample();
+    let sql = SqlEngine::new(&engine);
+    let ordered = sql
+        .query("SELECT price FROM ticks WHERE symbol = 'SZSE:000001' ORDER BY price DESC")
+        .unwrap();
+    assert_eq!(
+        ordered.rows.iter().map(|row| row[0].as_str()).collect::<Vec<_>>(),
+        vec!["10", "11"]
+    );
+    let grouped = sql
+        .query("SELECT price FROM ticks WHERE symbol = 'SZSE:000001' GROUP BY price")
+        .unwrap();
+    assert_eq!(grouped.rows.len(), 2);
+    let seq = sql
+        .query("SELECT seq FROM klines WHERE symbol = 'SZSE:000001' AND period = '1s'")
+        .unwrap();
+    assert!(seq.rows.iter().all(|row| row[0] == "0"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 fn sample() -> (std::path::PathBuf, Engine) {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT: AtomicU64 = AtomicU64::new(0);

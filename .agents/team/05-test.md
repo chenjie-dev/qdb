@@ -23,8 +23,9 @@
    - M3：删掉共享内存文件后，从状态快照和 WAL 恢复；坏 CRC 停在坏记录前
    - M4：`SZSE:000001` 的 K 线查询；歧义代码被拒绝
    - M5：按代码和周期过滤；`from_seq` 补齐；落后时先快照
-3. 有 crate 后运行相关的 `cargo test -p <crate>`。还没有目标 crate 时，报告写明阻塞，不把口头描述当成通过。
-4. 失败时给出最小复现，交回 Engine 或 Query。不在测试里改业务结果来让它变绿。
+3. 运行 `cargo test --workspace -- --test-threads=1`。相关 crate 可以先跑 `cargo test -p <crate> -- --test-threads=1`，不能代替整库。还没有目标 crate 时，报告写明阻塞，不把口头描述当成通过。
+4. 已实现的复制、槽位、可见性、切换时限和组提交性能，按 skill `qdb-test` 的表逐条指出测试名。性能用表里的倍数和时限，不记录某台机器的 `ops/sec`。
+5. 失败时给出最小复现，交回 Engine 或 Query。不在测试里改业务结果来让它变绿。
 
 ## 产出
 

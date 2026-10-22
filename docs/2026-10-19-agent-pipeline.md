@@ -26,7 +26,7 @@ Planner ──► Architect ──► Engine + Query
 | 规划 | Planner | PRD、验收标准、任务清单 | 验收可测，且没有越过第一版不做的范围 |
 | 架构 | Architect | 相对 `docs/design.md` 的增量、crate 落点 | 布局或提交顺序有变化时，设计正文已改 |
 | 开发 | Engine、Query | 对应 crate 与测试 | 该里程碑的验收命令能跑 |
-| 测试 | Test | 测试报告 | 验收每条有证据；失败有复现命令 |
+| 测试 | Test | 测试报告 | `cargo test --workspace -- --test-threads=1` 通过；`qdb-test` 表里已实现的每行都有测试名 |
 | 评审 | Reviewer | Standards / Spec 两轴 | 阻断项清零，或经人确认豁免 |
 | 发布 | Ops | 发布说明 | 恢复演练和 `/health` 通过 |
 | 运维 | Ops | 指标、空窗、恢复步骤 | 已知故障写在发布说明里 |
