@@ -876,7 +876,13 @@ write_seq = applied_seq，但环形缓冲里不必塞入历史帧
 
 ## 11. 分布式
 
-第一版不实现本节，但 ABI 和 WAL 从第一天带上 `cluster_id`、`node_id`、`partition_id`、`leader_epoch`。分区、复制、切换和单机并行的展开见 [分布式、高可用与高并发](2026-10-19-distributed-ha.md)。若细节与本节冲突，以本节的单写、epoch、WAL 复制和 D0/D1/D2 为准。
+第一版的单机路径是本机 `fsync` 后发布，不等待副本。跨机器用 Redis 的主从复制，不用 Raft 传每一行，也不用 Raft 选主。
+
+副本只读。主节点连不上时，副本向 `QDB_SENTINEL` 里的其他副本询问。从第一次连不上开始算，超过 `QDB_FAILOVER_MS`（缺省 200 毫秒，`0` 关闭）才投票。连接最长等 100 毫秒，读应答最长等 200 毫秒，进程已经退出时不会空等整段超时。票数达到 `QDB_QUORUM`（缺省过半，含自己），并且本副本的偏移不小于已应答副本，才 `promote`。偏移相同则对外地址字典序最小的那台升主。升主后向其他副本和旧主发 `POST /v1/follow`，把它们的复制上游改成自己。对方看到更高的任期，或者任期相同但自己已经被 fence，就停写并改拉新主。
+
+`QDB_DURABILITY=d2` 时，本机 `fsync` 之后仍不把这批记录交给订阅者和共享内存，直到足够多的副本应答了不小于这批的偏移。需要的应答数是 `QDB_MIN_REPLICAS`；没设时按哨兵列表构成的多数派去掉主节点自己。没有其他副本时仍按 D1 马上发布。缺省是 D1。
+
+槽位把键分到不同主节点。同一个槽仍然只有一个写入者。槽位表不会在切换后自动改写。查询、订阅和复制不跟写入抢。共享内存只映射本机。
 
 ### 11.1 分区
 
@@ -890,15 +896,12 @@ write_seq = applied_seq，但环形缓冲里不必塞入历史帧
 
 ```mermaid
 flowchart TB
-  raft[控制面: 领导权与 epoch]
-  leader[分区 Leader]
-  follower[分区 Follower]
-  raft --> leader
-  raft --> follower
-  leader --> walL[本地 WAL]
-  walL --> shmL[本地共享内存]
-  walL --> walF[复制 WAL]
-  walF --> shmF[Follower 本地共享内存]
+  master[主节点]
+  replica[副本]
+  master --> walM[主 WAL]
+  walM --> shmM[主节点共享内存]
+  walM -->|复制 ID 和偏移| walR[副本 WAL]
+  walR --> shmR[副本共享内存]
 ```
 
 跟随者用和订阅相同的 `from_seq` 拉 WAL，用同一份聚合代码应用。确定性依赖第 7 节：闭合由 `ClockTick` 驱动，跳号由 `GapAck` 驱动。
@@ -915,8 +918,8 @@ flowchart TB
 | 级别 | 行为 | 阶段 |
 | --- | --- | --- |
 | D0 | 本机 `fsync` 后发布 | 第一版 |
-| D1 | 本机 `fsync` 后发布，异步复制到跟随者。允许有复制延迟 | 分布式第一实现 |
-| D2 | 多数派拿到记录后才对本机订阅者发布 | 需要更低 RPO 时 |
+| D1 | 本机 `fsync` 后发布，另一个节点异步拉取 WAL。允许有复制延迟 | 已实现 |
+| D2 | 多数派拿到记录后才对本机订阅者发布。`QDB_DURABILITY=d2`，没有副本时退回 D1 | 已实现，不是缺省 |
 
 行情默认将来使用 D1。D2 会把组提交延迟变成跨机延迟，不作为默认。
 

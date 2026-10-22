@@ -5,7 +5,8 @@
 #![forbid(unsafe_code)]
 
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File};
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -16,7 +17,7 @@ use qdb_abi::{
 };
 use qdb_agg::{BarEvent, KlineAggregator, TradeInput};
 use qdb_shm::{RegionConfig, ShmRegion};
-use qdb_wal::{read_from, read_path, WalAppender, WalRead, WalRecord};
+use qdb_wal::{parse_wal, read_span, replace_wal, WalAppender, WalRead, WalRecord};
 use thiserror::Error;
 
 mod catalog;
@@ -54,6 +55,8 @@ pub enum StoreError {
     Crc,
     #[error("gap in wal")]
     Gap,
+    #[error("stale epoch")]
+    StaleEpoch,
     #[error(transparent)]
     Agg(#[from] qdb_agg::AggError),
 }
@@ -179,6 +182,30 @@ pub struct Engine {
     flush_count: u64,
     /// 重放期间先只更新内部结构，结束时再整表重建。
     defer_rows: bool,
+    leader_epoch: u64,
+    /// 任期被更高的 epoch 取代，或本进程是副本时，不再分配新序号。复制进来的记录仍可应用。
+    fenced: bool,
+    repl_id: [u8; 16],
+    repl_id2: [u8; 16],
+    /// 换成新复制 ID 时，旧 ID 仍能接到这个偏移为止的历史。
+    offset2: u64,
+    /// 本机 `fsync` 之后，要等副本应答才把记录交给订阅者和共享内存。
+    wait_majority: bool,
+    /// `wal/visible.pos` 里订阅者可以读到的字节偏移。
+    visible_pos: u64,
+    /// 订阅者能看见的最大序号。还没发布的写入可以已经在内存里。
+    published_seq: u64,
+    /// 上次发布时的报价。最新报价可能还在等副本。
+    published_quotes: HashMap<u32, QuoteRow>,
+    /// 已落盘、还没发布的共享内存帧。
+    held: Vec<HeldPublish>,
+}
+
+struct HeldPublish {
+    offset: u64,
+    seq: u64,
+    frames: Vec<Frame>,
+    quotes: HashMap<u32, QuoteRow>,
 }
 
 impl Engine {
@@ -223,8 +250,8 @@ impl Engine {
         fs::create_dir_all(root.join("snap")).map_err(io)?;
         let wal_path = root.join("wal/wal-1.qwal");
         let wal = WalAppender::open(&wal_path).map_err(io)?;
-        let (loaded, checkpoint) = load_for_open(root, &wal_path)?;
-        let mut engine = Self::from_replay(root, Some(wal), &loaded, region, checkpoint)?;
+        let plan = load_for_open(root, &wal_path, false)?;
+        let mut engine = Self::from_replay(root, Some(wal), plan, region)?;
         engine.attach_shm()?;
         engine.sync_metrics();
         Ok(engine)
@@ -233,6 +260,7 @@ impl Engine {
     /// 只读打开库。
     ///
     /// 重放 WAL 或检查点加尾部记录。不创建目录，不追加日志，不删除 `region.bin`。
+    /// 存在 `wal/visible.pos` 时只重放到那个偏移，订阅者先看不见还没被多数副本确认的尾部。
     ///
     /// # Arguments
     ///
@@ -253,19 +281,19 @@ impl Engine {
             )));
         }
         let wal_path = root.join("wal/wal-1.qwal");
-        let (loaded, checkpoint) = load_for_open(root, &wal_path)?;
-        let engine = Self::from_replay(root, None, &loaded, &RegionConfig::dev(), checkpoint)?;
+        let plan = load_for_open(root, &wal_path, true)?;
+        let engine = Self::from_replay(root, None, plan, &RegionConfig::dev())?;
         Ok(engine)
     }
 
     fn from_replay(
         root: &Path,
         wal: Option<WalAppender>,
-        loaded: &WalRead,
+        plan: OpenPlan,
         region: &RegionConfig,
-        checkpoint: Option<checkpoint::Checkpoint>,
     ) -> Result<Self, StoreError> {
         let readonly = wal.is_none();
+        let loaded = &plan.loaded;
         let mut engine = Self {
             root: root.to_path_buf(),
             wal,
@@ -290,8 +318,18 @@ impl Engine {
             pending: Vec::new(),
             flush_count: 0,
             defer_rows: true,
+            leader_epoch: 1,
+            fenced: false,
+            repl_id: [0; 16],
+            repl_id2: [0; 16],
+            offset2: 0,
+            wait_majority: false,
+            visible_pos: 0,
+            published_seq: 0,
+            published_quotes: HashMap::new(),
+            held: Vec::new(),
         };
-        if let Some(checkpoint) = checkpoint {
+        if let Some(checkpoint) = plan.checkpoint {
             engine.install_checkpoint(checkpoint)?;
         }
         for record in &loaded.records {
@@ -299,11 +337,25 @@ impl Engine {
         }
         engine.defer_rows = false;
         engine.rebuild_business_rows();
-        if loaded.crc_failed {
+        engine.load_or_create_repl();
+        if loaded.crc_failed || plan.tail_crc {
             engine.crc_failed = true;
             engine.metrics.crc_failed.store(true, Ordering::Release);
         }
-        engine.wal_pos = loaded.consumed;
+        if plan.gated {
+            engine.wait_majority = true;
+            engine.visible_pos = plan.visible_pos;
+            engine.published_seq = engine.applied_seq();
+            engine.published_quotes = engine.quotes.clone();
+        }
+        for record in &plan.tail {
+            engine.apply_record(record)?;
+        }
+        engine.wal_pos = if plan.gated {
+            plan.durable_end
+        } else {
+            loaded.consumed
+        };
         engine.next_seq = engine.agg.last_applied_seq() + 1;
         if engine.readonly {
             engine.sync_metrics();
@@ -460,7 +512,13 @@ impl Engine {
         if self.crc_failed {
             return Err(StoreError::Crc);
         }
-        let appended = read_from(&self.root.join("wal/wal-1.qwal"), self.wal_pos).map_err(io)?;
+        let end = if self.readonly {
+            read_visible_file(&self.root).unwrap_or(u64::MAX)
+        } else {
+            u64::MAX
+        };
+        let appended =
+            read_span(&self.root.join("wal/wal-1.qwal"), self.wal_pos, end).map_err(io)?;
         self.wal_pos = appended.consumed;
         let mut changes = Vec::new();
         for record in &appended.records {
@@ -914,10 +972,18 @@ impl Engine {
         from_seq: u64,
         limit: usize,
     ) -> (u64, Vec<LiveRow>) {
-        let snapshot_seq = self.applied_seq();
+        let snapshot_seq = if self.wait_majority {
+            self.published_seq
+        } else {
+            self.applied_seq()
+        };
         if from_seq == 0 {
-            let quotes = self
-                .quotes
+            let quotes = if self.wait_majority {
+                &self.published_quotes
+            } else {
+                &self.quotes
+            };
+            let quotes = quotes
                 .iter()
                 .filter_map(|(symbol_id, quote)| {
                     let name = self.symbol_name(*symbol_id);
@@ -942,7 +1008,7 @@ impl Engine {
         }
         let mut rows = Vec::new();
         for frame in &self.frames {
-            if rows.len() >= limit || frame.seq() <= from_seq {
+            if rows.len() >= limit || frame.seq() <= from_seq || frame.seq() > snapshot_seq {
                 continue;
             }
             let kind = match MsgType::from_u16(frame.header.msg_type) {
@@ -1007,6 +1073,7 @@ impl Engine {
 
     /// 把组提交缓冲区里的记录 `fsync`，并发布到共享内存。
     ///
+    /// 打开可见性门闩时只落盘，不发布。副本应答之后由 [`Engine::publish_visible`] 发布。
     /// 缓冲区为空时什么也不做。
     ///
     /// # Errors
@@ -1014,6 +1081,373 @@ impl Engine {
     /// 同步文件或发布帧失败时返回 [`StoreError::Io`]。
     pub fn flush(&mut self) -> Result<(), StoreError> {
         self.flush_pending()
+    }
+
+    /// 当前任期。单机从 1 开始。
+    ///
+    /// # Returns
+    ///
+    /// 本进程承认的 `leader_epoch`。
+    pub fn leader_epoch(&self) -> u64 {
+        self.leader_epoch
+    }
+
+    /// 已 `fsync` 的 WAL 终点，字节偏移。
+    ///
+    /// # Returns
+    ///
+    /// 复制游标。还没落盘时为 0。
+    pub fn durable_offset(&self) -> u64 {
+        self.wal_pos
+    }
+
+    /// 打开可见性门闩：本机落盘后，订阅者要等 [`Engine::publish_visible`]。
+    ///
+    /// 调用之前已经写进内存的记录仍然可见。之后的 `fsync` 写到 `wal/visible.pos` 后面，订阅者先看不见。
+    /// 没有其他副本时不要调用，否则记录会一直停在门闩后面。
+    ///
+    /// # Errors
+    ///
+    /// 写 `wal/visible.pos` 失败时返回 [`StoreError::Io`]。
+    pub fn arm_visibility_gate(&mut self) -> Result<(), StoreError> {
+        if self.wait_majority {
+            return Ok(());
+        }
+        self.wait_majority = true;
+        self.published_seq = self.applied_seq();
+        self.published_quotes = self.quotes.clone();
+        if read_visible_file(&self.root).is_none() {
+            self.visible_pos = self.wal_pos;
+            self.write_visible()?;
+        }
+        Ok(())
+    }
+
+    /// 把已经落盘、且偏移不超过 `offset` 的记录发布给订阅者和共享内存。
+    ///
+    /// 没打开门闩、或没有攒下的批次时什么也不做。
+    ///
+    /// # Arguments
+    ///
+    /// * `offset` - 已经有足够副本应答的 WAL 字节偏移。大于本机落盘位置时按落盘位置截断。
+    ///
+    /// # Errors
+    ///
+    /// 发布共享内存或写 `wal/visible.pos` 失败时返回 [`StoreError::Io`]。
+    pub fn publish_visible(&mut self, offset: u64) -> Result<(), StoreError> {
+        let offset = offset.min(self.wal_pos);
+        let mut changed = false;
+        while self
+            .held
+            .first()
+            .is_some_and(|batch| batch.offset <= offset)
+        {
+            let batch = self.held.remove(0);
+            self.published_seq = batch.seq;
+            self.published_quotes = batch.quotes;
+            self.visible_pos = batch.offset;
+            self.publish_frames(&batch.frames)?;
+            self.write_visible()?;
+            changed = true;
+        }
+        if changed {
+            self.sync_metrics();
+        }
+        Ok(())
+    }
+
+    /// 当前复制 ID。提升为主之后会换成新的。
+    ///
+    /// # Returns
+    ///
+    /// 16 字节。副本用它判断还能不能从偏移接着复制。
+    pub fn repl_id(&self) -> [u8; 16] {
+        self.repl_id
+    }
+
+    /// 本进程是不是只收复制、不分配新序号。
+    ///
+    /// # Returns
+    ///
+    /// 副本为真。
+    pub fn is_replica(&self) -> bool {
+        self.fenced
+    }
+
+    /// 停止本机分配新序号。
+    ///
+    /// # Arguments
+    ///
+    /// * `epoch` - 新的任期。小于当前任期时拒绝。等于当前任期也会停止写入。
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::StaleEpoch`] - `epoch` 比本机已经看见的更小。
+    pub fn fence(&mut self, epoch: u64) -> Result<(), StoreError> {
+        if epoch < self.leader_epoch {
+            return Err(StoreError::StaleEpoch);
+        }
+        self.leader_epoch = epoch;
+        self.fenced = true;
+        Ok(())
+    }
+
+    /// 以这个任期成为写入者，并从已经应用到的序号往后分配。
+    ///
+    /// # Arguments
+    ///
+    /// * `epoch` - 必须不小于本机任期。切换时用比旧写入者更大的值。
+    ///
+    /// # Errors
+    ///
+    /// [`StoreError::StaleEpoch`] - `epoch` 比本机已经看见的更小。
+    pub fn lead(&mut self, epoch: u64) -> Result<(), StoreError> {
+        if epoch < self.leader_epoch {
+            return Err(StoreError::StaleEpoch);
+        }
+        self.leader_epoch = epoch;
+        self.fenced = false;
+        Ok(())
+    }
+
+    /// 按 Redis 的部分同步导出已落盘 WAL。
+    ///
+    /// 复制 ID 对得上，并且偏移还在文件里，就只发这段之后的字节。对不上就从 0 全量发送。未 `fsync` 的尾部不发送。
+    ///
+    /// # Arguments
+    ///
+    /// * `repl_id` - 副本记下的复制 ID。`None` 表示还没同步过，得到全量。
+    /// * `from` - 副本已经有的字节偏移。
+    ///
+    /// # Returns
+    ///
+    /// `QDBREPL2`。第 9 字节 1 是增量，2 是全量。
+    ///
+    /// # Errors
+    ///
+    /// * [`StoreError::Io`] - `from` 超过已落盘位置，或文件读失败。
+    /// * [`StoreError::Crc`] - 已落盘区间里有坏校验。
+    pub fn replication_blob(
+        &self,
+        repl_id: Option<&[u8; 16]>,
+        from: u64,
+    ) -> Result<Vec<u8>, StoreError> {
+        let end = self.wal_pos;
+        if from > end {
+            return Err(StoreError::Io("replication cursor past durable wal".into()));
+        }
+        let partial = self.can_partial(repl_id, from);
+        let start = if partial { from } else { 0 };
+        let bytes = self.wal_slice(start, end)?;
+        let next = start + bytes.len() as u64;
+        let mut out = Vec::with_capacity(41 + bytes.len());
+        out.extend_from_slice(b"QDBREPL2");
+        out.push(if partial { 1 } else { 2 });
+        out.extend_from_slice(&self.leader_epoch.to_le_bytes());
+        out.extend_from_slice(&self.repl_id);
+        out.extend_from_slice(&next.to_le_bytes());
+        out.extend_from_slice(&bytes);
+        Ok(out)
+    }
+
+    /// 把另一个节点已经落盘的 WAL 按原序号写入本机。
+    ///
+    /// 比本机任期更小的包被拒绝。更大的任期会记下，并停止本机主动写入，直到 [`Engine::lead`]。
+    /// 序号必须接在已应用序号之后。
+    ///
+    /// # Arguments
+    ///
+    /// * `blob` - [`Engine::replication_blob`] 的输出。
+    ///
+    /// # Returns
+    ///
+    /// 新应用到的记录条数。已经有的序号会跳过。
+    ///
+    /// # Errors
+    ///
+    /// * [`StoreError::StaleEpoch`] - 包的任期更旧。
+    /// * [`StoreError::Gap`] - 序号接不上。已经连续的前缀仍保留。
+    /// * [`StoreError::ReadOnly`] - 没有本地 WAL。
+    /// * [`StoreError::Crc`] - 包校验失败。
+    pub fn apply_replication(&mut self, blob: &[u8]) -> Result<u64, StoreError> {
+        if self.readonly {
+            return Err(StoreError::ReadOnly);
+        }
+        if blob.len() < 41 || &blob[..8] != b"QDBREPL2" {
+            return Err(StoreError::Io("not a replication batch".into()));
+        }
+        let kind = blob[8];
+        let epoch = u64::from_le_bytes(blob[9..17].try_into().unwrap());
+        let mut repl_id = [0u8; 16];
+        repl_id.copy_from_slice(&blob[17..33]);
+        if epoch < self.leader_epoch && repl_id != self.repl_id && repl_id != self.repl_id2 {
+            return Err(StoreError::StaleEpoch);
+        }
+        let parsed = parse_wal(&blob[41..]).map_err(io)?;
+        if parsed.crc_failed {
+            return Err(StoreError::Crc);
+        }
+        if kind == 2 {
+            if !self.fenced && repl_id != self.repl_id {
+                return Err(StoreError::StaleEpoch);
+            }
+            self.reset_from_records(&parsed.records)?;
+            self.leader_epoch = epoch.max(self.leader_epoch);
+            self.repl_id = repl_id;
+            self.fenced = true;
+            self.save_repl_meta()?;
+            self.catch_up_visible()?;
+            return Ok(parsed.records.len() as u64);
+        }
+        if epoch > self.leader_epoch {
+            self.leader_epoch = epoch;
+            self.fenced = true;
+        }
+        self.repl_id = repl_id;
+        let applied = self.append_records(&parsed.records)?;
+        self.save_repl_meta()?;
+        if self.fenced {
+            self.catch_up_visible()?;
+        }
+        Ok(applied)
+    }
+
+    /// 把本副本提升为主。复制 ID 换成新的，旧 ID 还能接到提升前的偏移。
+    ///
+    /// # Returns
+    ///
+    /// 新的复制 ID。
+    ///
+    /// # Errors
+    ///
+    /// 写 `wal/repl.meta` 失败时返回 [`StoreError::Io`]。
+    pub fn promote(&mut self) -> Result<[u8; 16], StoreError> {
+        self.repl_id2 = self.repl_id;
+        self.offset2 = self.wal_pos;
+        self.repl_id = new_repl_id();
+        self.leader_epoch = self.leader_epoch.saturating_add(1);
+        self.fenced = false;
+        self.save_repl_meta()?;
+        Ok(self.repl_id)
+    }
+
+    fn can_partial(&self, repl_id: Option<&[u8; 16]>, from: u64) -> bool {
+        let Some(repl_id) = repl_id else {
+            return false;
+        };
+        if *repl_id == self.repl_id {
+            return true;
+        }
+        *repl_id == self.repl_id2 && from <= self.offset2
+    }
+
+    fn wal_slice(&self, start: u64, end: u64) -> Result<Vec<u8>, StoreError> {
+        if start == end {
+            return Ok(Vec::new());
+        }
+        let path = self.root.join("wal/wal-1.qwal");
+        if !path.is_file() {
+            return Ok(Vec::new());
+        }
+        let mut file = File::open(&path).map_err(io)?;
+        file.seek(SeekFrom::Start(start)).map_err(io)?;
+        let mut buf = vec![0u8; (end - start) as usize];
+        file.read_exact(&mut buf).map_err(io)?;
+        let parsed = parse_wal(&buf).map_err(io)?;
+        if parsed.crc_failed {
+            return Err(StoreError::Crc);
+        }
+        buf.truncate(parsed.consumed as usize);
+        Ok(buf)
+    }
+
+    fn append_records(&mut self, records: &[WalRecord]) -> Result<u64, StoreError> {
+        let mut applied = 0u64;
+        for record in records {
+            if record.seq <= self.applied_seq() {
+                continue;
+            }
+            if record.seq != self.applied_seq() + 1 {
+                self.flush_replicated()?;
+                return Err(StoreError::Gap);
+            }
+            self.wal
+                .as_mut()
+                .ok_or(StoreError::ReadOnly)?
+                .append(record)
+                .map_err(io)?;
+            self.apply_record(record)?;
+            self.next_seq = self.applied_seq() + 1;
+            applied += 1;
+        }
+        self.flush_replicated()?;
+        Ok(applied)
+    }
+
+    fn reset_from_records(&mut self, records: &[WalRecord]) -> Result<(), StoreError> {
+        let path = self.root.join("wal/wal-1.qwal");
+        replace_wal(&path, records).map_err(io)?;
+        self.symbols.clear();
+        self.by_key.clear();
+        self.exchanges.clear();
+        self.ticks.clear();
+        self.quotes.clear();
+        self.frames.clear();
+        self.pending.clear();
+        self.held.clear();
+        self.agg = KlineAggregator::default();
+        self.tables = table::TableSet::default();
+        self.next_seq = 1;
+        self.defer_rows = true;
+        for record in records {
+            self.apply_record(record)?;
+            self.next_seq = self.applied_seq() + 1;
+        }
+        self.defer_rows = false;
+        self.rebuild_business_rows();
+        self.wal_pos = fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        Ok(())
+    }
+
+    fn load_or_create_repl(&mut self) {
+        let path = self.root.join("wal/repl.meta");
+        if let Ok(bytes) = fs::read(&path) {
+            if bytes.len() >= 48 {
+                self.repl_id.copy_from_slice(&bytes[0..16]);
+                self.repl_id2.copy_from_slice(&bytes[16..32]);
+                self.offset2 = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
+                let epoch = u64::from_le_bytes(bytes[40..48].try_into().unwrap());
+                if epoch > 0 {
+                    self.leader_epoch = epoch;
+                }
+                return;
+            }
+        }
+        self.repl_id = new_repl_id();
+        let _ = self.save_repl_meta();
+    }
+
+    fn save_repl_meta(&self) -> Result<(), StoreError> {
+        let path = self.root.join("wal/repl.meta");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(io)?;
+        }
+        let mut bytes = Vec::with_capacity(48);
+        bytes.extend_from_slice(&self.repl_id);
+        bytes.extend_from_slice(&self.repl_id2);
+        bytes.extend_from_slice(&self.offset2.to_le_bytes());
+        bytes.extend_from_slice(&self.leader_epoch.to_le_bytes());
+        fs::write(path, bytes).map_err(io)
+    }
+
+    fn flush_replicated(&mut self) -> Result<(), StoreError> {
+        if let Some(wal) = self.wal.as_mut() {
+            wal.flush().map_err(io)?;
+        }
+        self.wal_pos = fs::metadata(self.root.join("wal/wal-1.qwal"))
+            .map(|meta| meta.len())
+            .unwrap_or(self.wal_pos);
+        Ok(())
     }
 
     fn maybe_flush(&mut self) -> Result<(), StoreError> {
@@ -1039,6 +1473,18 @@ impl Engine {
         self.wal_pos = fs::metadata(self.root.join("wal/wal-1.qwal"))
             .map(|meta| meta.len())
             .unwrap_or(self.wal_pos);
+        if self.wait_majority {
+            let frames = std::mem::take(&mut self.pending);
+            self.held.push(HeldPublish {
+                offset: self.wal_pos,
+                seq: self.applied_seq(),
+                frames,
+                quotes: self.quotes.clone(),
+            });
+            self.flush_count += 1;
+            self.metrics.heartbeat_ns.store(now_ns(), Ordering::Release);
+            return Ok(());
+        }
         let last = self.pending.last().map(|frame| frame.seq()).unwrap_or(0);
         let applied = self.applied_seq();
         if let Some(shm) = self.shm.as_mut() {
@@ -1053,6 +1499,51 @@ impl Engine {
         self.flush_count += 1;
         self.sync_metrics();
         Ok(())
+    }
+
+    fn publish_frames(&mut self, frames: &[Frame]) -> Result<(), StoreError> {
+        if frames.is_empty() {
+            return Ok(());
+        }
+        let last = frames.last().map(|frame| frame.seq()).unwrap_or(0);
+        let applied = if self.wait_majority {
+            self.published_seq
+        } else {
+            self.applied_seq()
+        };
+        if let Some(shm) = self.shm.as_mut() {
+            shm.set_durable(last);
+            shm.set_applied(applied);
+            for frame in frames {
+                shm.publish(frame).map_err(io)?;
+            }
+            shm.set_heartbeat(now_ns());
+        }
+        Ok(())
+    }
+
+    fn write_visible(&self) -> Result<(), StoreError> {
+        let path = self.root.join("wal/visible.pos");
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(io)?;
+        }
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(&self.visible_pos.to_le_bytes());
+        bytes[8..].copy_from_slice(&self.published_seq.to_le_bytes());
+        let mut file = fs::File::create(&path).map_err(io)?;
+        file.write_all(&bytes).map_err(io)?;
+        file.sync_all().map_err(io)
+    }
+
+    fn catch_up_visible(&mut self) -> Result<(), StoreError> {
+        if read_visible_file(&self.root).is_none() {
+            return Ok(());
+        }
+        self.held.clear();
+        self.visible_pos = self.wal_pos;
+        self.published_seq = self.applied_seq();
+        self.published_quotes = self.quotes.clone();
+        self.write_visible()
     }
 
     fn apply_record(&mut self, record: &WalRecord) -> Result<Vec<BarEvent>, StoreError> {
@@ -1287,6 +1778,9 @@ impl Engine {
         if self.readonly {
             return Err(StoreError::ReadOnly);
         }
+        if self.fenced {
+            return Err(StoreError::StaleEpoch);
+        }
         if self.crc_failed {
             Err(StoreError::Crc)
         } else {
@@ -1295,7 +1789,11 @@ impl Engine {
     }
 
     fn sync_metrics(&self) {
-        let applied = self.applied_seq();
+        let applied = if self.wait_majority {
+            self.published_seq
+        } else {
+            self.applied_seq()
+        };
         self.metrics.applied_seq.store(applied, Ordering::Release);
         self.metrics.durable_seq.store(applied, Ordering::Release);
         self.metrics.write_seq.store(applied, Ordering::Release);
@@ -1477,9 +1975,71 @@ fn fixed_label(value: &str) -> [u8; 16] {
     out
 }
 
-fn load_for_open(
+struct OpenPlan {
+    loaded: WalRead,
+    checkpoint: Option<checkpoint::Checkpoint>,
+    tail: Vec<WalRecord>,
+    tail_crc: bool,
+    durable_end: u64,
+    visible_pos: u64,
+    gated: bool,
+}
+
+fn read_visible_file(root: &Path) -> Option<u64> {
+    let bytes = fs::read(root.join("wal/visible.pos")).ok()?;
+    if bytes.len() < 8 {
+        return None;
+    }
+    Some(u64::from_le_bytes(bytes[0..8].try_into().ok()?))
+}
+
+fn load_for_open(root: &Path, wal_path: &Path, reader: bool) -> Result<OpenPlan, StoreError> {
+    let file_len = if wal_path.is_file() {
+        fs::metadata(wal_path).map_err(io)?.len()
+    } else {
+        0
+    };
+    let visible = read_visible_file(root);
+    let gate_end = visible.unwrap_or(file_len).min(file_len);
+    if !reader && visible.is_some() && gate_end < file_len {
+        let (prefix, checkpoint) = read_up_to(root, wal_path, gate_end)?;
+        let tail = if prefix.crc_failed {
+            WalRead {
+                records: Vec::new(),
+                crc_failed: false,
+                last_good_seq: 0,
+                consumed: prefix.consumed,
+            }
+        } else {
+            read_span(wal_path, prefix.consumed, file_len).map_err(io)?
+        };
+        return Ok(OpenPlan {
+            visible_pos: prefix.consumed,
+            durable_end: file_len,
+            gated: true,
+            tail_crc: tail.crc_failed,
+            tail: tail.records,
+            loaded: prefix,
+            checkpoint,
+        });
+    }
+    let end = if reader { gate_end } else { file_len };
+    let (loaded, checkpoint) = read_up_to(root, wal_path, end)?;
+    Ok(OpenPlan {
+        durable_end: if reader { loaded.consumed } else { file_len },
+        visible_pos: visible.unwrap_or(loaded.consumed),
+        gated: visible.is_some() && !reader,
+        tail: Vec::new(),
+        tail_crc: false,
+        loaded,
+        checkpoint,
+    })
+}
+
+fn read_up_to(
     root: &Path,
     wal_path: &Path,
+    end: u64,
 ) -> Result<(WalRead, Option<checkpoint::Checkpoint>), StoreError> {
     let file_len = if wal_path.is_file() {
         fs::metadata(wal_path).map_err(io)?.len()
@@ -1487,14 +2047,14 @@ fn load_for_open(
         0
     };
     if let Some(saved) = checkpoint::read(root) {
-        if saved.wal_pos <= file_len {
-            let tail = read_from(wal_path, saved.wal_pos).map_err(io)?;
+        if saved.wal_pos <= end && saved.wal_pos <= file_len {
+            let tail = read_span(wal_path, saved.wal_pos, end).map_err(io)?;
             if !tail.crc_failed {
                 return Ok((tail, Some(saved)));
             }
         }
     }
-    Ok((read_path(wal_path).map_err(io)?, None))
+    Ok((read_span(wal_path, 0, end).map_err(io)?, None))
 }
 
 pub(crate) fn decode_quote_payload(
@@ -1559,6 +2119,10 @@ impl Engine {
         self.frames.shrink_to_fit();
         self.pending.clear();
         self.pending.shrink_to_fit();
+        self.held.clear();
+        self.held.shrink_to_fit();
+        self.published_quotes.clear();
+        self.published_quotes.shrink_to_fit();
         self.tables = table::TableSet::default();
         self.agg = KlineAggregator::new();
         self.shm = None;
@@ -1572,6 +2136,17 @@ impl Drop for Engine {
         }
         self.shm = None;
     }
+}
+
+fn new_repl_id() -> [u8; 16] {
+    let nanos = now_ns();
+    let mixed = nanos
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(std::process::id() as u64);
+    let mut id = [0u8; 16];
+    id[..8].copy_from_slice(&nanos.to_le_bytes());
+    id[8..].copy_from_slice(&mixed.to_le_bytes());
+    id
 }
 
 fn now_ns() -> u64 {

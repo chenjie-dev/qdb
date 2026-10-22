@@ -1,6 +1,18 @@
 use std::io::Read;
+use std::net::TcpStream;
 use std::process::{Command, Stdio};
 use std::time::Duration;
+
+fn wait_until_listening(port: u16) {
+    let addr = format!("127.0.0.1:{port}");
+    for _ in 0..100 {
+        if TcpStream::connect(&addr).is_ok() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    panic!("qdb did not listen on {addr}");
+}
 
 #[test]
 fn a_second_qdb_process_exits_before_opening_the_database() {
@@ -9,7 +21,7 @@ fn a_second_qdb_process_exits_before_opening_the_database() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let lock = dir.join("instance.lock");
-    let port = 25000 + (n % 10000);
+    let port = (25000 + (n % 10000)) as u16;
     let mut first = Command::new(env!("CARGO_BIN_EXE_qdb"))
         .arg(&dir)
         .env("QDB_INSTANCE_LOCK", &lock)
@@ -19,7 +31,7 @@ fn a_second_qdb_process_exits_before_opening_the_database() {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    std::thread::sleep(Duration::from_millis(400));
+    wait_until_listening(port);
     assert!(first.try_wait().unwrap().is_none(), "first instance exited");
     let second = Command::new(env!("CARGO_BIN_EXE_qdb"))
         .arg(dir.join("other"))
@@ -47,7 +59,7 @@ fn sigterm_releases_memory_and_exits() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let lock = dir.join("instance.lock");
-    let port = 26000 + (n % 10000);
+    let port = (26000 + (n % 10000)) as u16;
     let mut child = Command::new(env!("CARGO_BIN_EXE_qdb"))
         .arg(&dir)
         .env("QDB_INSTANCE_LOCK", &lock)
@@ -57,7 +69,7 @@ fn sigterm_releases_memory_and_exits() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    std::thread::sleep(Duration::from_millis(400));
+    wait_until_listening(port);
     assert!(
         child.try_wait().unwrap().is_none(),
         "qdb exited before the signal"

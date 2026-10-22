@@ -336,23 +336,35 @@ fn url_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+pub fn write_bytes(
+    stream: &mut TcpStream,
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+) -> std::io::Result<()> {
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        409 => "Conflict",
+        421 => "Misdirected Request",
+        _ => "Service Unavailable",
+    };
+    let resp = format!(
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(resp.as_bytes())?;
+    stream.write_all(body)
+}
+
 pub fn write_http(
     stream: &mut TcpStream,
     status: u16,
     content_type: &str,
     body: &str,
 ) -> std::io::Result<()> {
-    let reason = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        404 => "Not Found",
-        _ => "Service Unavailable",
-    };
-    let resp = format!(
-        "HTTP/1.1 {status} {reason}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-        body.len()
-    );
-    stream.write_all(resp.as_bytes())
+    write_bytes(stream, status, content_type, body.as_bytes())
 }
 
 pub struct HttpRequest {

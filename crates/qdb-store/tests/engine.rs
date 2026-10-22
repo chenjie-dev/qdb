@@ -217,6 +217,75 @@ fn checkpoint_survives_a_corrupt_wal_prefix() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[test]
+fn replication_keeps_the_sequence_and_a_higher_epoch_stops_the_old_writer() {
+    let leader_dir = temp("repl-leader");
+    let follower_dir = temp("repl-follower");
+    let mut leader = Engine::open(&leader_dir).unwrap();
+    leader.write_trade("SSE", "600000", 1, 10, 2).unwrap();
+    let blob = leader.replication_blob(None, 0).unwrap();
+    assert_eq!(blob[8], 2);
+    let mut follower = Engine::open(&follower_dir).unwrap();
+    follower.fence(follower.leader_epoch()).unwrap();
+    assert_eq!(follower.apply_replication(&blob).unwrap(), 2);
+    assert_eq!(follower.repl_id(), leader.repl_id());
+    assert_eq!(follower.applied_seq(), leader.applied_seq());
+    let id = follower.resolve("SSE:600000").unwrap();
+    assert_eq!(follower.ticks(id)[0].price, 10);
+    assert!(matches!(
+        follower.write_trade("SSE", "600000", 2, 11, 1).unwrap_err(),
+        StoreError::StaleEpoch
+    ));
+    let again = leader
+        .replication_blob(Some(&follower.repl_id()), follower.durable_offset())
+        .unwrap();
+    assert_eq!(again[8], 1);
+    assert_eq!(follower.apply_replication(&again).unwrap(), 0);
+    leader.fence(2).unwrap();
+    assert!(matches!(
+        leader.write_trade("SSE", "600000", 2, 12, 1).unwrap_err(),
+        StoreError::StaleEpoch
+    ));
+    let old_id = leader.repl_id();
+    let promoted = follower.promote().unwrap();
+    assert_ne!(promoted, old_id);
+    let continued = follower.replication_blob(Some(&old_id), 0).unwrap();
+    assert_eq!(
+        continued[8], 1,
+        "old replication id still serves the prefix"
+    );
+    let seq = follower.write_trade("SSE", "600000", 2, 20, 1).unwrap();
+    assert!(seq > leader.applied_seq());
+    assert!(matches!(
+        follower.apply_replication(&blob).unwrap_err(),
+        StoreError::StaleEpoch
+    ));
+    let _ = std::fs::remove_dir_all(leader_dir);
+    let _ = std::fs::remove_dir_all(follower_dir);
+}
+
+#[test]
+fn subscribers_wait_until_the_visible_offset_is_published() {
+    let dir = temp("d2vis");
+    let mut engine = Engine::open(&dir).unwrap();
+    engine.arm_visibility_gate().unwrap();
+    engine.write_trade("SSE", "600000", 1, 10, 1).unwrap();
+    let offset = engine.durable_offset();
+    let hidden = Engine::open_read(&dir).unwrap();
+    assert!(hidden.symbols().is_empty());
+    let (seq, rows) = engine.changes_since(None, 0, 10);
+    assert_eq!(seq, 0);
+    assert!(rows.is_empty());
+    engine.publish_visible(offset).unwrap();
+    let shown = Engine::open_read(&dir).unwrap();
+    let id = shown.resolve("SSE:600000").unwrap();
+    assert_eq!(shown.ticks(id).len(), 1);
+    let (seq, rows) = engine.changes_since(None, 0, 10);
+    assert!(seq > 0);
+    assert!(!rows.is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 fn temp(name: &str) -> std::path::PathBuf {
     let dir = std::env::temp_dir().join(format!("qdb-engine-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

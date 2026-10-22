@@ -1,0 +1,54 @@
+# 一台主节点和两台副本。写入按 D2 等至少一个副本应答后，订阅者才看得到。
+# 主节点停下大约 200 毫秒后，地址较小的副本升主，另一台和旧主改拉新主。
+services:
+  qdb-1:
+    build: .
+    environment:
+      QDB_HTTP_ADDR: 0.0.0.0
+      QDB_FEED: "0"
+      QDB_ADVERTISE: qdb-1:9090
+      QDB_CLUSTER: qdb-1:9090=0-16383
+      QDB_DURABILITY: d2
+      QDB_SENTINEL: http://qdb-2:9090,http://qdb-3:9090
+    ports:
+      - "19091:9090"
+    volumes:
+      - qdb1:/var/lib/qdb
+  qdb-2:
+    build: .
+    environment:
+      QDB_HTTP_ADDR: 0.0.0.0
+      QDB_FEED: "0"
+      QDB_ADVERTISE: qdb-2:9090
+      QDB_UPSTREAM: http://qdb-1:9090
+      QDB_DURABILITY: d2
+      QDB_SENTINEL: http://qdb-3:9090
+      QDB_QUORUM: "2"
+      QDB_FAILOVER_MS: "200"
+    ports:
+      - "19092:9090"
+    volumes:
+      - qdb2:/var/lib/qdb
+    depends_on:
+      - qdb-1
+  qdb-3:
+    build: .
+    environment:
+      QDB_HTTP_ADDR: 0.0.0.0
+      QDB_FEED: "0"
+      QDB_ADVERTISE: qdb-3:9090
+      QDB_UPSTREAM: http://qdb-1:9090
+      QDB_DURABILITY: d2
+      QDB_SENTINEL: http://qdb-2:9090
+      QDB_QUORUM: "2"
+      QDB_FAILOVER_MS: "200"
+    ports:
+      - "19093:9090"
+    volumes:
+      - qdb3:/var/lib/qdb
+    depends_on:
+      - qdb-1
+volumes:
+  qdb1:
+  qdb2:
+  qdb3:

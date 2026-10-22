@@ -124,6 +124,23 @@ pub fn read_path(path: &Path) -> Result<WalRead, WalError> {
 ///
 /// * [`WalError::Io`] - 打开失败，或 `from` 已经超过文件长度。
 pub fn read_from(path: &Path, from: u64) -> Result<WalRead, WalError> {
+    read_span(path, from, u64::MAX)
+}
+
+/// 只读取 `[from, end)` 里已经写完的记录。
+///
+/// `end` 超过文件长度时停在文件末尾。用来让订阅者停在已经对多数副本可见的偏移，不把后面的字节算进去。
+///
+/// # Arguments
+///
+/// * `path` - WAL 文件。不存在时返回空结果，`consumed` 等于 `from`。
+/// * `from` - 起始字节偏移。
+/// * `end` - 不包含的结束偏移。`u64::MAX` 表示读到文件末尾。
+///
+/// # Errors
+///
+/// * [`WalError::Io`] - 打开失败，或 `from` 已经超过文件长度。
+pub fn read_span(path: &Path, from: u64, end: u64) -> Result<WalRead, WalError> {
     if !path.exists() {
         return Ok(WalRead {
             records: Vec::new(),
@@ -142,10 +159,19 @@ pub fn read_from(path: &Path, from: u64) -> Result<WalRead, WalError> {
             "wal truncated at {len}, reader was at {from}"
         )));
     }
+    let end = end.min(len);
+    if from >= end {
+        return Ok(WalRead {
+            records: Vec::new(),
+            crc_failed: false,
+            last_good_seq: 0,
+            consumed: from,
+        });
+    }
     file.seek(SeekFrom::Start(from))
         .map_err(|err| WalError::Io(err.to_string()))?;
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
+    let mut bytes = vec![0u8; (end - from) as usize];
+    file.read_exact(&mut bytes)
         .map_err(|err| WalError::Io(err.to_string()))?;
     parse_bytes(&bytes, from)
 }
@@ -214,6 +240,23 @@ pub fn write_dump(path: &Path, records: &[WalRecord]) -> Result<(), WalError> {
 }
 
 pub fn parse_dump_body(bytes: &[u8]) -> Result<WalRead, WalError> {
+    parse_bytes(bytes, 0)
+}
+
+/// 解析一段原始 WAL 字节，不含转储魔数。
+///
+/// # Arguments
+///
+/// * `bytes` - `crc32 | body_len | body` 的拼接。可以在一条记录中间结束。
+///
+/// # Returns
+///
+/// 完整记录，以及 [`WalRead::consumed`] 停在下一条完整记录之前。
+///
+/// # Errors
+///
+/// 记录体无法解码时返回 [`WalError::Crc`]。校验不对时不返回错误，而是把 [`WalRead::crc_failed`] 设为真。
+pub fn parse_wal(bytes: &[u8]) -> Result<WalRead, WalError> {
     parse_bytes(bytes, 0)
 }
 

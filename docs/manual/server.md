@@ -68,6 +68,32 @@ JSON：`{"items":[{"key":"binance:ticker:BTCUSDT","value":{}}]}`。值原样保�
 
 证券还不存在时先发 `{"type":"waiting"}`。语句错误发 `{"type":"error","message":"..."}` 并关闭。这是只读连接，读已经 `fsync` 的 WAL，大约每 50 毫秒看一次。写失败或客户端关闭就结束这条连接，不挡住写入线程。
 
+### GET /v1/replicate?from=&repl_id=&db=
+
+拉取已经 `fsync` 的 WAL。`from` 是副本已有的字节偏移，`repl_id` 是它记下的 32 位十六进制复制 ID。两者对得上就只发增量；缺 ID 或对不上就从 0 全量发送。正文是 `QDBREPL2`：8 字节魔数、1 字节类型（1 增量，2 全量）、小端 `u64` 任期、16 字节复制 ID、小端 `u64` 下一偏移，然后是原始 WAL。还没落盘的尾部不会出现。坏校验返回 503。
+
+跟随进程设置 `QDB_UPSTREAM=http://主节点:9090`。它变成副本，停止接受本机新写入，并大约每 50 毫秒拉取。从第一次连不上开始算，超过 `QDB_FAILOVER_MS`（缺省 200，`0` 关闭）才考虑升主。探测连接最多等 100 毫秒。
+
+大规模时用 `QDB_CLUSTER=地址=起-止,...` 把 16384 个槽分给多台主节点。键的槽号是 CRC16 的低 14 位，`{标签}` 里的文字决定槽，用来把相关键放在一起。写入的键不在本节点时返回 421，正文是 `moved`、`slot` 和 `key`。`QDB_ADVERTISE` 是本节点在这张表里的地址，缺省是监听地址加端口。`GET /v1/cluster` 返回这张表。
+
+多副本时设置 `QDB_SENTINEL` 为其他副本地址，逗号分隔。`QDB_QUORUM` 是确认主节点失联所需的票数，含自己。缺省时没有其他副本就是 1；有其他副本时是过半。本副本的偏移还必须不小于已应答副本。偏移一样时，对外地址字典序较小的副本升主。`QDB_MIN_REPLICAS` 大于 0 时，主节点在 `QDB_REPLICA_LAG_MS`（缺省 10000）内看不到足够的副本应答就拒绝写入。
+
+`QDB_DURABILITY=d2` 时，本机落盘后订阅者和共享内存先看不到这批记录。要等足够多的副本在 `QDB_REPLICA_LAG_MS` 内应答了不小于这批的偏移才发布。需要的副本数是 `QDB_MIN_REPLICAS`；没设时按哨兵列表算多数派，再减去主节点自己。没有其他副本时仍马上发布。缺省 `d1`，本机落盘后就发布。
+
+升主之后向 `QDB_SENTINEL` 里的副本和旧主发送 `POST /v1/follow?upstream=http://新主:端口`。对方确认新主的任期更高，或者任期相同但自己已经被 fence，就停止写入并改从新主拉取。新的上游写在数据目录的 `upstream.url`；内容是 `-` 表示本进程已经升主，重启后不再使用 `QDB_UPSTREAM`。旧主一直连不上时会继续重试。槽位表不会跟着改。
+
+### POST /v1/promote?db=
+
+把本进程从副本提升为主。复制 ID 换成新的，任期加一，之后可以写入。应提升偏移最大的那台副本。
+
+### GET /v1/info?db=
+
+返回 `role`、`epoch`、`repl_id`、`offset`、`upstream`。`role` 为 `master` 或 `replica`。主节点的 `upstream` 为空。
+
+### POST /v1/epoch?op=fence&epoch=&db=
+
+`fence` 让本进程停止分配新序号。`epoch` 小于已经看见的任期时返回 409。旧主在副本提升之前要先 fence。
+
 ### GET /health
 
 正文是 `text/plain`。
