@@ -1,6 +1,6 @@
 //! 只读 SQL 子集，以及 `CREATE TABLE` 和 `INSERT`。
 //!
-//! 语法边界见 `docs/manual/sql.md`。`ORDER BY` 可以被解析，结果仍按存储顺序返回。
+//! 语法边界见 `docs/manual/sql.md`。`WHERE`、`GROUP BY`、`HAVING`、`DISTINCT` 和 `ORDER BY` 都会生效。
 #![forbid(unsafe_code)]
 
 use qdb_abi::{KlineBody, Period};
@@ -85,7 +85,7 @@ impl<'a> SqlEngine<'a> {
 
     /// 执行 `SELECT`、`SHOW` 或 `DESCRIBE`。不写 WAL。
     ///
-    /// `ORDER BY` 可以被解析，结果仍按存储顺序返回。`LIMIT` 不能超过 100000。
+    /// `WHERE` 在扫描之后过滤。`GROUP BY` 每个分组一行，`HAVING` 再过滤分组。`DISTINCT` 去重。`ORDER BY` 在 `LIMIT` 之前排序。`LIMIT` 不能超过 100000。
     /// 不带 `symbol` 的 `ticks` 会多一列 `symbol`。`JOIN` 按 PostgreSQL 的内连接和外连接匹配，多表时列名是 `别名.列名`。
     ///
     /// # Arguments
@@ -130,21 +130,68 @@ impl<'a> SqlEngine<'a> {
         if stmt.limit > 100_000 {
             return Err(SqlError::Limit(stmt.limit));
         }
-        if !stmt.joins.is_empty() {
-            if !stmt.aggregates.is_empty() {
-                return Err(SqlError::Syntax(
-                    "aggregate is not supported on join".into(),
-                ));
+        if !stmt.joins.is_empty() && !stmt.aggregates.is_empty() {
+            return Err(SqlError::Syntax(
+                "aggregate is not supported on join".into(),
+            ));
+        }
+        let mut fetch = stmt.clone();
+        fetch.limit = 100_000;
+        fetch.columns = vec!["*".into()];
+        fetch.headings = vec!["*".into()];
+        fetch.aggregates.clear();
+        fetch.distinct = false;
+        fetch.order.clear();
+        fetch.group.clear();
+        fetch.having = None;
+        fetch.where_expr = None;
+        let raw = if !fetch.joins.is_empty() {
+            self.query_joined(&fetch)?
+        } else {
+            match fetch.table.as_str() {
+                "klines" => self.query_klines(&fetch)?,
+                "snapshots" => self.query_snapshots(&fetch)?,
+                "symbols" => self.query_symbols(&fetch)?,
+                "ticks" => self.query_ticks(&fetch)?,
+                other => self.query_user(other, &fetch)?,
             }
-            return self.query_joined(stmt);
+        };
+        self.finish(stmt, raw)
+    }
+
+    fn finish(&self, stmt: &Stmt, mut result: QueryResult) -> Result<QueryResult, SqlError> {
+        if let Some(expr) = &stmt.where_expr {
+            let mut kept = Vec::new();
+            for row in result.rows {
+                if eval_expr(expr, &result.columns, &row)? {
+                    kept.push(row);
+                }
+            }
+            result.rows = kept;
         }
-        match stmt.table.as_str() {
-            "klines" => self.query_klines(stmt),
-            "snapshots" => self.query_snapshots(stmt),
-            "symbols" => self.query_symbols(stmt),
-            "ticks" => self.query_ticks(stmt),
-            other => self.query_user(other, stmt),
+        if !stmt.aggregates.is_empty() || !stmt.group.is_empty() {
+            result = group_rows(stmt, result)?;
+        } else {
+            result = project_rows(stmt, result)?;
         }
+        if let Some(expr) = &stmt.having {
+            let mut kept = Vec::new();
+            for row in result.rows {
+                if eval_expr(expr, &result.columns, &row)? {
+                    kept.push(row);
+                }
+            }
+            result.rows = kept;
+        }
+        if stmt.distinct {
+            let mut seen = std::collections::HashSet::new();
+            result.rows.retain(|row| seen.insert(row.clone()));
+        }
+        if !stmt.order.is_empty() {
+            sort_rows(&mut result, &stmt.order)?;
+        }
+        result.rows.truncate(stmt.limit as usize);
+        Ok(result)
     }
 }
 
@@ -405,11 +452,16 @@ struct JoinItem {
 #[derive(Clone)]
 struct Stmt {
     columns: Vec<String>,
+    headings: Vec<String>,
     aggregates: Vec<Agg>,
+    distinct: bool,
     table: String,
     alias: String,
     joins: Vec<JoinItem>,
-    filters: Vec<(String, String)>,
+    where_expr: Option<Expr>,
+    group: Vec<String>,
+    having: Option<Expr>,
+    order: Vec<OrderKey>,
     symbol: Option<String>,
     period: Option<Period>,
     ts_from: Option<i64>,
@@ -425,14 +477,61 @@ struct Agg {
     column: String,
 }
 
+#[derive(Clone)]
+enum Cmp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
+}
+
+#[derive(Clone)]
+enum Expr {
+    And(Vec<Expr>),
+    Or(Vec<Expr>),
+    Cmp {
+        column: String,
+        op: Cmp,
+        value: String,
+    },
+    Between {
+        column: String,
+        low: i64,
+        high: i64,
+    },
+    IsNull {
+        column: String,
+        negated: bool,
+    },
+}
+
+#[derive(Clone)]
+struct OrderKey {
+    name: String,
+    desc: bool,
+}
+
 fn parse(sql: &str) -> Result<Stmt, SqlError> {
     let tokens = tokenize(sql);
     let mut index = 0;
     expect(&tokens, &mut index, "select")?;
+    let distinct = if tokens
+        .get(index)
+        .is_some_and(|token| token.eq_ignore_ascii_case("distinct"))
+    {
+        index += 1;
+        true
+    } else {
+        false
+    };
     let mut columns = Vec::new();
+    let mut headings = Vec::new();
     let mut aggregates = Vec::new();
     if tokens.get(index).map(|t| t.as_str()) == Some("*") {
         columns.push("*".to_string());
+        headings.push("*".to_string());
         index += 1;
     } else {
         loop {
@@ -441,7 +540,7 @@ fn parse(sql: &str) -> Result<Stmt, SqlError> {
                 .ok_or_else(|| SqlError::Syntax("column".into()))?
                 .clone();
             index += 1;
-            if tokens.get(index).map(|t| t.as_str()) == Some("(") {
+            let source = if tokens.get(index).map(|t| t.as_str()) == Some("(") {
                 index += 1;
                 let column = tokens
                     .get(index)
@@ -449,18 +548,32 @@ fn parse(sql: &str) -> Result<Stmt, SqlError> {
                     .clone();
                 index += 1;
                 expect(&tokens, &mut index, ")")?;
+                let func = name.to_ascii_lowercase();
+                let label = format!("{func}({column})");
                 aggregates.push(Agg {
-                    func: name.to_ascii_lowercase(),
-                    column,
+                    func,
+                    column: column.to_ascii_lowercase(),
                 });
-                columns.push(format!(
-                    "{}({})",
-                    aggregates.last().unwrap().func,
-                    aggregates.last().unwrap().column
-                ));
+                label
             } else {
-                columns.push(name);
-            }
+                name.to_ascii_lowercase()
+            };
+            let heading = if tokens
+                .get(index)
+                .is_some_and(|token| token.eq_ignore_ascii_case("as"))
+            {
+                index += 1;
+                let heading = tokens
+                    .get(index)
+                    .ok_or_else(|| SqlError::Syntax("alias".into()))?
+                    .to_ascii_lowercase();
+                index += 1;
+                heading
+            } else {
+                source.clone()
+            };
+            columns.push(source);
+            headings.push(heading);
             if tokens.get(index).map(|t| t.as_str()) == Some(",") {
                 index += 1;
                 continue;
@@ -532,76 +645,91 @@ fn parse(sql: &str) -> Result<Stmt, SqlError> {
     let mut ts_to = None;
     let mut eq_column = None;
     let mut eq_value = None;
-    let mut filters = Vec::new();
+    let mut where_expr = None;
     if tokens
         .get(index)
         .map(|t| t.eq_ignore_ascii_case("where"))
         .unwrap_or(false)
     {
         index += 1;
-        while index < tokens.len()
-            && !tokens[index].eq_ignore_ascii_case("order")
-            && !tokens[index].eq_ignore_ascii_case("limit")
-            && !tokens[index].eq_ignore_ascii_case("group")
-        {
-            let field = tokens
+        let parsed = parse_expr(&tokens, &mut index)?;
+        if joins.is_empty() {
+            let (residual, simple) = peel_scan_predicates(parsed);
+            symbol = simple.symbol;
+            period = simple.period;
+            ts_from = simple.ts_from;
+            ts_to = simple.ts_to;
+            eq_column = simple.eq_column;
+            eq_value = simple.eq_value;
+            where_expr = residual;
+        } else {
+            where_expr = Some(parsed);
+        }
+    }
+    let mut group = Vec::new();
+    if tokens
+        .get(index)
+        .is_some_and(|token| token.eq_ignore_ascii_case("group"))
+    {
+        index += 1;
+        expect(&tokens, &mut index, "by")?;
+        loop {
+            group.push(
+                tokens
+                    .get(index)
+                    .ok_or_else(|| SqlError::Syntax("group".into()))?
+                    .to_ascii_lowercase(),
+            );
+            index += 1;
+            if tokens.get(index).map(|t| t.as_str()) == Some(",") {
+                index += 1;
+                continue;
+            }
+            break;
+        }
+    }
+    let mut having = None;
+    if tokens
+        .get(index)
+        .is_some_and(|token| token.eq_ignore_ascii_case("having"))
+    {
+        index += 1;
+        having = Some(parse_expr(&tokens, &mut index)?);
+    }
+    let mut order = Vec::new();
+    if tokens
+        .get(index)
+        .is_some_and(|token| token.eq_ignore_ascii_case("order"))
+    {
+        index += 1;
+        expect(&tokens, &mut index, "by")?;
+        loop {
+            let name = tokens
                 .get(index)
-                .ok_or_else(|| SqlError::Syntax("where".into()))?
+                .ok_or_else(|| SqlError::Syntax("order".into()))?
                 .to_ascii_lowercase();
             index += 1;
-            if tokens
+            let desc = if tokens
                 .get(index)
-                .map(|t| t.eq_ignore_ascii_case("between"))
-                .unwrap_or(false)
+                .is_some_and(|token| token.eq_ignore_ascii_case("desc"))
             {
                 index += 1;
-                let from = parse_i64(
-                    tokens
-                        .get(index)
-                        .ok_or_else(|| SqlError::Syntax("between".into()))?,
-                )?;
+                true
+            } else if tokens
+                .get(index)
+                .is_some_and(|token| token.eq_ignore_ascii_case("asc"))
+            {
                 index += 1;
-                expect(&tokens, &mut index, "and")?;
-                let to = parse_i64(
-                    tokens
-                        .get(index)
-                        .ok_or_else(|| SqlError::Syntax("between".into()))?,
-                )?;
-                index += 1;
-                if !joins.is_empty() {
-                    return Err(SqlError::Syntax(
-                        "between is not supported after join".into(),
-                    ));
-                }
-                if field == "ts" {
-                    ts_from = Some(from);
-                    ts_to = Some(to);
-                }
+                false
             } else {
-                expect(&tokens, &mut index, "=")?;
-                let value = tokens
-                    .get(index)
-                    .ok_or_else(|| SqlError::Syntax("value".into()))?
-                    .clone();
+                false
+            };
+            order.push(OrderKey { name, desc });
+            if tokens.get(index).map(|t| t.as_str()) == Some(",") {
                 index += 1;
-                if !joins.is_empty() {
-                    filters.push((field, unquote(&value)));
-                } else if field == "symbol" {
-                    symbol = Some(unquote(&value));
-                } else if field == "period" {
-                    period = Period::parse(&unquote(&value));
-                } else {
-                    eq_column = Some(field);
-                    eq_value = Some(unquote(&value));
-                }
+                continue;
             }
-            if tokens
-                .get(index)
-                .map(|t| t.eq_ignore_ascii_case("and"))
-                .unwrap_or(false)
-            {
-                index += 1;
-            }
+            break;
         }
     }
     let mut limit = 1000;
@@ -614,11 +742,16 @@ fn parse(sql: &str) -> Result<Stmt, SqlError> {
     }
     Ok(Stmt {
         columns,
+        headings,
         aggregates,
+        distinct,
         table,
         alias,
         joins,
-        filters,
+        where_expr,
+        group,
+        having,
+        order,
         symbol,
         period,
         ts_from,
@@ -802,42 +935,9 @@ impl<'a> SqlEngine<'a> {
             cols.extend(right_cols);
             rows = joined;
         }
-        rows.retain(|row| {
-            stmt.filters.iter().all(|(column, value)| {
-                resolve_column(&cols, column)
-                    .ok()
-                    .and_then(|index| row.get(index))
-                    .is_some_and(|cell| cell != SQL_NULL && cell == value)
-            })
-        });
-        for (column, _) in &stmt.filters {
-            resolve_column(&cols, column)?;
-        }
-        rows.truncate(stmt.limit as usize);
-        let selected = if stmt.columns == ["*"] {
-            cols.clone()
-        } else {
-            stmt.columns
-                .iter()
-                .map(|name| resolve_column(&cols, name).map(|index| cols[index].clone()))
-                .collect::<Result<Vec<_>, _>>()?
-        };
-        let indexes = selected
-            .iter()
-            .map(|name| resolve_column(&cols, name))
-            .collect::<Result<Vec<_>, _>>()?;
-        let out = rows
-            .into_iter()
-            .map(|row| {
-                indexes
-                    .iter()
-                    .map(|index| show_cell(&row[*index]))
-                    .collect()
-            })
-            .collect();
         Ok(QueryResult {
-            columns: selected,
-            rows: out,
+            columns: cols,
+            rows,
         })
     }
 
@@ -1308,6 +1408,8 @@ fn clause_word(token: &str) -> bool {
             | "on"
             | "outer"
             | "union"
+            | "having"
+            | "distinct"
     )
 }
 
@@ -1511,6 +1613,398 @@ fn key_of(row: &[String], indexes: &[usize]) -> Option<Vec<String>> {
     Some(key)
 }
 
+struct ScanPush {
+    symbol: Option<String>,
+    period: Option<Period>,
+    ts_from: Option<i64>,
+    ts_to: Option<i64>,
+    eq_column: Option<String>,
+    eq_value: Option<String>,
+}
+
+fn peel_scan_predicates(expr: Expr) -> (Option<Expr>, ScanPush) {
+    let mut push = ScanPush {
+        symbol: None,
+        period: None,
+        ts_from: None,
+        ts_to: None,
+        eq_column: None,
+        eq_value: None,
+    };
+    let residual = peel_expr(&expr, &mut push);
+    (residual, push)
+}
+
+fn peel_expr(expr: &Expr, push: &mut ScanPush) -> Option<Expr> {
+    match expr {
+        Expr::And(items) => {
+            let mut kept = Vec::new();
+            for item in items {
+                if let Some(part) = peel_expr(item, push) {
+                    kept.push(part);
+                }
+            }
+            match kept.len() {
+                0 => None,
+                1 => kept.pop(),
+                _ => Some(Expr::And(kept)),
+            }
+        }
+        Expr::Cmp {
+            column,
+            op: Cmp::Eq,
+            value,
+        } if column == "symbol" => {
+            push.symbol = Some(value.clone());
+            None
+        }
+        Expr::Cmp {
+            column,
+            op: Cmp::Eq,
+            value,
+        } if column == "period" => {
+            push.period = Period::parse(value);
+            None
+        }
+        Expr::Between { column, low, high } if column == "ts" => {
+            push.ts_from = Some(*low);
+            push.ts_to = Some(*high);
+            Some(expr.clone())
+        }
+        Expr::Cmp {
+            column,
+            op: Cmp::Eq,
+            value,
+        } if push.eq_column.is_none() => {
+            push.eq_column = Some(column.clone());
+            push.eq_value = Some(value.clone());
+            Some(expr.clone())
+        }
+        other => Some(other.clone()),
+    }
+}
+
+fn parse_expr(tokens: &[String], index: &mut usize) -> Result<Expr, SqlError> {
+    let mut items = vec![parse_and(tokens, index)?];
+    while tokens
+        .get(*index)
+        .is_some_and(|token| token.eq_ignore_ascii_case("or"))
+    {
+        *index += 1;
+        items.push(parse_and(tokens, index)?);
+    }
+    if items.len() == 1 {
+        Ok(items.pop().unwrap())
+    } else {
+        Ok(Expr::Or(items))
+    }
+}
+
+fn parse_and(tokens: &[String], index: &mut usize) -> Result<Expr, SqlError> {
+    let mut items = vec![parse_pred(tokens, index)?];
+    while tokens
+        .get(*index)
+        .is_some_and(|token| token.eq_ignore_ascii_case("and"))
+    {
+        *index += 1;
+        items.push(parse_pred(tokens, index)?);
+    }
+    if items.len() == 1 {
+        Ok(items.pop().unwrap())
+    } else {
+        Ok(Expr::And(items))
+    }
+}
+
+fn parse_pred(tokens: &[String], index: &mut usize) -> Result<Expr, SqlError> {
+    if tokens.get(*index).is_some_and(|token| token == "(") {
+        *index += 1;
+        let expr = parse_expr(tokens, index)?;
+        expect(tokens, index, ")")?;
+        return Ok(expr);
+    }
+    let column = tokens
+        .get(*index)
+        .ok_or_else(|| SqlError::Syntax("where".into()))?
+        .to_ascii_lowercase();
+    *index += 1;
+    if tokens
+        .get(*index)
+        .is_some_and(|token| token.eq_ignore_ascii_case("is"))
+    {
+        *index += 1;
+        let negated = if tokens
+            .get(*index)
+            .is_some_and(|token| token.eq_ignore_ascii_case("not"))
+        {
+            *index += 1;
+            true
+        } else {
+            false
+        };
+        expect(tokens, index, "null")?;
+        return Ok(Expr::IsNull { column, negated });
+    }
+    if tokens
+        .get(*index)
+        .is_some_and(|token| token.eq_ignore_ascii_case("between"))
+    {
+        *index += 1;
+        let low = parse_i64(
+            tokens
+                .get(*index)
+                .ok_or_else(|| SqlError::Syntax("between".into()))?,
+        )?;
+        *index += 1;
+        expect(tokens, index, "and")?;
+        let high = parse_i64(
+            tokens
+                .get(*index)
+                .ok_or_else(|| SqlError::Syntax("between".into()))?,
+        )?;
+        *index += 1;
+        return Ok(Expr::Between { column, low, high });
+    }
+    let op = parse_cmp(tokens, index)?;
+    let value = unquote(
+        tokens
+            .get(*index)
+            .ok_or_else(|| SqlError::Syntax("value".into()))?,
+    );
+    *index += 1;
+    Ok(Expr::Cmp { column, op, value })
+}
+
+fn parse_cmp(tokens: &[String], index: &mut usize) -> Result<Cmp, SqlError> {
+    let token = tokens
+        .get(*index)
+        .ok_or_else(|| SqlError::Syntax("operator".into()))?;
+    *index += 1;
+    match token.as_str() {
+        "=" => Ok(Cmp::Eq),
+        "<>" | "!=" => Ok(Cmp::Ne),
+        "<" => Ok(Cmp::Lt),
+        "<=" => Ok(Cmp::Le),
+        ">" => Ok(Cmp::Gt),
+        ">=" => Ok(Cmp::Ge),
+        other => Err(SqlError::Syntax(format!("operator {other}"))),
+    }
+}
+
+fn eval_expr(expr: &Expr, columns: &[String], row: &[String]) -> Result<bool, SqlError> {
+    match expr {
+        Expr::And(items) => {
+            for item in items {
+                if !eval_expr(item, columns, row)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+        Expr::Or(items) => {
+            for item in items {
+                if eval_expr(item, columns, row)? {
+                    return Ok(true);
+                }
+            }
+            Ok(false)
+        }
+        Expr::Cmp { column, op, value } => {
+            let cell = cell_at(columns, row, column)?;
+            if cell == SQL_NULL {
+                return Ok(false);
+            }
+            Ok(cmp_values(cell, value, op))
+        }
+        Expr::Between { column, low, high } => {
+            let cell = cell_at(columns, row, column)?;
+            let Ok(number) = cell.parse::<i64>() else {
+                return Ok(false);
+            };
+            Ok(number >= *low && number <= *high)
+        }
+        Expr::IsNull { column, negated } => {
+            let cell = cell_at(columns, row, column)?;
+            Ok((cell == SQL_NULL) != *negated)
+        }
+    }
+}
+
+fn cell_at<'a>(columns: &[String], row: &'a [String], name: &str) -> Result<&'a str, SqlError> {
+    let index = resolve_column(columns, name)?;
+    Ok(row.get(index).map(String::as_str).unwrap_or(""))
+}
+
+fn cmp_values(cell: &str, value: &str, op: &Cmp) -> bool {
+    let ordering = match (cell.parse::<i64>(), value.parse::<i64>()) {
+        (Ok(left), Ok(right)) => left.cmp(&right),
+        _ => cell.cmp(value),
+    };
+    match op {
+        Cmp::Eq => ordering.is_eq(),
+        Cmp::Ne => ordering.is_ne(),
+        Cmp::Lt => ordering.is_lt(),
+        Cmp::Le => ordering.is_le(),
+        Cmp::Gt => ordering.is_gt(),
+        Cmp::Ge => ordering.is_ge(),
+    }
+}
+
+fn project_rows(stmt: &Stmt, result: QueryResult) -> Result<QueryResult, SqlError> {
+    if stmt.columns == ["*"] {
+        return Ok(show_result(result));
+    }
+    let indexes = stmt
+        .columns
+        .iter()
+        .map(|name| resolve_column(&result.columns, name))
+        .collect::<Result<Vec<_>, _>>()?;
+    let rows = result
+        .rows
+        .into_iter()
+        .map(|row| {
+            indexes
+                .iter()
+                .map(|index| show_cell(row.get(*index).map(String::as_str).unwrap_or("")))
+                .collect()
+        })
+        .collect();
+    Ok(QueryResult {
+        columns: stmt.headings.clone(),
+        rows,
+    })
+}
+
+fn show_result(mut result: QueryResult) -> QueryResult {
+    for row in &mut result.rows {
+        for cell in row {
+            if cell == SQL_NULL {
+                cell.clear();
+            }
+        }
+    }
+    result
+}
+
+fn group_rows(stmt: &Stmt, result: QueryResult) -> Result<QueryResult, SqlError> {
+    for name in stmt.columns.iter().filter(|name| !name.contains('(')) {
+        if stmt.group.iter().all(|group| group != name) {
+            return Err(SqlError::Syntax(format!(
+                "column \"{name}\" must appear in GROUP BY"
+            )));
+        }
+    }
+    let mut groups: Vec<(Vec<String>, Vec<Vec<String>>)> = Vec::new();
+    for row in result.rows {
+        let key = stmt
+            .group
+            .iter()
+            .map(|name| {
+                resolve_column(&result.columns, name)
+                    .map(|index| row.get(index).cloned().unwrap_or_default())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some((_, bucket)) = groups.iter_mut().find(|(existing, _)| existing == &key) {
+            bucket.push(row);
+        } else {
+            groups.push((key, vec![row]));
+        }
+    }
+    if groups.is_empty() && stmt.group.is_empty() && !stmt.aggregates.is_empty() {
+        groups.push((Vec::new(), Vec::new()));
+    }
+    let mut rows = Vec::new();
+    for (_, bucket) in groups {
+        let mut out = Vec::new();
+        let mut aggs = stmt.aggregates.iter();
+        for name in &stmt.columns {
+            if name.contains('(') {
+                let agg = aggs
+                    .next()
+                    .ok_or_else(|| SqlError::Syntax("aggregate".into()))?;
+                out.push(aggregate_text(&result.columns, &bucket, agg)?);
+            } else {
+                let index = resolve_column(&result.columns, name)?;
+                out.push(show_cell(
+                    bucket
+                        .first()
+                        .and_then(|row| row.get(index))
+                        .map(String::as_str)
+                        .unwrap_or(""),
+                ));
+            }
+        }
+        rows.push(out);
+    }
+    Ok(QueryResult {
+        columns: stmt.headings.clone(),
+        rows,
+    })
+}
+
+fn aggregate_text(columns: &[String], rows: &[Vec<String>], agg: &Agg) -> Result<String, SqlError> {
+    if rows.is_empty() {
+        return Ok(String::new());
+    }
+    let index = resolve_column(columns, &agg.column)?;
+    let values: Vec<&str> = rows
+        .iter()
+        .filter_map(|row| row.get(index).map(String::as_str))
+        .filter(|value| *value != SQL_NULL)
+        .collect();
+    if agg.func == "count" {
+        return Ok(values.len().to_string());
+    }
+    if values.is_empty() {
+        return Ok(String::new());
+    }
+    let numbers: Vec<i128> = values
+        .iter()
+        .map(|value| {
+            value
+                .parse::<i128>()
+                .map_err(|_| SqlError::Syntax(format!("aggregate {}", agg.func)))
+        })
+        .collect::<Result<_, _>>()?;
+    match agg.func.as_str() {
+        "max" => Ok(numbers.iter().copied().max().unwrap_or(0).to_string()),
+        "min" => Ok(numbers.iter().copied().min().unwrap_or(0).to_string()),
+        "sum" => Ok(numbers.iter().sum::<i128>().to_string()),
+        "avg" => Ok(format_avg(numbers.iter().sum(), numbers.len() as i128)),
+        "first" => Ok(values[0].to_string()),
+        "last" => Ok(values[values.len() - 1].to_string()),
+        other => Err(SqlError::Syntax(format!("aggregate {other}"))),
+    }
+}
+
+fn sort_rows(result: &mut QueryResult, order: &[OrderKey]) -> Result<(), SqlError> {
+    let keys = order
+        .iter()
+        .map(|key| Ok((resolve_column(&result.columns, &key.name)?, key.desc)))
+        .collect::<Result<Vec<_>, _>>()?;
+    result.rows.sort_by(|left, right| {
+        for (index, desc) in &keys {
+            let cmp = cmp_cells(
+                left.get(*index).map(String::as_str).unwrap_or(""),
+                right.get(*index).map(String::as_str).unwrap_or(""),
+            );
+            let cmp = if *desc { cmp.reverse() } else { cmp };
+            if cmp != std::cmp::Ordering::Equal {
+                return cmp;
+            }
+        }
+        std::cmp::Ordering::Equal
+    });
+    Ok(())
+}
+
+fn cmp_cells(left: &str, right: &str) -> std::cmp::Ordering {
+    match (left.parse::<i64>(), right.parse::<i64>()) {
+        (Ok(left), Ok(right)) => left.cmp(&right),
+        _ => left.cmp(right),
+    }
+}
+
 fn tokenize(sql: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut chars = sql.chars().peekable();
@@ -1531,6 +2025,18 @@ fn tokenize(sql: &str) -> Vec<String> {
         }
         if ch == ',' || ch == '(' || ch == ')' || ch == '=' {
             tokens.push(ch.to_string());
+            continue;
+        }
+        if ch == '<' || ch == '>' || ch == '!' {
+            let mut op = String::from(ch);
+            if let Some(next) = chars.peek() {
+                if (*next == '=' && (ch == '<' || ch == '>' || ch == '!'))
+                    || (*next == '>' && ch == '<')
+                {
+                    op.push(chars.next().unwrap());
+                }
+            }
+            tokens.push(op);
             continue;
         }
         let mut word = String::from(ch);

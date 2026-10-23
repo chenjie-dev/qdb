@@ -60,19 +60,19 @@ cargo test --workspace -- --test-threads=1
 
 ## 当前 SQL
 
-只测 [`docs/manual/sql.md`](../../../docs/manual/sql.md) 里已经写明的语法。下面每一条都要有测试名。子查询、`UPDATE`、`DELETE`、`HAVING`、窗口函数、连接上的聚合，断言为失败，不能当成已支持。
+只测 [`docs/manual/sql.md`](../../../docs/manual/sql.md) 里已经写明的语法。下面每一条都要有测试名。子查询、`UPDATE`、`DELETE`、窗口函数、连接上的聚合，断言为失败，不能当成已支持。
 
 | 写法 | 必须碰到的边界 |
 |---|---|
 | `SELECT` 列或 `*` | 缺 `FROM`、未知列、关键字大小写、末尾分号 |
-| `WHERE` | `symbol`、`period` 缺失或未知；`ts BETWEEN` 含两端；`snapshots` 无 `symbol`；`symbols` 忽略 `symbol`；`<`、`OR` 失败 |
-| 聚合 | `MAX` `MIN` `SUM` `AVG` `COUNT` `FIRST` `LAST` 各一次；未知函数失败；空结果是空文本 |
-| `ORDER BY` / `GROUP BY` | 能解析，行序和行数仍是存储顺序 |
+| `WHERE` | `symbol`、`period` 缺失或未知；`ts BETWEEN` 含两端；`snapshots` 无 `symbol`；`symbols` 忽略 `symbol`；`<`、`>`、`<>`、`AND`、`OR`、`IS NULL`；`symbol` 只写在 `OR` 里时 `klines` 失败 |
+| 聚合 | `MAX` `MIN` `SUM` `AVG` `COUNT` `FIRST` `LAST` 各一次；未知函数失败；空结果是空文本；非聚合列不在 `GROUP BY` 里失败 |
+| `ORDER BY` / `GROUP BY` / `HAVING` / `DISTINCT` | `ORDER BY` 在 `LIMIT` 前排序，整数按数值；`GROUP BY` 每个键一行；`HAVING` 过滤分组；`DISTINCT` 去重；`AS` 别名可用于 `ORDER BY` |
 | `LIMIT` | 缺省 1000；`0` 得到空；`100000` 通过；`100001` 失败；缺数字失败 |
 | `SUBSCRIBE` | 只从 `SELECT` 末尾剥掉；`query` 遇到它失败；`SHOW` 末尾失败 |
 | `SHOW` / `DESCRIBE` / `DESC` | 四张行情表和用户表；未知表失败 |
 | `CREATE TABLE` / `INSERT` | 三种类型；空定义、列数不对、类型不对、保留表名、主键冲突失败 |
-| `JOIN` | `INNER`、`LEFT`、`RIGHT`、`FULL`、`CROSS`；`OUTER` 和 `AS`；`ON` 的 `AND`；缺 `ON`、重复别名、`CROSS` 带 `ON`、连接后的 `BETWEEN`、重名列、连接上的聚合都失败；补出来的空列不再匹配空字符串 |
+| `JOIN` | `INNER`、`LEFT`、`RIGHT`、`FULL`、`CROSS`；`OUTER` 和 `AS`；`ON` 的 `AND`；缺 `ON`、重复别名、`CROSS` 带 `ON`、重名列、连接上的聚合都失败；连接后引用不存在的列失败，存在的列可以 `BETWEEN`；补出来的空列不再匹配空字符串 |
 
 ## 写法
 

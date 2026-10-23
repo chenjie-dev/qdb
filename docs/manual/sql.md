@@ -34,10 +34,12 @@ DESC ticks;
 ## 语法
 
 ```text
-SELECT select_list
-FROM table_name
-[WHERE predicate [AND predicate ...]]
-[ORDER BY column]
+SELECT [DISTINCT] select_list
+FROM table_name [join ...]
+[WHERE expr]
+[GROUP BY column [, column ...]]
+[HAVING expr]
+[ORDER BY column [ASC | DESC] [, ...]]
 [LIMIT n]
 [SUBSCRIBE]
 ```
@@ -46,7 +48,17 @@ FROM table_name
 
 `select_list` 是 `*`，或逗号分隔的列名，或聚合 `func(column)`。
 
-`ORDER BY` 和 `GROUP BY` 可以被解析器跳过。结果顺序是存储顺序，不会按 `ORDER BY` 重排。聚合是否生效取决于 `SELECT` 列表里有没有聚合函数，不取决于 `GROUP BY`。
+`ORDER BY` 会按列排序后再套 `LIMIT`。整列都能解析成整数时按数值比，否则按文本比。同一键的先后保持存储顺序。`GROUP BY` 每个分组一行。选择列表里不是聚合的列必须出现在分组键中。没有 `GROUP BY` 的聚合仍然是一行。`HAVING` 在分组之后过滤。`DISTINCT` 去掉重复的结果行。`SELECT 列 AS 别名` 可以给结果列改名，`ORDER BY` 和 `HAVING` 能用这个别名。
+
+`WHERE` 在单表和连接之后都生效，支持 `AND`、`OR`、括号、`=`、`<>`、`!=`、`<`、`<=`、`>`、`>=`、`BETWEEN`、`IS NULL`、`IS NOT NULL`。`OR` 的优先级低于 `AND`。比较两边都是整数时按数值比。
+
+`symbols`、`klines` 上的 `symbol` 和 `period` 仍要写在最外层的 `AND` 里，不能只放在 `OR` 中。`klines.seq` 仍是 `0`。
+
+## 与 PostgreSQL 的差异
+
+已经对齐的是：内连接和外连接、`CROSS JOIN`、`ON` 等值、`WHERE` 的与或和比较、`GROUP BY`、`HAVING`、`DISTINCT`、`ORDER BY` 再 `LIMIT`、列别名。
+
+还没有的是：子查询、`UNION`、`WITH`、窗口函数、`CASE`、四则运算、`LIKE`、`IN`、`UPDATE`、`DELETE`、`information_schema`，以及 PostgreSQL 线协议。连接补出来的空值在结果里是空文本，`IS NULL` 能把它和真正的空字符串分开。`SUBSCRIBE` 的增量仍按到达顺序追加，不按 `ORDER BY` 重排整段输出。
 
 `LIMIT` 缺省 1000，最大 100000。超过上限返回 `limit N exceeds 100000`。截断发生在过滤之后。
 
@@ -138,7 +150,7 @@ WHERE symbol = 'SSE:600000' AND period = '1m'
 
 ## 聚合
 
-聚合只实现在 `klines` 上。多个聚合出现在同一 `SELECT` 列表时，结果是一行。
+聚合可以写在任意单表上，包括用户表。连接上的聚合是语法错误。没有 `GROUP BY` 时，多个聚合合成一行。
 
 | 函数 | 行为 |
 |---|---|

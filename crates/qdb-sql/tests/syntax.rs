@@ -43,11 +43,18 @@ fn select_requires_from_and_rejects_unknown_columns_and_other_operators() {
     assert!(sql
         .query("SELECT * FROM (SELECT * FROM symbols) t")
         .is_err());
+    let under = sql
+        .query("SELECT price FROM ticks WHERE symbol = 'SZSE:000001' AND price < 12")
+        .unwrap();
+    assert_eq!(under.rows, vec![vec!["10".to_string()]]);
+    let either = sql
+        .query(
+            "SELECT price FROM ticks WHERE symbol = 'SZSE:000001' AND (price = 10 OR price = 99)",
+        )
+        .unwrap();
+    assert_eq!(either.rows, vec![vec!["10".to_string()]]);
     assert!(sql
-        .query("SELECT price FROM ticks WHERE symbol = 'SZSE:000001' AND price < 10")
-        .is_err());
-    assert!(sql
-        .query("SELECT price FROM ticks WHERE symbol = 'SZSE:000001' OR price = 10")
+        .query("SELECT close FROM klines WHERE symbol = 'SZSE:000001' OR period = '1s'")
         .is_err());
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -219,43 +226,122 @@ fn join_syntax_covers_outer_and_and_aliases_and_rejects_the_edges() {
     .unwrap();
     SqlEngine::execute(&mut engine, "INSERT INTO tag VALUES (8, '000001')").unwrap();
     SqlEngine::execute(&mut engine, "INSERT INTO tag VALUES (9, '')").unwrap();
-    let sql = SqlEngine::new(&engine);
-    let named = sql
-        .query("SELECT n.id FROM note AS n LEFT OUTER JOIN symbols AS s ON n.code = s.symbol")
-        .unwrap();
-    assert_eq!(named.rows.len(), 2);
-    let both = sql
-        .query("SELECT a.id FROM note a JOIN note b ON a.id = b.id AND a.code = b.code")
-        .unwrap();
-    assert_eq!(both.rows.len(), 2);
-    let padded = sql
+    {
+        let sql = SqlEngine::new(&engine);
+        let named = sql
+            .query("SELECT n.id FROM note AS n LEFT OUTER JOIN symbols AS s ON n.code = s.symbol")
+            .unwrap();
+        assert_eq!(named.rows.len(), 2);
+        let both = sql
+            .query("SELECT a.id FROM note a JOIN note b ON a.id = b.id AND a.code = b.code")
+            .unwrap();
+        assert_eq!(both.rows.len(), 2);
+        let padded = sql
         .query("SELECT n.id, t.id FROM note n LEFT JOIN symbols s ON n.code = s.symbol LEFT JOIN tag t ON s.code = t.label")
         .unwrap();
-    let unmatched = padded.rows.iter().find(|row| row[0] == "2").unwrap();
-    assert_eq!(unmatched[1], "");
-    let matched = padded.rows.iter().find(|row| row[0] == "1").unwrap();
-    assert_eq!(matched[1], "8");
-    assert!(sql.query("SELECT * FROM note n JOIN note m").is_err());
+        let unmatched = padded.rows.iter().find(|row| row[0] == "2").unwrap();
+        assert_eq!(unmatched[1], "");
+        let matched = padded.rows.iter().find(|row| row[0] == "1").unwrap();
+        assert_eq!(matched[1], "8");
+        assert!(sql.query("SELECT * FROM note n JOIN note m").is_err());
+        assert!(sql
+            .query("SELECT * FROM note n JOIN note n ON n.id = n.id")
+            .is_err());
+        assert!(sql
+            .query("SELECT * FROM note n CROSS JOIN note m ON n.id = m.id")
+            .is_err());
+        assert!(sql
+            .query(
+                "SELECT * FROM note n JOIN symbols s ON n.code = s.symbol WHERE ts BETWEEN 1 AND 2"
+            )
+            .is_err());
+        let between = sql
+            .query(
+                "SELECT n.id FROM note n CROSS JOIN tag t WHERE t.id BETWEEN 8 AND 8 AND n.id = 1",
+            )
+            .unwrap();
+        assert_eq!(between.rows, vec![vec!["1".to_string()]]);
+        assert!(sql
+            .query("SELECT max(id) FROM note n JOIN symbols s ON n.code = s.symbol")
+            .is_err());
+        assert!(sql
+            .query("SELECT code FROM note n JOIN symbols s ON n.code = s.symbol")
+            .is_err());
+        let star = sql
+            .query("SELECT * FROM note n CROSS JOIN tag t WHERE n.id = 1 AND t.id = 8")
+            .unwrap();
+        assert!(star.columns.iter().any(|column| column == "n.id"));
+        assert!(star.columns.iter().any(|column| column == "t.label"));
+        assert_eq!(star.rows.len(), 1);
+    }
+    SqlEngine::execute(
+        &mut engine,
+        "INSERT INTO note VALUES (3, 'SZSE:000001', true)",
+    )
+    .unwrap();
+    SqlEngine::execute(
+        &mut engine,
+        "INSERT INTO note VALUES (10, 'SSE:600000', false)",
+    )
+    .unwrap();
+    let sql = SqlEngine::new(&engine);
     assert!(sql
-        .query("SELECT * FROM note n JOIN note n ON n.id = n.id")
+        .query("SELECT code, active FROM note GROUP BY code")
         .is_err());
-    assert!(sql
-        .query("SELECT * FROM note n CROSS JOIN note m ON n.id = m.id")
-        .is_err());
-    assert!(sql
-        .query("SELECT * FROM note n JOIN symbols s ON n.code = s.symbol WHERE ts BETWEEN 1 AND 2")
-        .is_err());
-    assert!(sql
-        .query("SELECT max(id) FROM note n JOIN symbols s ON n.code = s.symbol")
-        .is_err());
-    assert!(sql
-        .query("SELECT code FROM note n JOIN symbols s ON n.code = s.symbol")
-        .is_err());
-    let star = sql
-        .query("SELECT * FROM note n CROSS JOIN tag t WHERE n.id = 1 AND t.id = 8")
+    let grouped = sql
+        .query("SELECT code, count(id) AS n FROM note GROUP BY code HAVING n = 1 ORDER BY code")
         .unwrap();
-    assert!(star.columns.iter().any(|column| column == "n.id"));
-    assert!(star.columns.iter().any(|column| column == "t.label"));
-    assert_eq!(star.rows.len(), 1);
+    assert_eq!(grouped.columns, vec!["code", "n"]);
+    assert_eq!(
+        grouped.rows,
+        vec![
+            vec![String::new(), "1".to_string()],
+            vec!["SSE:600000".to_string(), "1".to_string()]
+        ]
+    );
+    let by_id = sql
+        .query("SELECT id FROM note WHERE id <> 1 AND id != 2 ORDER BY id DESC")
+        .unwrap();
+    assert_eq!(
+        by_id.rows,
+        vec![vec!["10".to_string()], vec!["3".to_string()]]
+    );
+    let precedence = sql
+        .query("SELECT id FROM note WHERE id = 1 OR id = 10 AND active = false ORDER BY id")
+        .unwrap();
+    assert_eq!(
+        precedence.rows,
+        vec![vec!["1".to_string()], vec!["10".to_string()]]
+    );
+    let distinct = sql
+        .query("SELECT DISTINCT active FROM note ORDER BY active DESC")
+        .unwrap();
+    assert_eq!(
+        distinct.rows,
+        vec![vec!["true".to_string()], vec!["false".to_string()]]
+    );
+    let nulls = sql
+        .query("SELECT n.id FROM note n LEFT JOIN symbols s ON n.code = s.symbol WHERE s.symbol IS NULL")
+        .unwrap();
+    assert_eq!(
+        nulls.rows,
+        vec![vec!["2".to_string()], vec!["10".to_string()]]
+    );
+    let blank = sql
+        .query("SELECT t.id FROM note n LEFT JOIN tag t ON n.id = t.id WHERE t.label = ''")
+        .unwrap();
+    assert!(blank.rows.is_empty());
+    let missing = sql
+        .query("SELECT n.id FROM note n LEFT JOIN tag t ON n.id = t.id WHERE t.id IS NULL ORDER BY n.id")
+        .unwrap();
+    assert_eq!(
+        missing.rows,
+        vec![
+            vec!["1".to_string()],
+            vec!["2".to_string()],
+            vec!["3".to_string()],
+            vec!["10".to_string()]
+        ]
+    );
     let _ = std::fs::remove_dir_all(dir);
 }

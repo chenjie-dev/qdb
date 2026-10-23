@@ -28,7 +28,7 @@
 - 价格是调用方缩放后的整数。`price_scale` 不参与计算。
 - 已闭合 K 线只追加。修正已闭合 K 线的接口还没有。
 - 早于当前桶的成交进入 `ticks`，不进入 K 线。
-- SQL 的 `ORDER BY` 不改变行序。`GROUP BY` 不产生分组。
+- SQL 的 `ORDER BY` 在 `LIMIT` 之前排序。`GROUP BY` 每个分组键一行。单表扫描最多 100000 行。
 - `klines` 的 SQL `seq` 列恒为 `0`。
 - `symbols.exchange` 是调用方标签。内部编号在 `exchange_id` 和 `symbol_id`。展示代码在 `symbol`。
 - 同一 `seq` 的多帧里，续传只交付过滤后的第一条。
