@@ -560,7 +560,11 @@ pub fn apply_quotes(
         );
         n += 1;
     }
-    guard.flush().map_err(|e| e.to_string())?;
+    // 先放 live，避免与只读路径双锁交错；盘中报价默认不 fsync（QDB_QUOTE_FLUSH=1 才刷）
+    drop(book);
+    if std::env::var("QDB_QUOTE_FLUSH").ok().as_deref() == Some("1") {
+        guard.flush().map_err(|e| e.to_string())?;
+    }
     Ok(format!("{{\"written\":{n}}}"))
 }
 
@@ -589,16 +593,24 @@ pub fn doc_json(docs: &HashMap<String, Value>, key: &str) -> Option<String> {
     docs.get(key).map(|v| v.to_string())
 }
 
+/// `limit`：只返回窗口内最后 N 根（主流行情台首屏/翻页）；`None` 保持全量兼容。
+/// `end_ns`：只保留 `bucket_start_ns <= end_ns` 的桶（用于 `endTime` 向前翻页）。
 pub fn klines_json(
     engine: &Mutex<Engine>,
     symbol: &str,
     period_name: &str,
+    limit: Option<usize>,
+    end_ns: Option<u64>,
 ) -> Result<String, String> {
     let period =
         Period::parse(period_name).ok_or_else(|| format!("unknown period {period_name}"))?;
-    let guard = engine.lock().map_err(|_| "engine lock".to_string())?;
-    let id = guard.resolve(symbol).map_err(|e| e.to_string())?;
-    let rows = guard.klines(id, period);
+    let end_i = end_ns.map(|end| end.min(i64::MAX as u64) as i64);
+    // 拷完窗口立刻放锁，避免序列化时堵住 collector 写入（切换标的体感卡顿的主因）
+    let rows = {
+        let guard = engine.lock().map_err(|_| "engine lock".to_string())?;
+        let id = guard.resolve(symbol).map_err(|e| e.to_string())?;
+        guard.klines_window(id, period, limit, end_i)
+    };
     let mut body = format!(
         "{{\"symbol\":\"{symbol}\",\"period\":\"{}\",\"scale\":{PRICE_SCALE},\"data\":[",
         period.as_str()

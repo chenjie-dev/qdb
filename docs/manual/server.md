@@ -32,7 +32,7 @@ QDB_HTTP_PORT=19090 cargo run -p qdb-server --bin qdb -- /var/lib/qdb
 
 ### POST /v1/quotes
 
-JSON：`{"items":[{"exchange":"SSE","code":"600519","ts_ns":1,"last":13250000,"price":1325.0,"open":1322.5,"high":1348.6,"low":1321.0,"pre_close":1329.0,"volume":1,"amount":1,"name":"贵州茅台"}]}`。`last` 是按 10000 倍缩放的整数。成功正文 `{"written":N}`。
+JSON：`{"items":[{"exchange":"SSE","code":"600519","ts_ns":1,"last":13250000,"price":1325.0,"open":1322.5,"high":1348.6,"low":1321.0,"pre_close":1329.0,"volume":1,"amount":1,"name":"贵州茅台"}]}`。`last` 是按 10000 倍缩放的整数。成功正文 `{"written":N}`。这次请求默认不 `fsync`，记录随组提交（256 条或 1 毫秒）落盘。`QDB_QUOTE_FLUSH=1` 时，应答前刷盘。
 
 ### POST /v1/trades
 
@@ -49,6 +49,13 @@ JSON：`{"items":[{"key":"binance:ticker:BTCUSDT","value":{}}]}`。值原样保�
 ### GET /v1/klines?symbol=SSE:600519&period=1d
 
 `period` 取 `1s` `1m` `5m` `15m` `1h` `4h` `1d`。`state` 为 0 表示未闭合。价格已按 `scale` 还原成十进制。
+
+可选查询参数（窗口读，少传则行为与旧版一致）：
+
+| 参数 | 含义 |
+|---|---|
+| `limit` | 只返回满足条件的**最后** N 根（上限 5000） |
+| `endTime` | 毫秒；只保留 `bucket_open_ms <= endTime` 的桶，用于向前翻历史 |
 
 ### GET /v1/ws?db=
 

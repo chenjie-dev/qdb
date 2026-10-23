@@ -1036,7 +1036,18 @@ fn handle(
             .into_iter()
             .next()
             .unwrap_or_else(|| "1d".into());
-        return match klines_json(&engine, &symbol, &period) {
+        // limit / endTime(ms)：窗口读，避免一次吐全历史（对齐币安 klines 翻页）
+        let limit = query_param(query, "limit")
+            .into_iter()
+            .next()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|n| n.min(5_000));
+        let end_ns = query_param(query, "endTime")
+            .into_iter()
+            .next()
+            .and_then(|s| s.parse::<u64>().ok())
+            .map(|ms| ms.saturating_mul(1_000_000));
+        return match klines_json(&engine, &symbol, &period, limit, end_ns) {
             Ok(body) => write_http(&mut stream, 200, "application/json", &body),
             Err(err) => write_http(
                 &mut stream,

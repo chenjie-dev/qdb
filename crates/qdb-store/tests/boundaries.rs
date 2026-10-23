@@ -293,6 +293,28 @@ fn read_only_rejects_writes_and_a_cursor_past_the_wal_is_rejected() {
 }
 
 #[test]
+fn kline_window_keeps_the_latest_bars_up_to_end_ns() {
+    let dir = temp("kwin");
+    let mut engine = Engine::open(&dir).unwrap();
+    engine.write_trade("SSE", "600000", utc(0), 10, 1).unwrap();
+    engine.write_trade("SSE", "600000", utc(1), 11, 1).unwrap();
+    engine.write_trade("SSE", "600000", utc(2), 12, 1).unwrap();
+    let id = engine.resolve("SSE:600000").unwrap();
+    assert_eq!(engine.klines(id, Period::M1).len(), 3);
+    let last = engine.klines_window(id, Period::M1, Some(2), None);
+    assert_eq!(last.len(), 2);
+    assert_eq!(last[0].open, 11);
+    assert_eq!(last[1].open, 12);
+    let early = engine.klines_window(id, Period::M1, None, Some(utc(1)));
+    assert!(early.iter().all(|bar| bar.bucket_start_ns <= utc(1)));
+    assert!(early.iter().all(|bar| bar.open != 12));
+    assert!(engine
+        .klines_window(id, Period::M1, Some(0), None)
+        .is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn one_group_commit_beats_one_fsync_per_trade() {
     const N: i64 = 48;
     let single = time_trades(false, N);

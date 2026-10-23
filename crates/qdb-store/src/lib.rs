@@ -605,11 +605,75 @@ impl Engine {
     ///
     /// 没有数据时返回空向量。
     pub fn klines(&self, symbol_id: u32, period: Period) -> Vec<KlineBody> {
-        let mut rows = self.agg.sealed(symbol_id, period).to_vec();
-        if let Some(open) = self.agg.open_bar(symbol_id, period) {
-            rows.push(open.body);
+        self.klines_window(symbol_id, period, None, None)
+    }
+
+    /// 按时间窗口读取 K 线，只拷贝需要的尾部。
+    ///
+    /// 先丢掉 `bucket_start_ns` 晚于 `end_ns` 的桶，再取最后 `limit` 根。未闭合桶在窗口内时附在最后。不写 WAL。
+    ///
+    /// # Arguments
+    ///
+    /// * `symbol_id` - 证券编号。
+    /// * `period` - `1s`、`1m`、`5m`、`15m`、`1h`、`4h` 或 `1d`。
+    /// * `limit` - 最多返回多少根。`None` 表示不截断。`Some(0)` 返回空。
+    /// * `end_ns` - 桶起点的上限，UTC 纳秒，含该时刻。`None` 表示不截断。
+    ///
+    /// # Returns
+    ///
+    /// 按桶起点从早到晚。没有数据时返回空向量。
+    pub fn klines_window(
+        &self,
+        symbol_id: u32,
+        period: Period,
+        limit: Option<usize>,
+        end_ns: Option<i64>,
+    ) -> Vec<KlineBody> {
+        let sealed = self.agg.sealed(symbol_id, period);
+        let end_i = end_ns.unwrap_or(i64::MAX);
+        let end_idx = sealed.partition_point(|row| row.bucket_start_ns <= end_i);
+        let prefix = &sealed[..end_idx];
+        let open = self
+            .agg
+            .open_bar(symbol_id, period)
+            .map(|bar| bar.body)
+            .filter(|body| body.bucket_start_ns <= end_i);
+
+        match limit {
+            None => {
+                let mut rows = prefix.to_vec();
+                if let Some(body) = open {
+                    if rows
+                        .last()
+                        .map(|r| r.bucket_start_ns != body.bucket_start_ns)
+                        .unwrap_or(true)
+                    {
+                        rows.push(body);
+                    }
+                }
+                rows
+            }
+            Some(0) => Vec::new(),
+            Some(n) => {
+                // 需要含未闭合桶时，先从 sealed 取 n-1，再追加 open
+                let take_sealed = if open.is_some() { n.saturating_sub(1) } else { n };
+                let start = prefix.len().saturating_sub(take_sealed);
+                let mut rows = prefix[start..].to_vec();
+                if let Some(body) = open {
+                    if rows
+                        .last()
+                        .map(|r| r.bucket_start_ns != body.bucket_start_ns)
+                        .unwrap_or(true)
+                    {
+                        rows.push(body);
+                    }
+                    if rows.len() > n {
+                        rows.remove(0);
+                    }
+                }
+                rows
+            }
         }
-        rows
     }
 
     /// 把 `交易所:代码` 或唯一的裸代码解析成证券编号。
