@@ -47,7 +47,7 @@ cargo test --workspace -- --test-threads=1
 | 多库 | 非法库名、重名、库之间成交隔离、根目录已有 WAL 仍是 `default` |
 | 转储恢复回放 | 空库才能恢复、坏魔数或坏 CRC 被拒绝、半截转储不算损坏、恢复后的成交和 K 线与转储前一致、回放不改写源库 |
 | 建表 | 只接受 INT64、STRING、BOOL；重名表、未知类型、主键冲突失败；复合主键按整行判重；索引等值查找不带回其他行；字符串 1024 字节通过、1025 失败；重启后表和行还在 |
-| SQL | 示例查询、聚合、歧义代码、缺条件、超限、BETWEEN 含端点；`ORDER BY` 和 `GROUP BY` 不改变存储顺序；`klines.seq` 恒为 `0`；`INNER`/`LEFT`/`RIGHT`/`FULL`/`CROSS JOIN` 的匹配和空列 |
+| SQL | 见下面「当前 SQL」。改语法时先改那一节，再补对应测试 |
 | 订阅 | 过滤、有序续传、序号空洞得到 Gap、未知代码失败 |
 | 复制 | 复制 ID 对得上只发增量，对不上从 0 全量；偏移超过已落盘位置被拒绝；更高任期停止旧写入者；只读打开拒绝再写 |
 | 可见性 | 门闩打开后，只读打开看不到还没 `publish_visible` 的成交；发布到较早偏移时，更晚的成交仍不可见 |
@@ -57,6 +57,22 @@ cargo test --workspace -- --test-threads=1
 | 实例 | 同一把实例锁上，第二个 qdb 进程启动失败，且不会先打开库 |
 | 行情中心 | 组提交在 flush 前不增加落盘次数；五档报价往返；from_seq=0 返回当前快照；检查点之后前缀损坏仍能打开 |
 | 退出 | `release` 后内存表为空，WAL 仍能再打开；SIGTERM 后进程退出并打印已释放内存 |
+
+## 当前 SQL
+
+只测 [`docs/manual/sql.md`](../../../docs/manual/sql.md) 里已经写明的语法。下面每一条都要有测试名。子查询、`UPDATE`、`DELETE`、`HAVING`、窗口函数、连接上的聚合，断言为失败，不能当成已支持。
+
+| 写法 | 必须碰到的边界 |
+|---|---|
+| `SELECT` 列或 `*` | 缺 `FROM`、未知列、关键字大小写、末尾分号 |
+| `WHERE` | `symbol`、`period` 缺失或未知；`ts BETWEEN` 含两端；`snapshots` 无 `symbol`；`symbols` 忽略 `symbol`；`<`、`OR` 失败 |
+| 聚合 | `MAX` `MIN` `SUM` `AVG` `COUNT` `FIRST` `LAST` 各一次；未知函数失败；空结果是空文本 |
+| `ORDER BY` / `GROUP BY` | 能解析，行序和行数仍是存储顺序 |
+| `LIMIT` | 缺省 1000；`0` 得到空；`100000` 通过；`100001` 失败；缺数字失败 |
+| `SUBSCRIBE` | 只从 `SELECT` 末尾剥掉；`query` 遇到它失败；`SHOW` 末尾失败 |
+| `SHOW` / `DESCRIBE` / `DESC` | 四张行情表和用户表；未知表失败 |
+| `CREATE TABLE` / `INSERT` | 三种类型；空定义、列数不对、类型不对、保留表名、主键冲突失败 |
+| `JOIN` | `INNER`、`LEFT`、`RIGHT`、`FULL`、`CROSS`；`OUTER` 和 `AS`；`ON` 的 `AND`；缺 `ON`、重复别名、`CROSS` 带 `ON`、连接后的 `BETWEEN`、重名列、连接上的聚合都失败；补出来的空列不再匹配空字符串 |
 
 ## 写法
 

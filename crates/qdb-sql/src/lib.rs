@@ -483,6 +483,13 @@ fn parse(sql: &str) -> Result<Stmt, SqlError> {
             .to_ascii_lowercase();
         index += 1;
         let join_alias = take_alias(&tokens, &mut index, &join_table)?;
+        if kind == JoinKind::Cross
+            && tokens
+                .get(index)
+                .is_some_and(|token| token.eq_ignore_ascii_case("on"))
+        {
+            return Err(SqlError::Syntax("cross join cannot have on".into()));
+        }
         let mut on = Vec::new();
         if kind != JoinKind::Cross {
             expect(&tokens, &mut index, "on")?;
@@ -1339,12 +1346,6 @@ fn take_join_kind(tokens: &[String], index: &mut usize) -> Result<Option<JoinKin
         "cross" => {
             *index += 1;
             expect(tokens, index, "join")?;
-            if tokens
-                .get(*index)
-                .is_some_and(|token| token.eq_ignore_ascii_case("on"))
-            {
-                return Err(SqlError::Syntax("cross join cannot have on".into()));
-            }
             Ok(Some(JoinKind::Cross))
         }
         _ => Ok(None),
