@@ -459,7 +459,29 @@ group       = ident { "," ident }
 order       = ident ["ASC" | "DESC"] { "," ident ["ASC" | "DESC"] }
 ```
 
-不支持 `JOIN`、子查询、`HAVING`、窗口函数、`INSERT`、`UPDATE`、`DELETE`。写入只来自行情流和恢复，不来自 SQL。
+不支持子查询、`HAVING`、窗口函数、`UPDATE`、`DELETE`。`JOIN` 见下一节。写入只来自行情流、恢复和 `INSERT`，不来自 `UPDATE`。
+
+`FROM` 之后可以接 PostgreSQL 风格的连接。`JOIN` 与 `INNER JOIN` 相同，只保留两边都匹配的行。`LEFT JOIN` 保留左表全部行，右边没有匹配时那些列为空文本。`RIGHT JOIN` 相反。`FULL JOIN` 两边都保留。`ON` 是等值条件，多个条件用 `AND`。`NULL` 不等于 `NULL`，空文本对空文本仍然相等。结果先按左表顺序，再补上没有配上的右表行。多表时 `*` 的列名是 `别名.列名`。不支持连接上的聚合。
+
+```text
+from_item   = table [alias] { join }
+join        = ["INNER"] "JOIN" table [alias] "ON" eq { "AND" eq }
+            | "LEFT" ["OUTER"] "JOIN" table [alias] "ON" eq { "AND" eq }
+            | "RIGHT" ["OUTER"] "JOIN" table [alias] "ON" eq { "AND" eq }
+            | "FULL" ["OUTER"] "JOIN" table [alias] "ON" eq { "AND" eq }
+            | "CROSS" "JOIN" table [alias]
+alias       = ["AS"] ident
+eq          = qual "=" qual
+qual        = ident "." ident
+```
+
+```sql
+SELECT s.code, n.id
+FROM symbols AS s
+INNER JOIN note AS n ON s.code = n.code
+WHERE n.active = true
+LIMIT 100;
+```
 
 标识符和字符串用单引号字面量。绑定参数放到后续协议阶段；第一版 SQL 文本里直接写字面量。
 

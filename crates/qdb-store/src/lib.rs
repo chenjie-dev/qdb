@@ -656,7 +656,11 @@ impl Engine {
             Some(0) => Vec::new(),
             Some(n) => {
                 // 需要含未闭合桶时，先从 sealed 取 n-1，再追加 open
-                let take_sealed = if open.is_some() { n.saturating_sub(1) } else { n };
+                let take_sealed = if open.is_some() {
+                    n.saturating_sub(1)
+                } else {
+                    n
+                };
                 let start = prefix.len().saturating_sub(take_sealed);
                 let mut rows = prefix[start..].to_vec();
                 if let Some(body) = open {

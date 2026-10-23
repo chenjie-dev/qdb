@@ -2,7 +2,7 @@
 
 `qdb_sql::SqlEngine` 执行一条只读语句，返回列名和字符串行。没有预编译语句，没有参数绑定。标识符和关键字不区分大小写，字符串用单引号。
 
-本版本没有 `INSERT`、`UPDATE`、`DELETE`、`JOIN`、子查询和函数嵌套。写入走 [库接口](library.md)。
+本版本没有 `UPDATE`、`DELETE`、子查询和函数嵌套。写入走 [库接口](library.md)，用户表也可以 `INSERT`。表和表用 `JOIN` 连接，规则与 PostgreSQL 的内连接和外连接相同。
 
 ## 建表
 
@@ -49,6 +49,31 @@ FROM table_name
 `ORDER BY` 和 `GROUP BY` 可以被解析器跳过。结果顺序是存储顺序，不会按 `ORDER BY` 重排。聚合是否生效取决于 `SELECT` 列表里有没有聚合函数，不取决于 `GROUP BY`。
 
 `LIMIT` 缺省 1000，最大 100000。超过上限返回 `limit N exceeds 100000`。截断发生在过滤之后。
+
+## 关联
+
+`JOIN` 写在 `FROM` 后面、`WHERE` 前面。可以连多张表，包括 `symbols`、`ticks`、`snapshots`、`klines` 和用户表。
+
+| 写法 | 结果 |
+|---|---|
+| `JOIN`、`INNER JOIN` | 只留下 `ON` 配得上的行 |
+| `LEFT JOIN` | 留下左表全部行。右边没有匹配时，右边的列是空文本 |
+| `RIGHT JOIN` | 留下右表全部行。左边没有匹配时，左边的列是空文本 |
+| `FULL JOIN` | 两边没有匹配的行都留下，缺的一侧是空文本 |
+| `CROSS JOIN` | 两表每一行相乘，不写 `ON` |
+
+`OUTER` 可以写在 `LEFT`、`RIGHT`、`FULL` 后面，也可以不写。`ON` 只接受 `别名.列 = 别名.列`，多个条件用 `AND`。空文本和空文本相等。没有匹配而补出来的空列不再参与后面的等值，和 PostgreSQL 里 `NULL` 不匹配 `NULL` 一样。
+
+表名后面可以写别名：`note AS n` 或 `note n`。同一条语句里别名不能重复。
+
+多表时 `SELECT *` 的列名是 `别名.列名`。点名一列时写成 `n.id`；如果这个列名只在一张表里出现，也可以写 `id`。重名又不加前缀是语法错误。`WHERE` 在连接完成之后过滤。连接上不能写聚合。
+
+```sql
+SELECT s.code, n.id
+FROM symbols s
+JOIN note n ON s.code = n.code
+WHERE n.active = true;
+```
 
 `WHERE` 支持：
 

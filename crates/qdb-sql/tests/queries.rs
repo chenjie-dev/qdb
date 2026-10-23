@@ -79,7 +79,11 @@ fn order_and_group_keep_storage_order_and_kline_seq_is_zero() {
         .query("SELECT price FROM ticks WHERE symbol = 'SZSE:000001' ORDER BY price DESC")
         .unwrap();
     assert_eq!(
-        ordered.rows.iter().map(|row| row[0].as_str()).collect::<Vec<_>>(),
+        ordered
+            .rows
+            .iter()
+            .map(|row| row[0].as_str())
+            .collect::<Vec<_>>(),
         vec!["10", "11"]
     );
     let grouped = sql
@@ -90,6 +94,73 @@ fn order_and_group_keep_storage_order_and_kline_seq_is_zero() {
         .query("SELECT seq FROM klines WHERE symbol = 'SZSE:000001' AND period = '1s'")
         .unwrap();
     assert!(seq.rows.iter().all(|row| row[0] == "0"));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn joins_follow_postgresql_inner_outer_and_cross() {
+    let (dir, mut engine) = sample();
+    qdb_sql::SqlEngine::execute(
+        &mut engine,
+        "CREATE TABLE note (id INT64 PRIMARY KEY, code STRING, active BOOL)",
+    )
+    .unwrap();
+    qdb_sql::SqlEngine::execute(
+        &mut engine,
+        "INSERT INTO note VALUES (1, 'SZSE:000001', true)",
+    )
+    .unwrap();
+    qdb_sql::SqlEngine::execute(
+        &mut engine,
+        "INSERT INTO note VALUES (2, 'SSE:600000', false)",
+    )
+    .unwrap();
+    let sql = qdb_sql::SqlEngine::new(&engine);
+    let inner = sql
+        .query("SELECT n.id, s.symbol FROM symbols s JOIN note n ON s.symbol = n.code")
+        .unwrap();
+    assert_eq!(inner.columns, vec!["n.id", "s.symbol"]);
+    assert_eq!(
+        inner.rows,
+        vec![vec!["1".to_string(), "SZSE:000001".to_string()]]
+    );
+    let left = sql
+        .query("SELECT n.id, s.code FROM note n LEFT JOIN symbols s ON n.code = s.symbol")
+        .unwrap();
+    assert_eq!(left.rows.len(), 2);
+    assert!(left
+        .rows
+        .iter()
+        .any(|row| row == &vec!["2".to_string(), String::new()]));
+    let right = sql
+        .query("SELECT n.id FROM note n RIGHT JOIN symbols s ON n.code = s.symbol")
+        .unwrap();
+    assert_eq!(right.rows.len(), 1);
+    assert_eq!(right.rows[0][0], "1");
+    let full = sql
+        .query(
+            "SELECT n.id, s.symbol_id FROM note n FULL OUTER JOIN symbols s ON n.code = s.symbol",
+        )
+        .unwrap();
+    assert_eq!(full.rows.len(), 2);
+    assert!(full
+        .rows
+        .iter()
+        .any(|row| row[0].is_empty() || row[1].is_empty()));
+    let cross = sql
+        .query("SELECT n.id, s.symbol_id FROM note n CROSS JOIN symbols s")
+        .unwrap();
+    assert_eq!(cross.rows.len(), 2);
+    let filtered = sql
+        .query("SELECT n.id FROM symbols s INNER JOIN note n ON s.symbol = n.code WHERE n.active = true")
+        .unwrap();
+    assert_eq!(filtered.rows, vec![vec!["1".to_string()]]);
+    assert!(sql
+        .query("SELECT code FROM note n JOIN symbols s ON n.code = s.symbol")
+        .is_err());
+    assert!(sql
+        .query("SELECT count(id) FROM note n JOIN symbols s ON n.code = s.symbol")
+        .is_err());
     let _ = std::fs::remove_dir_all(dir);
 }
 

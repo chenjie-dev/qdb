@@ -240,23 +240,14 @@ fn composite_primary_key_is_the_whole_key_and_bool_roundtrips() {
         })
         .unwrap();
     engine
-        .insert_row(
-            "pos",
-            &[Cell::Int64(1), Cell::Int64(1), Cell::Bool(true)],
-        )
+        .insert_row("pos", &[Cell::Int64(1), Cell::Int64(1), Cell::Bool(true)])
         .unwrap();
     engine
-        .insert_row(
-            "pos",
-            &[Cell::Int64(1), Cell::Int64(2), Cell::Bool(false)],
-        )
+        .insert_row("pos", &[Cell::Int64(1), Cell::Int64(2), Cell::Bool(false)])
         .unwrap();
     assert!(matches!(
         engine
-            .insert_row(
-                "pos",
-                &[Cell::Int64(1), Cell::Int64(1), Cell::Bool(false)],
-            )
+            .insert_row("pos", &[Cell::Int64(1), Cell::Int64(1), Cell::Bool(false)],)
             .unwrap_err(),
         StoreError::DuplicateKey
     ));
@@ -271,9 +262,7 @@ fn composite_primary_key_is_the_whole_key_and_bool_roundtrips() {
 fn read_only_rejects_writes_and_a_cursor_past_the_wal_is_rejected() {
     let dir = temp("ro");
     let mut engine = Engine::open(&dir).unwrap();
-    engine
-        .write_trade("SSE", "600000", 1, i64::MAX, 3)
-        .unwrap();
+    engine.write_trade("SSE", "600000", 1, i64::MAX, 3).unwrap();
     let id = engine.resolve("SSE:600000").unwrap();
     assert_eq!(engine.ticks(id)[0].amount, i64::MAX);
     let past = engine.durable_offset() + 1;

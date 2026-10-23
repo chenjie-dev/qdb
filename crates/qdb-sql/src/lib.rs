@@ -86,7 +86,7 @@ impl<'a> SqlEngine<'a> {
     /// 执行 `SELECT`、`SHOW` 或 `DESCRIBE`。不写 WAL。
     ///
     /// `ORDER BY` 可以被解析，结果仍按存储顺序返回。`LIMIT` 不能超过 100000。
-    /// 不带 `symbol` 的 `ticks` 会多一列 `symbol`。
+    /// 不带 `symbol` 的 `ticks` 会多一列 `symbol`。`JOIN` 按 PostgreSQL 的内连接和外连接匹配，多表时列名是 `别名.列名`。
     ///
     /// # Arguments
     ///
@@ -129,6 +129,14 @@ impl<'a> SqlEngine<'a> {
     fn execute_stmt(&self, stmt: &Stmt) -> Result<QueryResult, SqlError> {
         if stmt.limit > 100_000 {
             return Err(SqlError::Limit(stmt.limit));
+        }
+        if !stmt.joins.is_empty() {
+            if !stmt.aggregates.is_empty() {
+                return Err(SqlError::Syntax(
+                    "aggregate is not supported on join".into(),
+                ));
+            }
+            return self.query_joined(stmt);
         }
         match stmt.table.as_str() {
             "klines" => self.query_klines(stmt),
@@ -200,7 +208,11 @@ pub fn live_rows(
     seen: &[Vec<String>],
 ) -> Result<Vec<Vec<String>>, SqlError> {
     let stmt = parse(sql)?;
-    if !stmt.aggregates.is_empty() || stmt.table == "symbols" || !builtin_table(&stmt.table) {
+    if !stmt.joins.is_empty()
+        || !stmt.aggregates.is_empty()
+        || stmt.table == "symbols"
+        || !builtin_table(&stmt.table)
+    {
         let mut wide = stmt.clone();
         wide.limit = 100_000;
         let rows = SqlEngine::new(engine).execute_stmt(&wide)?.rows;
@@ -373,11 +385,31 @@ fn kline_live_rows(engine: &Engine, stmt: &Stmt, change: &qdb_store::Change) -> 
     rows
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JoinKind {
+    Inner,
+    Left,
+    Right,
+    Full,
+    Cross,
+}
+
+#[derive(Clone)]
+struct JoinItem {
+    kind: JoinKind,
+    table: String,
+    alias: String,
+    on: Vec<(String, String)>,
+}
+
 #[derive(Clone)]
 struct Stmt {
     columns: Vec<String>,
     aggregates: Vec<Agg>,
     table: String,
+    alias: String,
+    joins: Vec<JoinItem>,
+    filters: Vec<(String, String)>,
     symbol: Option<String>,
     period: Option<Period>,
     ts_from: Option<i64>,
@@ -442,12 +474,58 @@ fn parse(sql: &str) -> Result<Stmt, SqlError> {
         .ok_or_else(|| SqlError::Syntax("table".into()))?
         .to_ascii_lowercase();
     index += 1;
+    let alias = take_alias(&tokens, &mut index, &table)?;
+    let mut joins = Vec::new();
+    while let Some(kind) = take_join_kind(&tokens, &mut index)? {
+        let join_table = tokens
+            .get(index)
+            .ok_or_else(|| SqlError::Syntax("table".into()))?
+            .to_ascii_lowercase();
+        index += 1;
+        let join_alias = take_alias(&tokens, &mut index, &join_table)?;
+        let mut on = Vec::new();
+        if kind != JoinKind::Cross {
+            expect(&tokens, &mut index, "on")?;
+            loop {
+                let left = tokens
+                    .get(index)
+                    .ok_or_else(|| SqlError::Syntax("on".into()))?
+                    .to_ascii_lowercase();
+                index += 1;
+                expect(&tokens, &mut index, "=")?;
+                let right = tokens
+                    .get(index)
+                    .ok_or_else(|| SqlError::Syntax("on".into()))?
+                    .to_ascii_lowercase();
+                index += 1;
+                on.push((left, right));
+                if tokens
+                    .get(index)
+                    .is_some_and(|token| token.eq_ignore_ascii_case("and"))
+                {
+                    index += 1;
+                    continue;
+                }
+                break;
+            }
+            if on.is_empty() {
+                return Err(SqlError::Syntax("on".into()));
+            }
+        }
+        joins.push(JoinItem {
+            kind,
+            table: join_table,
+            alias: join_alias,
+            on,
+        });
+    }
     let mut symbol = None;
     let mut period = None;
     let mut ts_from = None;
     let mut ts_to = None;
     let mut eq_column = None;
     let mut eq_value = None;
+    let mut filters = Vec::new();
     if tokens
         .get(index)
         .map(|t| t.eq_ignore_ascii_case("where"))
@@ -483,6 +561,11 @@ fn parse(sql: &str) -> Result<Stmt, SqlError> {
                         .ok_or_else(|| SqlError::Syntax("between".into()))?,
                 )?;
                 index += 1;
+                if !joins.is_empty() {
+                    return Err(SqlError::Syntax(
+                        "between is not supported after join".into(),
+                    ));
+                }
                 if field == "ts" {
                     ts_from = Some(from);
                     ts_to = Some(to);
@@ -494,7 +577,9 @@ fn parse(sql: &str) -> Result<Stmt, SqlError> {
                     .ok_or_else(|| SqlError::Syntax("value".into()))?
                     .clone();
                 index += 1;
-                if field == "symbol" {
+                if !joins.is_empty() {
+                    filters.push((field, unquote(&value)));
+                } else if field == "symbol" {
                     symbol = Some(unquote(&value));
                 } else if field == "period" {
                     period = Period::parse(&unquote(&value));
@@ -524,6 +609,9 @@ fn parse(sql: &str) -> Result<Stmt, SqlError> {
         columns,
         aggregates,
         table,
+        alias,
+        joins,
+        filters,
         symbol,
         period,
         ts_from,
@@ -683,6 +771,78 @@ impl<'a> SqlEngine<'a> {
             )
             .map_err(map_store)?;
         Ok(QueryResult { columns, rows })
+    }
+
+    fn query_joined(&self, stmt: &Stmt) -> Result<QueryResult, SqlError> {
+        let mut names = Vec::new();
+        names.push(stmt.alias.clone());
+        for join in &stmt.joins {
+            if names.iter().any(|name| name == &join.alias) {
+                return Err(SqlError::Syntax(format!(
+                    "table name \"{}\" specified more than once",
+                    join.alias
+                )));
+            }
+            names.push(join.alias.clone());
+        }
+        let base = self.load_rel(&stmt.table)?;
+        let mut cols = qualify(&stmt.alias, &base.columns);
+        let mut rows = base.rows;
+        for join in &stmt.joins {
+            let right = self.load_rel(&join.table)?;
+            let right_cols = qualify(&join.alias, &right.columns);
+            let joined = apply_join(&cols, &rows, join, &right_cols, &right.rows)?;
+            cols.extend(right_cols);
+            rows = joined;
+        }
+        rows.retain(|row| {
+            stmt.filters.iter().all(|(column, value)| {
+                resolve_column(&cols, column)
+                    .ok()
+                    .and_then(|index| row.get(index))
+                    .is_some_and(|cell| cell != SQL_NULL && cell == value)
+            })
+        });
+        for (column, _) in &stmt.filters {
+            resolve_column(&cols, column)?;
+        }
+        rows.truncate(stmt.limit as usize);
+        let selected = if stmt.columns == ["*"] {
+            cols.clone()
+        } else {
+            stmt.columns
+                .iter()
+                .map(|name| resolve_column(&cols, name).map(|index| cols[index].clone()))
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        let indexes = selected
+            .iter()
+            .map(|name| resolve_column(&cols, name))
+            .collect::<Result<Vec<_>, _>>()?;
+        let out = rows
+            .into_iter()
+            .map(|row| {
+                indexes
+                    .iter()
+                    .map(|index| show_cell(&row[*index]))
+                    .collect()
+            })
+            .collect();
+        Ok(QueryResult {
+            columns: selected,
+            rows: out,
+        })
+    }
+
+    fn load_rel(&self, table: &str) -> Result<LoadedRel, SqlError> {
+        if self.engine.table_schema(table).is_none() {
+            return Err(SqlError::Syntax(format!("unknown table {table}")));
+        }
+        let (columns, rows) = self
+            .engine
+            .scan_table(table, None, None, 100_000)
+            .map_err(map_store)?;
+        Ok(LoadedRel { columns, rows })
     }
 
     fn query_user_describe(&self, tokens: &[String]) -> Result<QueryResult, SqlError> {
@@ -1095,6 +1255,259 @@ fn map_resolve(result: Result<u32, StoreError>) -> Result<u32, SqlError> {
         Err(StoreError::Ambiguous) => Err(SqlError::Ambiguous),
         Err(err) => Err(SqlError::Store(err.to_string())),
     }
+}
+
+/// 连接补出来的空列。文本结果里显示成空字符串，但不再和真正的空字符串相等。
+const SQL_NULL: &str = "\u{0}";
+
+struct LoadedRel {
+    columns: Vec<String>,
+    rows: Vec<Vec<String>>,
+}
+
+fn take_alias(tokens: &[String], index: &mut usize, table: &str) -> Result<String, SqlError> {
+    let Some(token) = tokens.get(*index) else {
+        return Ok(table.to_string());
+    };
+    if token.eq_ignore_ascii_case("as") {
+        *index += 1;
+        let alias = tokens
+            .get(*index)
+            .ok_or_else(|| SqlError::Syntax("alias".into()))?
+            .to_ascii_lowercase();
+        *index += 1;
+        return Ok(alias);
+    }
+    if clause_word(token) {
+        return Ok(table.to_string());
+    }
+    *index += 1;
+    Ok(token.to_ascii_lowercase())
+}
+
+fn clause_word(token: &str) -> bool {
+    matches!(
+        token.to_ascii_lowercase().as_str(),
+        "where"
+            | "join"
+            | "inner"
+            | "left"
+            | "right"
+            | "full"
+            | "cross"
+            | "order"
+            | "group"
+            | "limit"
+            | "on"
+            | "outer"
+            | "union"
+    )
+}
+
+fn take_join_kind(tokens: &[String], index: &mut usize) -> Result<Option<JoinKind>, SqlError> {
+    let Some(token) = tokens.get(*index) else {
+        return Ok(None);
+    };
+    match token.to_ascii_lowercase().as_str() {
+        "join" => {
+            *index += 1;
+            Ok(Some(JoinKind::Inner))
+        }
+        "inner" => {
+            *index += 1;
+            expect(tokens, index, "join")?;
+            Ok(Some(JoinKind::Inner))
+        }
+        "left" => {
+            *index += 1;
+            skip_outer(tokens, index);
+            expect(tokens, index, "join")?;
+            Ok(Some(JoinKind::Left))
+        }
+        "right" => {
+            *index += 1;
+            skip_outer(tokens, index);
+            expect(tokens, index, "join")?;
+            Ok(Some(JoinKind::Right))
+        }
+        "full" => {
+            *index += 1;
+            skip_outer(tokens, index);
+            expect(tokens, index, "join")?;
+            Ok(Some(JoinKind::Full))
+        }
+        "cross" => {
+            *index += 1;
+            expect(tokens, index, "join")?;
+            if tokens
+                .get(*index)
+                .is_some_and(|token| token.eq_ignore_ascii_case("on"))
+            {
+                return Err(SqlError::Syntax("cross join cannot have on".into()));
+            }
+            Ok(Some(JoinKind::Cross))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn skip_outer(tokens: &[String], index: &mut usize) {
+    if tokens
+        .get(*index)
+        .is_some_and(|token| token.eq_ignore_ascii_case("outer"))
+    {
+        *index += 1;
+    }
+}
+
+fn qualify(alias: &str, columns: &[String]) -> Vec<String> {
+    columns
+        .iter()
+        .map(|column| format!("{alias}.{column}"))
+        .collect()
+}
+
+fn show_cell(cell: &str) -> String {
+    if cell == SQL_NULL {
+        String::new()
+    } else {
+        cell.to_string()
+    }
+}
+
+fn resolve_column(columns: &[String], name: &str) -> Result<usize, SqlError> {
+    let name = name.to_ascii_lowercase();
+    if let Some(index) = columns.iter().position(|column| column == &name) {
+        return Ok(index);
+    }
+    let hits: Vec<usize> = columns
+        .iter()
+        .enumerate()
+        .filter(|(_, column)| {
+            column
+                .rsplit_once('.')
+                .is_some_and(|(_, bare)| bare == name)
+        })
+        .map(|(index, _)| index)
+        .collect();
+    match hits.as_slice() {
+        [index] => Ok(*index),
+        [] => Err(SqlError::Syntax(format!(
+            "column \"{name}\" does not exist"
+        ))),
+        _ => Err(SqlError::Syntax(format!("column \"{name}\" is ambiguous"))),
+    }
+}
+
+fn apply_join(
+    left_cols: &[String],
+    left_rows: &[Vec<String>],
+    join: &JoinItem,
+    right_cols: &[String],
+    right_rows: &[Vec<String>],
+) -> Result<Vec<Vec<String>>, SqlError> {
+    if join.kind == JoinKind::Cross {
+        let mut out = Vec::new();
+        for left in left_rows {
+            for right in right_rows {
+                let mut row = left.clone();
+                row.extend(right.clone());
+                out.push(row);
+            }
+        }
+        return Ok(out);
+    }
+    let (left_at, right_at) = on_sides(left_cols, right_cols, &join.on)?;
+    let mut index: std::collections::HashMap<Vec<String>, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (row_index, row) in right_rows.iter().enumerate() {
+        if let Some(key) = key_of(row, &right_at) {
+            index.entry(key).or_default().push(row_index);
+        }
+    }
+    let mut matched = vec![false; right_rows.len()];
+    let mut out = Vec::new();
+    for left in left_rows {
+        let hits = key_of(left, &left_at).and_then(|key| index.get(&key).cloned());
+        if let Some(hits) = hits {
+            for hit in hits {
+                matched[hit] = true;
+                let mut row = left.clone();
+                row.extend(right_rows[hit].clone());
+                out.push(row);
+            }
+        } else if join.kind == JoinKind::Left || join.kind == JoinKind::Full {
+            let mut row = left.clone();
+            row.extend(vec![SQL_NULL.to_string(); right_cols.len()]);
+            out.push(row);
+        }
+    }
+    if join.kind == JoinKind::Right || join.kind == JoinKind::Full {
+        for (row_index, right) in right_rows.iter().enumerate() {
+            if !matched[row_index] {
+                let mut row = vec![SQL_NULL.to_string(); left_cols.len()];
+                row.extend(right.clone());
+                out.push(row);
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn on_sides(
+    left_cols: &[String],
+    right_cols: &[String],
+    on: &[(String, String)],
+) -> Result<(Vec<usize>, Vec<usize>), SqlError> {
+    let mut left_at = Vec::new();
+    let mut right_at = Vec::new();
+    for (left_name, right_name) in on {
+        match (
+            place(left_cols, right_cols, left_name)?,
+            place(left_cols, right_cols, right_name)?,
+        ) {
+            (Side::Left(left), Side::Right(right)) | (Side::Right(right), Side::Left(left)) => {
+                left_at.push(left);
+                right_at.push(right);
+            }
+            _ => {
+                return Err(SqlError::Syntax(
+                    "on must compare one column from each side".into(),
+                ))
+            }
+        }
+    }
+    Ok((left_at, right_at))
+}
+
+enum Side {
+    Left(usize),
+    Right(usize),
+}
+
+fn place(left_cols: &[String], right_cols: &[String], name: &str) -> Result<Side, SqlError> {
+    let left = resolve_column(left_cols, name).ok();
+    let right = resolve_column(right_cols, name).ok();
+    match (left, right) {
+        (Some(index), None) => Ok(Side::Left(index)),
+        (None, Some(index)) => Ok(Side::Right(index)),
+        (Some(_), Some(_)) => Err(SqlError::Syntax(format!("column \"{name}\" is ambiguous"))),
+        (None, None) => Err(SqlError::Syntax(format!(
+            "column \"{name}\" does not exist"
+        ))),
+    }
+}
+
+fn key_of(row: &[String], indexes: &[usize]) -> Option<Vec<String>> {
+    let mut key = Vec::with_capacity(indexes.len());
+    for index in indexes {
+        let cell = &row[*index];
+        if cell == SQL_NULL {
+            return None;
+        }
+        key.push(cell.clone());
+    }
+    Some(key)
 }
 
 fn tokenize(sql: &str) -> Vec<String> {
