@@ -345,3 +345,89 @@ fn join_syntax_covers_outer_and_and_aliases_and_rejects_the_edges() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn expressions_case_like_in_and_union_follow_integer_rules() {
+    let (dir, mut engine) = open();
+    note(&mut engine);
+    let sql = SqlEngine::new(&engine);
+    let notional = sql
+        .query("SELECT price * volume AS notional FROM ticks WHERE symbol = 'SZSE:000001' AND price = 10")
+        .unwrap();
+    assert_eq!(notional.rows, vec![vec!["1000".to_string()]]);
+    let added = sql
+        .query("SELECT id + 2 * 3 AS n FROM note WHERE id = 1")
+        .unwrap();
+    assert_eq!(added.rows, vec![vec!["7".to_string()]]);
+    let code = sql.query("SELECT code FROM symbols").unwrap();
+    assert_eq!(code.rows, vec![vec!["000001".to_string()]]);
+    let signed = sql.query("SELECT -id AS n FROM note WHERE id = 1").unwrap();
+    assert_eq!(signed.rows, vec![vec!["-1".to_string()]]);
+    let half = sql.query("SELECT id / 2 FROM note").unwrap();
+    assert_eq!(half.columns, vec!["id / 2"]);
+    assert_eq!(
+        half.rows,
+        vec![vec!["0".to_string()], vec!["1".to_string()]]
+    );
+    let kept = sql
+        .query("SELECT id FROM note WHERE id IN (2, 1) AND NOT id = 2")
+        .unwrap();
+    assert_eq!(kept.rows, vec![vec!["1".to_string()]]);
+    assert!(sql
+        .query("SELECT id FROM note WHERE id IN (3, null)")
+        .unwrap()
+        .rows
+        .is_empty());
+    let like = sql
+        .query("SELECT code FROM note WHERE code LIKE 'SZSE:______'")
+        .unwrap();
+    assert_eq!(like.rows, vec![vec!["SZSE:000001".to_string()]]);
+    let band = sql
+        .query("SELECT CASE WHEN id > 1 THEN 'hi' ELSE 'lo' END AS band FROM note")
+        .unwrap();
+    assert_eq!(band.columns, vec!["band"]);
+    assert_eq!(
+        band.rows,
+        vec![vec!["lo".to_string()], vec!["hi".to_string()]]
+    );
+    let active = sql.query("SELECT id FROM note WHERE active").unwrap();
+    assert_eq!(active.rows, vec![vec!["1".to_string()]]);
+    let grouped = sql
+        .query("SELECT id / 2 AS bucket, count(id) AS n FROM note GROUP BY id / 2 ORDER BY bucket")
+        .unwrap();
+    assert_eq!(
+        grouped.rows,
+        vec![
+            vec!["0".to_string(), "1".to_string()],
+            vec!["1".to_string(), "1".to_string()]
+        ]
+    );
+    let unioned = sql
+        .query(
+            "SELECT id FROM note WHERE id = 2 UNION SELECT id FROM note WHERE id = 1 ORDER BY id",
+        )
+        .unwrap();
+    assert_eq!(
+        unioned.rows,
+        vec![vec!["1".to_string()], vec!["2".to_string()]]
+    );
+    assert_eq!(
+        sql.query("SELECT id FROM note WHERE id = 1 UNION ALL SELECT id FROM note WHERE id = 1")
+            .unwrap()
+            .rows
+            .len(),
+        2
+    );
+    assert_eq!(
+        sql.query("SELECT id FROM note WHERE id = 1 UNION SELECT id FROM note WHERE id = 1")
+            .unwrap()
+            .rows
+            .len(),
+        1
+    );
+    assert!(sql
+        .query("SELECT id, code FROM note UNION SELECT id FROM note")
+        .is_err());
+    assert!(sql.query("SELECT id / 0 FROM note").is_err());
+    let _ = std::fs::remove_dir_all(dir);
+}

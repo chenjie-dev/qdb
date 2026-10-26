@@ -2,7 +2,7 @@
 
 `qdb_sql::SqlEngine` 执行一条只读语句，返回列名和字符串行。没有预编译语句，没有参数绑定。标识符和关键字不区分大小写，字符串用单引号。
 
-本版本没有 `UPDATE`、`DELETE`、子查询和函数嵌套。写入走 [库接口](library.md)，用户表也可以 `INSERT`。表和表用 `JOIN` 连接，规则与 PostgreSQL 的内连接和外连接相同。
+本版本没有 `UPDATE`、`DELETE`、子查询和函数嵌套。可以写整数四则运算、`CASE`、`IN`、`LIKE` 和 `UNION`。写入走 [库接口](library.md)，用户表也可以 `INSERT`。表和表用 `JOIN` 连接，规则与 PostgreSQL 的内连接和外连接相同。
 
 ## 建表
 
@@ -46,19 +46,19 @@ FROM table_name [join ...]
 
 `SUBSCRIBE` 只在客户端生效。它先执行去掉该关键字后的 `SELECT`，再持续打印匹配的新行。库接口里的 `SqlEngine::query` 遇到这个关键字会返回语法错误；跟随用 `split_subscribe` 和 `live_rows`。
 
-`select_list` 是 `*`，或逗号分隔的列名，或聚合 `func(column)`。
+`select_list` 是 `*`，或逗号分隔的列、整数表达式、`CASE`，或聚合 `func(column)`。表达式只用整数，除法向零截断，除以 0 是错误。`*` 和 `/` 比 `+` 和 `-` 更紧。`CASE` 写成 `CASE WHEN 条件 THEN 值 ELSE 值 END`。
 
-`ORDER BY` 会按列排序后再套 `LIMIT`。整列都能解析成整数时按数值比，否则按文本比。同一键的先后保持存储顺序。`GROUP BY` 每个分组一行。选择列表里不是聚合的列必须出现在分组键中。没有 `GROUP BY` 的聚合仍然是一行。`HAVING` 在分组之后过滤。`DISTINCT` 去掉重复的结果行。`SELECT 列 AS 别名` 可以给结果列改名，`ORDER BY` 和 `HAVING` 能用这个别名。
+`ORDER BY` 会按列排序后再套 `LIMIT`。整列都能解析成整数时按数值比，否则按文本比。同一键的先后保持存储顺序。`GROUP BY` 每个分组一行，分组键可以是表达式。选择列表里不是聚合的表达式必须出现在分组键中。没有 `GROUP BY` 的聚合仍然是一行。`HAVING` 在分组之后过滤。`DISTINCT` 去掉重复的结果行。`UNION` 去掉整行重复，`UNION ALL` 保留重复；两边的列数必须相同，列名用第一段。`ORDER BY` 和 `LIMIT` 写在整段 `UNION` 之后。`SELECT 列 AS 别名` 可以给结果列改名，`ORDER BY` 和 `HAVING` 能用这个别名。
 
-`WHERE` 在单表和连接之后都生效，支持 `AND`、`OR`、括号、`=`、`<>`、`!=`、`<`、`<=`、`>`、`>=`、`BETWEEN`、`IS NULL`、`IS NOT NULL`。`OR` 的优先级低于 `AND`。比较两边都是整数时按数值比。
+`WHERE` 在单表和连接之后都生效，支持 `AND`、`OR`、`NOT`、括号、比较、四则运算、`CASE`、`IN`、`LIKE`、`BETWEEN`、`IS NULL`、`IS NOT NULL`。`OR` 的优先级低于 `AND`。比较两边都是整数时按数值比。`IN` 里出现空值时，没有相等项的结果是未知，行会被滤掉。`LIKE` 的 `%` 匹配任意长度，`_` 匹配一个字符，`\` 转义这两个符号。空值不匹配 `LIKE`。
 
 `symbols`、`klines` 上的 `symbol` 和 `period` 仍要写在最外层的 `AND` 里，不能只放在 `OR` 中。`klines.seq` 仍是 `0`。
 
 ## 与 PostgreSQL 的差异
 
-已经对齐的是：内连接和外连接、`CROSS JOIN`、`ON` 等值、`WHERE` 的与或和比较、`GROUP BY`、`HAVING`、`DISTINCT`、`ORDER BY` 再 `LIMIT`、列别名。
+已经对齐的是：内连接和外连接、`CROSS JOIN`、`ON` 等值、`WHERE` 的与或和比较、整数四则运算、`CASE`、`IN`、`LIKE`、`GROUP BY`、`HAVING`、`DISTINCT`、`UNION`、`ORDER BY` 再 `LIMIT`、列别名。
 
-还没有的是：子查询、`UNION`、`WITH`、窗口函数、`CASE`、四则运算、`LIKE`、`IN`、`UPDATE`、`DELETE`、`information_schema`，以及 PostgreSQL 线协议。连接补出来的空值在结果里是空文本，`IS NULL` 能把它和真正的空字符串分开。`SUBSCRIBE` 的增量仍按到达顺序追加，不按 `ORDER BY` 重排整段输出。
+还没有的是：子查询、`WITH`、窗口函数、`UPDATE`、`DELETE`、`information_schema`，以及 PostgreSQL 线协议。连接补出来的空值在结果里是空文本，`IS NULL` 能把它和真正的空字符串分开。`SUBSCRIBE` 的增量仍按到达顺序追加，不按 `ORDER BY` 重排整段输出。带表达式或 `UNION` 的订阅会重算当前结果。
 
 `LIMIT` 缺省 1000，最大 100000。超过上限返回 `limit N exceeds 100000`。截断发生在过滤之后。
 

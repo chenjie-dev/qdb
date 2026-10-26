@@ -442,26 +442,35 @@ struct SnapshotPod {
 第一版语法是固定子集，手写递归下降解析，不接入通用 SQL 解析器。这样语法边界就是代码边界。
 
 ```text
-statement   = select
+statement   = query
+query       = select { "UNION" ["ALL"] select }
+              ["ORDER BY" order] ["LIMIT" integer]
 select      = "SELECT" ["DISTINCT"] projection "FROM" from_item
               ["WHERE" expr] ["GROUP BY" group] ["HAVING" expr]
-              ["ORDER BY" order] ["LIMIT" integer]
 projection  = "*" | item { "," item }
-item        = (ident | agg "(" ident ")") ["AS" ident]
+item        = agg "(" ident ")" ["AS" ident] | value ["AS" ident]
 agg         = "MAX" | "MIN" | "SUM" | "AVG" | "FIRST" | "LAST" | "COUNT"
 expr        = or
 or          = and { "OR" and }
-and         = pred { "AND" pred }
-pred        = ident comp literal
-            | ident "BETWEEN" literal "AND" literal
-            | ident "IS" ["NOT"] "NULL"
-            | "(" expr ")"
+and         = not { "AND" not }
+not         = ["NOT"] cmp
+cmp         = value [comp value | "BETWEEN" value "AND" value
+            | ["NOT"] "IN" "(" value { "," value } ")"
+            | ["NOT"] "LIKE" value
+            | "IS" ["NOT"] "NULL"]
+value       = add
+add         = mul { ("+" | "-") mul }
+mul         = unary { ("*" | "/") unary }
+unary       = ["-"] primary
+primary     = ident | literal | "(" expr ")"
+            | "CASE" when { when } ["ELSE" value] "END"
+when        = "WHEN" expr "THEN" value
 comp        = "=" | "<>" | "!=" | "<" | "<=" | ">" | ">="
-group       = ident { "," ident }
+group       = value { "," value }
 order       = ident ["ASC" | "DESC"] { "," ident ["ASC" | "DESC"] }
 ```
 
-不支持子查询、窗口函数、`UNION`、`WITH`、`UPDATE`、`DELETE`。`FROM` 可以是内置表或用户表。`JOIN` 见下一节。写入只来自行情流、恢复和 `INSERT`，不来自 `UPDATE`。
+不支持子查询、窗口函数、`WITH`、`UPDATE`、`DELETE`。`FROM` 可以是内置表或用户表。`JOIN` 见下一节。写入只来自行情流、恢复和 `INSERT`，不来自 `UPDATE`。四则运算只用整数，除法向零截断，不用浮点。`LIKE` 里 `%` 匹配任意长度，`_` 匹配一个字符，`\` 转义。`CASE` 只接受 `WHEN` 条件这种写法。
 
 `FROM` 之后可以接 PostgreSQL 风格的连接。`JOIN` 与 `INNER JOIN` 相同，只保留两边都匹配的行。`LEFT JOIN` 保留左表全部行，右边没有匹配时那些列为空文本。`RIGHT JOIN` 相反。`FULL JOIN` 两边都保留。`ON` 是等值条件，多个条件用 `AND`。`NULL` 不等于 `NULL`，空文本对空文本仍然相等。结果先按左表顺序，再补上没有配上的右表行。多表时 `*` 的列名是 `别名.列名`。不支持连接上的聚合。
 
@@ -525,12 +534,12 @@ WHERE symbol = 'SZSE:000001';
 2. 解析 `symbol`，得到 `symbol_id`。scale 不同的符号不能出现在同一个 `SUM` / `AVG` 里，除非按 `symbol` 分组。
 3. `klines` 对 `(symbol_id, period_id, bucket_start_ns)` 二分。`ticks` 对时间二分。`snapshots` 直接读 seqlock 槽。
 4. 查询开始时 Acquire 读取 `applied_seq`。扫描跳过 `seq` 更大的行。未闭合 K 线和快照若 `seq` 更大，或 seqlock 失败，重试最多 3 次，仍失败则返回 `Busy`。
-5. `WHERE` 支持 `AND` / `OR`、比较、`BETWEEN` 和 `IS NULL`。`symbol` 与 `period` 写在最外层 `AND` 上，供扫描使用。
-6. 有 `GROUP BY` 时按分组键各出一行。没有分组的聚合仍是一行。选择列表里的非聚合列必须出现在分组键中。`HAVING` 过滤分组结果。
-7. `DISTINCT` 去掉重复行。`ORDER BY` 在 `LIMIT` 之前排序。整数列按数值比，其余按文本比。`FIRST` / `LAST` 按组内存储顺序。
+5. `WHERE` 支持 `AND` / `OR` / `NOT`、比较、四则运算、`CASE`、`IN`、`LIKE`、`BETWEEN` 和 `IS NULL`。`symbol` 与 `period` 写在最外层 `AND` 上，供扫描使用。
+6. 有 `GROUP BY` 时按分组键各出一行。分组键可以是表达式。没有分组的聚合仍是一行。选择列表里的非聚合表达式必须出现在分组键中。`HAVING` 过滤分组结果。
+7. `DISTINCT` 去掉重复行。`UNION` 去掉整行重复，`UNION ALL` 保留。`ORDER BY` 和 `LIMIT` 作用在整段结果上，包括 `UNION` 之后。整数按数值比，其余按文本比。`FIRST` / `LAST` 按组内存储顺序。
 8. `SUM` 用 `i128` 累加，溢出返回错误。`AVG` 返回十进制文本，不使用二进制浮点。
 
-和 PostgreSQL 的差别：没有子查询、`UNION`、`WITH`、窗口函数、`CASE`、表达式和 `LIKE`。连接产生的空值显示为空文本。
+和 PostgreSQL 的差别：没有子查询、`WITH`、窗口函数。连接产生的空值显示为空文本。表达式结果是整数文本。
 
 空结果是零行，不是错误。符号不存在是错误。
 

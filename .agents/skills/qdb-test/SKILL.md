@@ -2,11 +2,11 @@
 name: qdb-test
 description: >-
   QDB automated test gate. Use before committing, when adding behavior, or when
-  the user mentions 自动化测试、回归、覆盖、边界. Run the full suite and add tests
-  for every implemented behavior described in the docs.
+  the user mentions 自动化测试、回归、覆盖、边界、loom、基准、fuzz. Run the full
+  suite and add tests for every implemented behavior described in the docs.
 ---
 
-> **中文说明**：提交前必须跑通 `cargo test --workspace`。文档或公开接口里已经实现的行为，要有对应测试。未实现的企业级清单不写测试冒充完成。
+> **中文说明**：提交前必须跑通整库测试。已实现的行为要有正常、边界、异常用例。复权、交易日历和多写入者不是本库的测试范围。覆盖率、loom、基准和 fuzz 还没接入，不能写成已经通过。
 
 # QDB 自动化测试
 
@@ -21,6 +21,33 @@ cargo test --workspace -- --test-threads=1
 失败则停止提交，先修到通过。`--test-threads=1` 让实例锁测试和 HTTP 集群测试按顺序跑。只跑其中一个 crate 不能代替整库，除非本次改动明确只在该 crate，并且整库测试在同一轮里已经通过。
 
 性能断言用设计里的倍数或时限，不用某台机器的 `ops/sec`。`qdb-bench` 只打印分布，不放进 `cargo test`。
+
+单独跑一个测试和跑整库，结果必须相同。测试不使用随机数，不依赖「现在」的墙上时钟来决定事件时间，也不共享可写目录、端口或实例锁。事件时间由调用方传入。心跳、切换时限这类必须看墙上时钟的用例，把等待写死在断言里，并且仍使用独立目录。
+
+## 分层
+
+单元测试放在对应 crate 的 `#[cfg(test)]` 里，测纯函数。集成测试放在 `tests/`，每个文件单独编译，只调用 `pub` 接口。两类测试都要碰到正常值、边界值、异常值。
+
+| 层 | 已经要覆盖的行为 |
+|---|---|
+| 布局与时间 | 帧和 K 线槽往返；截断和坏校验和被拒绝；UTC 的秒、分、日和 4 小时边界；时间戳 `0` 和负数不 panic |
+| 聚合 | 成交直接聚成各周期，包含 `1m`、`5m`、`1d`。同一输入重放两次结果相同。迟到不改已闭合 K 线。缺号不闭合。别的交易所不被这次时钟收线 |
+| 索引与表 | 等值索引只返回匹配行。主键冲突失败。空表查询得到空结果，不是错误 |
+| 共享内存 | 映射创建和 `release` 之后可以再打开。慢读者观察到被套圈，而不是静默跳号 |
+| 写入到查询 | 写入后用公开查询读到同一行。批量写入后的成交和 K 线与预期逐行一致 |
+| 订阅 | 只收到过滤条件里的标的。其他标的不出现。`from_seq` 续传。序号空洞得到 gap。读者被套圈后停止把后续帧当成连续数据 |
+| 订阅结束 | 读者关掉或进程退出后，写入者继续写入，不因为这个读者停住 |
+| 恢复 | 删掉共享内存后从快照加 WAL 回到同一 `seq` 和同一批行。快照加增量与只重放 WAL 的结果一致。坏 CRC 或截断停在最后一条好记录之前，拒绝继续写入 |
+
+行情文本解析用仓库里的样例字节，不访问新浪或任何交易所。外部字节进入引擎之前先变成成交或报价；解析函数对空串、缺字段、超长字段返回错误，不 panic。
+
+下面这些不测，也不要为了测试把它们加进库：复权因子、交易日历、节假日、非交易时段、时区换算。时钟只认调用方给出的 UTC 纳秒。
+
+## 并发
+
+引擎只有一个写入者。测试用一个写入者和多个只读查询同时跑，断言不 panic、查询能读到已经发布的行、写入者不因为读者变慢而停住。第二个 `qdb` 进程必须在打开库之前失败，这就是多写入者的边界。
+
+环形缓冲和 seqlock 的调度穷举见下面「尚未接入的门禁」。在那之前，并发证据是现在的单写多读测试和故意放慢的读者。
 
 ## 覆盖范围
 
@@ -67,7 +94,8 @@ cargo test --workspace -- --test-threads=1
 | `SELECT` 列或 `*` | 缺 `FROM`、未知列、关键字大小写、末尾分号 |
 | `WHERE` | `symbol`、`period` 缺失或未知；`ts BETWEEN` 含两端；`snapshots` 无 `symbol`；`symbols` 忽略 `symbol`；`<`、`>`、`<>`、`AND`、`OR`、`IS NULL`；`symbol` 只写在 `OR` 里时 `klines` 失败 |
 | 聚合 | `MAX` `MIN` `SUM` `AVG` `COUNT` `FIRST` `LAST` 各一次；未知函数失败；空结果是空文本；非聚合列不在 `GROUP BY` 里失败 |
-| `ORDER BY` / `GROUP BY` / `HAVING` / `DISTINCT` | `ORDER BY` 在 `LIMIT` 前排序，整数按数值；`GROUP BY` 每个键一行；`HAVING` 过滤分组；`DISTINCT` 去重；`AS` 别名可用于 `ORDER BY` |
+| `ORDER BY` / `GROUP BY` / `HAVING` / `DISTINCT` | `ORDER BY` 在 `LIMIT` 前排序，整数按数值；`GROUP BY` 每个键一行，分组键可以是表达式；`HAVING` 过滤分组；`DISTINCT` 去重；`AS` 别名可用于 `ORDER BY` |
+| 表达式 / `CASE` / `IN` / `LIKE` / `UNION` | `*` 比 `+` 更紧；整数除法向零截断；除以 0 失败；`000001` 仍按原文本返回；`CASE WHEN`；`IN` 含空值且不相等时无行；`LIKE` 的 `%` 和 `_`；`UNION` 去重，`UNION ALL` 保留，列数不同失败 |
 | `LIMIT` | 缺省 1000；`0` 得到空；`100000` 通过；`100001` 失败；缺数字失败 |
 | `SUBSCRIBE` | 只从 `SELECT` 末尾剥掉；`query` 遇到它失败；`SHOW` 末尾失败 |
 | `SHOW` / `DESCRIBE` / `DESC` | 四张行情表和用户表；未知表失败 |
@@ -78,5 +106,23 @@ cargo test --workspace -- --test-threads=1
 
 - 通过公开接口断言，不读私有字段。
 - 一个测试只讲一件事，名字写出条件和结果。
-- 用例之间不共享可变目录。临时目录用进程号区分，结束删除。
+- 用例之间不共享可变目录。临时目录用进程号区分，结束删除。每个测试从空目录构造自己的数据。
+- 构造成交、报价和 K 线时传入事件时间、价格和成交量。价格用 `i64`。同一段输入重复跑，行和 `seq` 不变。
 - 不访问外网，也不连真实交易所。测 HTTP 时只连本机 `127.0.0.1` 上的 `qdb` 进程。
+
+## 尚未接入的门禁
+
+下面是后续要接上的检查。仓库里还没有对应的 CI、覆盖率阈值、loom 测试、Criterion 基准和 fuzz 目标。没有接上之前，测试报告不写「覆盖率已达标」或「loom 已通过」。接上之后，任一失败就挡住合并。
+
+| 门禁 | 要求 |
+|---|---|
+| 格式 | `cargo fmt --all -- --check` |
+| Clippy | 本地可以是警告。CI 使用 `cargo clippy --workspace --all-targets -- -D warnings`。配置写在工作区 `[workspace.lints.clippy]` 时，每个 crate 要有 `lints.workspace = true`。测试代码可以在 `clippy.toml` 里放行 `unwrap` |
+| 覆盖率 | 用 `cargo llvm-cov` 或 tarpaulin 出报告。核心 crate 行覆盖率不低于 80%。`qdb-sql` 解析、`qdb-agg`、`qdb-wal` 恢复不低于 90%。低于阈值则 CI 失败 |
+| loom | 只测环形缓冲和 seqlock。生产代码默认用标准库原子量；`cfg(loom)` 下改用 loom 的原子量、互斥锁和线程。测试里的调度都从 loom 来。模型仍是一个写入者和多个读者 |
+| 压测 | 一个写入者和多个只读查询同时运行一段时间。断言不 panic、已发布的行不丢、进程内存不随着重复查询无限增长 |
+| 基准 | `cargo bench`，文件在 `benches/`，`Cargo.toml` 里 `harness = false`。用 Criterion，输入套 `black_box`。场景：单条写入、批量写入、按标的加时间范围查询、数据量变大后的同一查询、订阅从写入到读者看见的延迟、标的数量增加后的内存。基准不放进 `cargo test`。核心路径变慢时，提交说明写原因。`cargo test` 里的性能仍只用设计中的倍数和时限 |
+| fuzz | 对 SQL 文本、WAL 字节、行情 JSON 和行情文本做 fuzz。畸形长度、缺字段、超大整数、非数字价格都要拒绝或跳过，不 panic，也不把 `NaN` 写进价格。价格继续用 `i64` |
+| CI | 合并前跑格式、Clippy、`cargo test --workspace -- --test-threads=1`、覆盖率。loom 和 fuzz 单独一个任务。基准按计划比较历史结果，回退时要有说明 |
+
+订阅者变慢时，写入者不等待；读者得到 gap，停止把后续帧当成连续数据。这个行为以 [`docs/design.md`](../../../docs/design.md) 为准。重连从 `seq` 续传：缺号报 gap，同一 `seq` 不重复交付。

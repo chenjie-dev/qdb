@@ -68,7 +68,7 @@ git diff --staged
 提交前运行整库测试。失败则不要提交。
 
 ```bash
-cargo test --workspace
+cargo test --workspace -- --test-threads=1
 ```
 
 本次变更若增加了已实现的行为，先按 skill **qdb-test** 补测试，再进入提交。未实现的设计清单不补假测试。

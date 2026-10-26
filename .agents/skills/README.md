@@ -23,7 +23,7 @@
 |---|---|
 | [qdb-dev](./qdb-dev/SKILL.md) | 改 ABI、共享内存、WAL、聚合、SQL、订阅和恢复 |
 | [qdb-pipeline](./qdb-pipeline/SKILL.md) | 规划→架构→开发→测试→评审→发布→运维 |
-| [qdb-test](./qdb-test/SKILL.md) | 提交前整库测试，已实现行为必须有用例 |
+| [qdb-test](./qdb-test/SKILL.md) | 提交前整库测试；分层、边界，以及尚未接入的覆盖率、loom、基准和 fuzz |
 
 ### 行情前备知识
 

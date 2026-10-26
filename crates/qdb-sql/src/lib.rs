@@ -1,6 +1,6 @@
 //! 只读 SQL 子集，以及 `CREATE TABLE` 和 `INSERT`。
 //!
-//! 语法边界见 `docs/manual/sql.md`。`WHERE`、`GROUP BY`、`HAVING`、`DISTINCT` 和 `ORDER BY` 都会生效。
+//! 语法边界见 `docs/manual/sql.md`。`WHERE`、表达式、`CASE`、`GROUP BY`、`HAVING`、`DISTINCT`、`UNION` 和 `ORDER BY` 都会生效。
 #![forbid(unsafe_code)]
 
 use qdb_abi::{KlineBody, Period};
@@ -85,7 +85,7 @@ impl<'a> SqlEngine<'a> {
 
     /// 执行 `SELECT`、`SHOW` 或 `DESCRIBE`。不写 WAL。
     ///
-    /// `WHERE` 在扫描之后过滤。`GROUP BY` 每个分组一行，`HAVING` 再过滤分组。`DISTINCT` 去重。`ORDER BY` 在 `LIMIT` 之前排序。`LIMIT` 不能超过 100000。
+    /// `WHERE` 在扫描之后过滤，可以写比较、四则运算、`CASE`、`IN` 和 `LIKE`。`GROUP BY` 每个分组一行，`HAVING` 再过滤分组。`DISTINCT` 去重。`UNION` 拼接结果后再排序。`ORDER BY` 在 `LIMIT` 之前排序。`LIMIT` 不能超过 100000。
     /// 不带 `symbol` 的 `ticks` 会多一列 `symbol`。`JOIN` 按 PostgreSQL 的内连接和外连接匹配，多表时列名是 `别名.列名`。
     ///
     /// # Arguments
@@ -123,7 +123,35 @@ impl<'a> SqlEngine<'a> {
             return self.query_user_describe(&tokens);
         }
         let stmt = parse(sql)?;
-        self.execute_stmt(&stmt)
+        self.execute_query(&stmt)
+    }
+
+    fn execute_query(&self, stmt: &Stmt) -> Result<QueryResult, SqlError> {
+        if stmt.limit > 100_000 {
+            return Err(SqlError::Limit(stmt.limit));
+        }
+        if stmt.union.is_empty() {
+            return self.execute_stmt(stmt);
+        }
+        let mut combined = self.execute_stmt(&union_branch(stmt))?;
+        for (all, branch) in &stmt.union {
+            let next = self.execute_stmt(&union_branch(branch))?;
+            if next.columns.len() != combined.columns.len() {
+                return Err(SqlError::Syntax(
+                    "each UNION query must have the same number of columns".into(),
+                ));
+            }
+            combined.rows.extend(next.rows);
+            if !all {
+                let mut seen = std::collections::HashSet::new();
+                combined.rows.retain(|row| seen.insert(row.clone()));
+            }
+        }
+        if !stmt.order.is_empty() {
+            sort_rows(&mut combined, &stmt.order)?;
+        }
+        combined.rows.truncate(stmt.limit as usize);
+        Ok(combined)
     }
 
     fn execute_stmt(&self, stmt: &Stmt) -> Result<QueryResult, SqlError> {
@@ -139,7 +167,9 @@ impl<'a> SqlEngine<'a> {
         fetch.limit = 100_000;
         fetch.columns = vec!["*".into()];
         fetch.headings = vec!["*".into()];
+        fetch.select_values = vec![None];
         fetch.aggregates.clear();
+        fetch.union.clear();
         fetch.distinct = false;
         fetch.order.clear();
         fetch.group.clear();
@@ -163,7 +193,7 @@ impl<'a> SqlEngine<'a> {
         if let Some(expr) = &stmt.where_expr {
             let mut kept = Vec::new();
             for row in result.rows {
-                if eval_expr(expr, &result.columns, &row)? {
+                if eval_expr(expr, &result.columns, &row)?.is_true() {
                     kept.push(row);
                 }
             }
@@ -177,7 +207,7 @@ impl<'a> SqlEngine<'a> {
         if let Some(expr) = &stmt.having {
             let mut kept = Vec::new();
             for row in result.rows {
-                if eval_expr(expr, &result.columns, &row)? {
+                if eval_expr(expr, &result.columns, &row)?.is_true() {
                     kept.push(row);
                 }
             }
@@ -232,7 +262,7 @@ pub fn split_subscribe(sql: &str) -> Result<Option<String>, SqlError> {
 
 /// 把新变更投影成与这条 `SELECT` 相同的列。
 ///
-/// 成交、报价和 K 线按 `changes` 逐条投影，同一价格的新成交也会返回。`symbols`、用户表和聚合不看单条变更的列，而是重算后返回 `seen` 里没有的行。`LIMIT` 不截断这里的增量。
+/// 成交、报价和 K 线按 `changes` 逐条投影，同一价格的新成交也会返回。`symbols`、用户表、聚合、表达式和 `UNION` 不看单条变更的列，而是重算后返回 `seen` 里没有的行。`LIMIT` 不截断这里的增量。
 ///
 /// # Arguments
 ///
@@ -257,12 +287,17 @@ pub fn live_rows(
     let stmt = parse(sql)?;
     if !stmt.joins.is_empty()
         || !stmt.aggregates.is_empty()
+        || !stmt.union.is_empty()
+        || stmt
+            .select_values
+            .iter()
+            .any(|value| matches!(value, Some(expr) if !matches!(expr, ValExpr::Column(_))))
         || stmt.table == "symbols"
         || !builtin_table(&stmt.table)
     {
         let mut wide = stmt.clone();
         wide.limit = 100_000;
-        let rows = SqlEngine::new(engine).execute_stmt(&wide)?.rows;
+        let rows = SqlEngine::new(engine).execute_query(&wide)?.rows;
         return Ok(rows
             .into_iter()
             .filter(|row| !seen.iter().any(|old| old == row))
@@ -298,7 +333,7 @@ pub fn live_rows(
 pub fn captured_rows(engine: &Engine, sql: &str) -> Result<Vec<Vec<String>>, SqlError> {
     let mut stmt = parse(sql)?;
     stmt.limit = 100_000;
-    Ok(SqlEngine::new(engine).execute_stmt(&stmt)?.rows)
+    Ok(SqlEngine::new(engine).execute_query(&stmt)?.rows)
 }
 
 fn builtin_table(table: &str) -> bool {
@@ -453,15 +488,17 @@ struct JoinItem {
 struct Stmt {
     columns: Vec<String>,
     headings: Vec<String>,
+    select_values: Vec<Option<ValExpr>>,
     aggregates: Vec<Agg>,
     distinct: bool,
     table: String,
     alias: String,
     joins: Vec<JoinItem>,
     where_expr: Option<Expr>,
-    group: Vec<String>,
+    group: Vec<ValExpr>,
     having: Option<Expr>,
     order: Vec<OrderKey>,
+    union: Vec<(bool, Stmt)>,
     symbol: Option<String>,
     period: Option<Period>,
     ts_from: Option<i64>,
@@ -477,7 +514,15 @@ struct Agg {
     column: String,
 }
 
-#[derive(Clone)]
+fn union_branch(stmt: &Stmt) -> Stmt {
+    let mut bare = stmt.clone();
+    bare.union.clear();
+    bare.order.clear();
+    bare.limit = 100_000;
+    bare
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Cmp {
     Eq,
     Ne,
@@ -487,22 +532,87 @@ enum Cmp {
     Ge,
 }
 
+#[derive(Clone, Copy)]
+enum Arith {
+    Add,
+    Sub,
+    Mul,
+    Div,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Truth {
+    True,
+    False,
+    Unknown,
+}
+
+impl Truth {
+    fn is_true(self) -> bool {
+        matches!(self, Truth::True)
+    }
+
+    fn not(self) -> Self {
+        match self {
+            Truth::True => Truth::False,
+            Truth::False => Truth::True,
+            Truth::Unknown => Truth::Unknown,
+        }
+    }
+}
+
+#[derive(Clone)]
+enum Scalar {
+    Null,
+    Int(i128),
+    Text(String),
+}
+
+#[derive(Clone)]
+enum ValExpr {
+    Column(String),
+    Literal(String),
+    Neg(Box<ValExpr>),
+    Bin {
+        op: Arith,
+        left: Box<ValExpr>,
+        right: Box<ValExpr>,
+    },
+    Case {
+        arms: Vec<(Expr, ValExpr)>,
+        else_arm: Option<Box<ValExpr>>,
+    },
+    Pred(Box<Expr>),
+}
+
 #[derive(Clone)]
 enum Expr {
+    Value(ValExpr),
     And(Vec<Expr>),
     Or(Vec<Expr>),
+    Not(Box<Expr>),
     Cmp {
-        column: String,
+        left: Box<ValExpr>,
         op: Cmp,
-        value: String,
+        right: Box<ValExpr>,
     },
     Between {
-        column: String,
-        low: i64,
-        high: i64,
+        value: Box<ValExpr>,
+        low: Box<ValExpr>,
+        high: Box<ValExpr>,
     },
     IsNull {
-        column: String,
+        value: Box<ValExpr>,
+        negated: bool,
+    },
+    In {
+        value: Box<ValExpr>,
+        list: Vec<ValExpr>,
+        negated: bool,
+    },
+    Like {
+        value: Box<ValExpr>,
+        pattern: Box<ValExpr>,
         negated: bool,
     },
 }
@@ -516,114 +626,128 @@ struct OrderKey {
 fn parse(sql: &str) -> Result<Stmt, SqlError> {
     let tokens = tokenize(sql);
     let mut index = 0;
-    expect(&tokens, &mut index, "select")?;
-    let distinct = if tokens
+    let mut stmt = parse_select(&tokens, &mut index)?;
+    while tokens
         .get(index)
-        .is_some_and(|token| token.eq_ignore_ascii_case("distinct"))
+        .is_some_and(|token| token.eq_ignore_ascii_case("union"))
     {
         index += 1;
+        let all = if tokens
+            .get(index)
+            .is_some_and(|token| token.eq_ignore_ascii_case("all"))
+        {
+            index += 1;
+            true
+        } else {
+            false
+        };
+        stmt.union.push((all, parse_select(&tokens, &mut index)?));
+    }
+    parse_order_and_limit(&tokens, &mut index, &mut stmt)?;
+    if let Some(token) = tokens.get(index) {
+        return Err(SqlError::Syntax(format!("unexpected {token}")));
+    }
+    Ok(stmt)
+}
+
+fn parse_select(tokens: &[String], index: &mut usize) -> Result<Stmt, SqlError> {
+    expect(tokens, index, "select")?;
+    let distinct = if tokens
+        .get(*index)
+        .is_some_and(|token| token.eq_ignore_ascii_case("distinct"))
+    {
+        *index += 1;
         true
     } else {
         false
     };
     let mut columns = Vec::new();
     let mut headings = Vec::new();
+    let mut select_values = Vec::new();
     let mut aggregates = Vec::new();
-    if tokens.get(index).map(|t| t.as_str()) == Some("*") {
+    if tokens.get(*index).map(String::as_str) == Some("*") {
         columns.push("*".to_string());
         headings.push("*".to_string());
-        index += 1;
+        select_values.push(None);
+        *index += 1;
     } else {
         loop {
-            let name = tokens
-                .get(index)
-                .ok_or_else(|| SqlError::Syntax("column".into()))?
-                .clone();
-            index += 1;
-            let source = if tokens.get(index).map(|t| t.as_str()) == Some("(") {
-                index += 1;
+            if agg_call(tokens, *index) {
+                let func = tokens[*index].to_ascii_lowercase();
+                *index += 2;
                 let column = tokens
-                    .get(index)
+                    .get(*index)
                     .ok_or_else(|| SqlError::Syntax("agg arg".into()))?
                     .clone();
-                index += 1;
-                expect(&tokens, &mut index, ")")?;
-                let func = name.to_ascii_lowercase();
-                let label = format!("{func}({column})");
+                *index += 1;
+                expect(tokens, index, ")")?;
+                let source = format!("{func}({})", column.to_ascii_lowercase());
+                let heading = take_heading(tokens, index, &source)?;
                 aggregates.push(Agg {
                     func,
                     column: column.to_ascii_lowercase(),
                 });
-                label
+                columns.push(source);
+                headings.push(heading);
+                select_values.push(None);
             } else {
-                name.to_ascii_lowercase()
-            };
-            let heading = if tokens
-                .get(index)
-                .is_some_and(|token| token.eq_ignore_ascii_case("as"))
-            {
-                index += 1;
-                let heading = tokens
-                    .get(index)
-                    .ok_or_else(|| SqlError::Syntax("alias".into()))?
-                    .to_ascii_lowercase();
-                index += 1;
-                heading
-            } else {
-                source.clone()
-            };
-            columns.push(source);
-            headings.push(heading);
-            if tokens.get(index).map(|t| t.as_str()) == Some(",") {
-                index += 1;
+                let value = parse_add(tokens, index)?;
+                let source = render_val(&value);
+                let heading = take_heading(tokens, index, &render_val_outer(&value))?;
+                columns.push(source);
+                headings.push(heading);
+                select_values.push(Some(value));
+            }
+            if tokens.get(*index).map(String::as_str) == Some(",") {
+                *index += 1;
                 continue;
             }
             break;
         }
     }
-    expect(&tokens, &mut index, "from")?;
+    expect(tokens, index, "from")?;
     let table = tokens
-        .get(index)
+        .get(*index)
         .ok_or_else(|| SqlError::Syntax("table".into()))?
         .to_ascii_lowercase();
-    index += 1;
-    let alias = take_alias(&tokens, &mut index, &table)?;
+    *index += 1;
+    let alias = take_alias(tokens, index, &table)?;
     let mut joins = Vec::new();
-    while let Some(kind) = take_join_kind(&tokens, &mut index)? {
+    while let Some(kind) = take_join_kind(tokens, index)? {
         let join_table = tokens
-            .get(index)
+            .get(*index)
             .ok_or_else(|| SqlError::Syntax("table".into()))?
             .to_ascii_lowercase();
-        index += 1;
-        let join_alias = take_alias(&tokens, &mut index, &join_table)?;
+        *index += 1;
+        let join_alias = take_alias(tokens, index, &join_table)?;
         if kind == JoinKind::Cross
             && tokens
-                .get(index)
+                .get(*index)
                 .is_some_and(|token| token.eq_ignore_ascii_case("on"))
         {
             return Err(SqlError::Syntax("cross join cannot have on".into()));
         }
         let mut on = Vec::new();
         if kind != JoinKind::Cross {
-            expect(&tokens, &mut index, "on")?;
+            expect(tokens, index, "on")?;
             loop {
                 let left = tokens
-                    .get(index)
+                    .get(*index)
                     .ok_or_else(|| SqlError::Syntax("on".into()))?
                     .to_ascii_lowercase();
-                index += 1;
-                expect(&tokens, &mut index, "=")?;
+                *index += 1;
+                expect(tokens, index, "=")?;
                 let right = tokens
-                    .get(index)
+                    .get(*index)
                     .ok_or_else(|| SqlError::Syntax("on".into()))?
                     .to_ascii_lowercase();
-                index += 1;
+                *index += 1;
                 on.push((left, right));
                 if tokens
-                    .get(index)
+                    .get(*index)
                     .is_some_and(|token| token.eq_ignore_ascii_case("and"))
                 {
-                    index += 1;
+                    *index += 1;
                     continue;
                 }
                 break;
@@ -647,12 +771,11 @@ fn parse(sql: &str) -> Result<Stmt, SqlError> {
     let mut eq_value = None;
     let mut where_expr = None;
     if tokens
-        .get(index)
-        .map(|t| t.eq_ignore_ascii_case("where"))
-        .unwrap_or(false)
+        .get(*index)
+        .is_some_and(|token| token.eq_ignore_ascii_case("where"))
     {
-        index += 1;
-        let parsed = parse_expr(&tokens, &mut index)?;
+        *index += 1;
+        let parsed = parse_expr(tokens, index)?;
         if joins.is_empty() {
             let (residual, simple) = peel_scan_predicates(parsed);
             symbol = simple.symbol;
@@ -668,21 +791,15 @@ fn parse(sql: &str) -> Result<Stmt, SqlError> {
     }
     let mut group = Vec::new();
     if tokens
-        .get(index)
+        .get(*index)
         .is_some_and(|token| token.eq_ignore_ascii_case("group"))
     {
-        index += 1;
-        expect(&tokens, &mut index, "by")?;
+        *index += 1;
+        expect(tokens, index, "by")?;
         loop {
-            group.push(
-                tokens
-                    .get(index)
-                    .ok_or_else(|| SqlError::Syntax("group".into()))?
-                    .to_ascii_lowercase(),
-            );
-            index += 1;
-            if tokens.get(index).map(|t| t.as_str()) == Some(",") {
-                index += 1;
+            group.push(parse_add(tokens, index)?);
+            if tokens.get(*index).map(String::as_str) == Some(",") {
+                *index += 1;
                 continue;
             }
             break;
@@ -690,59 +807,16 @@ fn parse(sql: &str) -> Result<Stmt, SqlError> {
     }
     let mut having = None;
     if tokens
-        .get(index)
+        .get(*index)
         .is_some_and(|token| token.eq_ignore_ascii_case("having"))
     {
-        index += 1;
-        having = Some(parse_expr(&tokens, &mut index)?);
-    }
-    let mut order = Vec::new();
-    if tokens
-        .get(index)
-        .is_some_and(|token| token.eq_ignore_ascii_case("order"))
-    {
-        index += 1;
-        expect(&tokens, &mut index, "by")?;
-        loop {
-            let name = tokens
-                .get(index)
-                .ok_or_else(|| SqlError::Syntax("order".into()))?
-                .to_ascii_lowercase();
-            index += 1;
-            let desc = if tokens
-                .get(index)
-                .is_some_and(|token| token.eq_ignore_ascii_case("desc"))
-            {
-                index += 1;
-                true
-            } else if tokens
-                .get(index)
-                .is_some_and(|token| token.eq_ignore_ascii_case("asc"))
-            {
-                index += 1;
-                false
-            } else {
-                false
-            };
-            order.push(OrderKey { name, desc });
-            if tokens.get(index).map(|t| t.as_str()) == Some(",") {
-                index += 1;
-                continue;
-            }
-            break;
-        }
-    }
-    let mut limit = 1000;
-    if let Some(pos) = tokens.iter().position(|t| t.eq_ignore_ascii_case("limit")) {
-        limit = tokens
-            .get(pos + 1)
-            .ok_or_else(|| SqlError::Syntax("limit".into()))?
-            .parse()
-            .map_err(|_| SqlError::Syntax("limit".into()))?;
+        *index += 1;
+        having = Some(parse_expr(tokens, index)?);
     }
     Ok(Stmt {
         columns,
         headings,
+        select_values,
         aggregates,
         distinct,
         table,
@@ -751,15 +825,82 @@ fn parse(sql: &str) -> Result<Stmt, SqlError> {
         where_expr,
         group,
         having,
-        order,
+        order: Vec::new(),
+        union: Vec::new(),
         symbol,
         period,
         ts_from,
         ts_to,
         eq_column,
         eq_value,
-        limit,
+        limit: 1000,
     })
+}
+
+fn parse_order_and_limit(
+    tokens: &[String],
+    index: &mut usize,
+    stmt: &mut Stmt,
+) -> Result<(), SqlError> {
+    let mut saw_limit = false;
+    loop {
+        if tokens
+            .get(*index)
+            .is_some_and(|token| token.eq_ignore_ascii_case("order"))
+        {
+            if !stmt.order.is_empty() {
+                return Err(SqlError::Syntax("order".into()));
+            }
+            *index += 1;
+            expect(tokens, index, "by")?;
+            loop {
+                let name = tokens
+                    .get(*index)
+                    .ok_or_else(|| SqlError::Syntax("order".into()))?
+                    .to_ascii_lowercase();
+                *index += 1;
+                let desc = if tokens
+                    .get(*index)
+                    .is_some_and(|token| token.eq_ignore_ascii_case("desc"))
+                {
+                    *index += 1;
+                    true
+                } else if tokens
+                    .get(*index)
+                    .is_some_and(|token| token.eq_ignore_ascii_case("asc"))
+                {
+                    *index += 1;
+                    false
+                } else {
+                    false
+                };
+                stmt.order.push(OrderKey { name, desc });
+                if tokens.get(*index).map(String::as_str) == Some(",") {
+                    *index += 1;
+                    continue;
+                }
+                break;
+            }
+        } else if tokens
+            .get(*index)
+            .is_some_and(|token| token.eq_ignore_ascii_case("limit"))
+        {
+            if saw_limit {
+                return Err(SqlError::Syntax("limit".into()));
+            }
+            *index += 1;
+            stmt.limit = tokens
+                .get(*index)
+                .ok_or_else(|| SqlError::Syntax("limit".into()))?
+                .parse()
+                .map_err(|_| SqlError::Syntax("limit".into()))?;
+            *index += 1;
+            saw_limit = true;
+        } else {
+            break;
+        }
+    }
+    Ok(())
 }
 
 impl<'a> SqlEngine<'a> {
@@ -1244,12 +1385,20 @@ fn exec_insert(engine: &mut Engine, tokens: &[String]) -> Result<QueryResult, Sq
         .ok_or(SqlError::NotFound)?;
     let mut raws = Vec::new();
     while tokens.get(index).is_some_and(|token| token != ")") {
-        raws.push(unquote(
-            tokens
+        let token = tokens
+            .get(index)
+            .ok_or_else(|| SqlError::Syntax("value".into()))?;
+        if token == "-" {
+            index += 1;
+            let number = tokens
                 .get(index)
-                .ok_or_else(|| SqlError::Syntax("value".into()))?,
-        ));
-        index += 1;
+                .ok_or_else(|| SqlError::Syntax("value".into()))?;
+            raws.push(format!("-{}", unquote(number)));
+            index += 1;
+        } else {
+            raws.push(unquote(token));
+            index += 1;
+        }
         if tokens.get(index).is_some_and(|token| token == ",") {
             index += 1;
         }
@@ -1651,36 +1800,75 @@ fn peel_expr(expr: &Expr, push: &mut ScanPush) -> Option<Expr> {
             }
         }
         Expr::Cmp {
-            column,
+            left,
             op: Cmp::Eq,
-            value,
-        } if column == "symbol" => {
-            push.symbol = Some(value.clone());
-            None
-        }
-        Expr::Cmp {
-            column,
-            op: Cmp::Eq,
-            value,
-        } if column == "period" => {
-            push.period = Period::parse(value);
-            None
-        }
-        Expr::Between { column, low, high } if column == "ts" => {
-            push.ts_from = Some(*low);
-            push.ts_to = Some(*high);
+            right,
+        } => {
+            if let (ValExpr::Column(column), ValExpr::Literal(value)) =
+                (left.as_ref(), right.as_ref())
+            {
+                if column == "symbol" {
+                    push.symbol = Some(value.clone());
+                    return None;
+                }
+                if column == "period" {
+                    push.period = Period::parse(value);
+                    return None;
+                }
+                if push.eq_column.is_none() {
+                    push.eq_column = Some(column.clone());
+                    push.eq_value = Some(value.clone());
+                }
+            }
             Some(expr.clone())
         }
-        Expr::Cmp {
-            column,
-            op: Cmp::Eq,
-            value,
-        } if push.eq_column.is_none() => {
-            push.eq_column = Some(column.clone());
-            push.eq_value = Some(value.clone());
+        Expr::Between { value, low, high } => {
+            if let (ValExpr::Column(column), Some(low_n), Some(high_n)) =
+                (value.as_ref(), literal_i64(low), literal_i64(high))
+            {
+                if column == "ts" {
+                    push.ts_from = Some(low_n);
+                    push.ts_to = Some(high_n);
+                }
+            }
             Some(expr.clone())
         }
         other => Some(other.clone()),
+    }
+}
+
+fn literal_i64(expr: &ValExpr) -> Option<i64> {
+    match expr {
+        ValExpr::Literal(value) => value.parse().ok(),
+        ValExpr::Neg(inner) => literal_i64(inner).and_then(i64::checked_neg),
+        _ => None,
+    }
+}
+
+fn agg_call(tokens: &[String], index: usize) -> bool {
+    let Some(name) = tokens.get(index) else {
+        return false;
+    };
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "max" | "min" | "sum" | "avg" | "first" | "last" | "count"
+    ) && tokens.get(index + 1).map(String::as_str) == Some("(")
+}
+
+fn take_heading(tokens: &[String], index: &mut usize, fallback: &str) -> Result<String, SqlError> {
+    if tokens
+        .get(*index)
+        .is_some_and(|token| token.eq_ignore_ascii_case("as"))
+    {
+        *index += 1;
+        let heading = tokens
+            .get(*index)
+            .ok_or_else(|| SqlError::Syntax("alias".into()))?
+            .to_ascii_lowercase();
+        *index += 1;
+        Ok(heading)
+    } else {
+        Ok(fallback.to_string())
     }
 }
 
@@ -1701,13 +1889,13 @@ fn parse_expr(tokens: &[String], index: &mut usize) -> Result<Expr, SqlError> {
 }
 
 fn parse_and(tokens: &[String], index: &mut usize) -> Result<Expr, SqlError> {
-    let mut items = vec![parse_pred(tokens, index)?];
+    let mut items = vec![parse_not(tokens, index)?];
     while tokens
         .get(*index)
         .is_some_and(|token| token.eq_ignore_ascii_case("and"))
     {
         *index += 1;
-        items.push(parse_pred(tokens, index)?);
+        items.push(parse_not(tokens, index)?);
     }
     if items.len() == 1 {
         Ok(items.pop().unwrap())
@@ -1716,18 +1904,19 @@ fn parse_and(tokens: &[String], index: &mut usize) -> Result<Expr, SqlError> {
     }
 }
 
-fn parse_pred(tokens: &[String], index: &mut usize) -> Result<Expr, SqlError> {
-    if tokens.get(*index).is_some_and(|token| token == "(") {
-        *index += 1;
-        let expr = parse_expr(tokens, index)?;
-        expect(tokens, index, ")")?;
-        return Ok(expr);
-    }
-    let column = tokens
+fn parse_not(tokens: &[String], index: &mut usize) -> Result<Expr, SqlError> {
+    if tokens
         .get(*index)
-        .ok_or_else(|| SqlError::Syntax("where".into()))?
-        .to_ascii_lowercase();
-    *index += 1;
+        .is_some_and(|token| token.eq_ignore_ascii_case("not"))
+    {
+        *index += 1;
+        return Ok(Expr::Not(Box::new(parse_not(tokens, index)?)));
+    }
+    parse_comparison(tokens, index)
+}
+
+fn parse_comparison(tokens: &[String], index: &mut usize) -> Result<Expr, SqlError> {
+    let left = parse_add(tokens, index)?;
     if tokens
         .get(*index)
         .is_some_and(|token| token.eq_ignore_ascii_case("is"))
@@ -1743,132 +1932,684 @@ fn parse_pred(tokens: &[String], index: &mut usize) -> Result<Expr, SqlError> {
             false
         };
         expect(tokens, index, "null")?;
-        return Ok(Expr::IsNull { column, negated });
+        return Ok(Expr::IsNull {
+            value: Box::new(left),
+            negated,
+        });
     }
+    let negated = if tokens
+        .get(*index)
+        .is_some_and(|token| token.eq_ignore_ascii_case("not"))
+        && tokens.get(*index + 1).is_some_and(|token| {
+            token.eq_ignore_ascii_case("in") || token.eq_ignore_ascii_case("like")
+        }) {
+        *index += 1;
+        true
+    } else {
+        false
+    };
     if tokens
         .get(*index)
         .is_some_and(|token| token.eq_ignore_ascii_case("between"))
     {
         *index += 1;
-        let low = parse_i64(
-            tokens
-                .get(*index)
-                .ok_or_else(|| SqlError::Syntax("between".into()))?,
-        )?;
-        *index += 1;
+        let low = parse_add(tokens, index)?;
         expect(tokens, index, "and")?;
-        let high = parse_i64(
-            tokens
-                .get(*index)
-                .ok_or_else(|| SqlError::Syntax("between".into()))?,
-        )?;
-        *index += 1;
-        return Ok(Expr::Between { column, low, high });
+        let high = parse_add(tokens, index)?;
+        return Ok(Expr::Between {
+            value: Box::new(left),
+            low: Box::new(low),
+            high: Box::new(high),
+        });
     }
-    let op = parse_cmp(tokens, index)?;
-    let value = unquote(
-        tokens
-            .get(*index)
-            .ok_or_else(|| SqlError::Syntax("value".into()))?,
-    );
-    *index += 1;
-    Ok(Expr::Cmp { column, op, value })
+    if tokens
+        .get(*index)
+        .is_some_and(|token| token.eq_ignore_ascii_case("in"))
+    {
+        *index += 1;
+        expect(tokens, index, "(")?;
+        let mut list = Vec::new();
+        loop {
+            list.push(parse_add(tokens, index)?);
+            if tokens.get(*index).map(String::as_str) == Some(",") {
+                *index += 1;
+                continue;
+            }
+            break;
+        }
+        if list.is_empty() {
+            return Err(SqlError::Syntax("in".into()));
+        }
+        expect(tokens, index, ")")?;
+        return Ok(Expr::In {
+            value: Box::new(left),
+            list,
+            negated,
+        });
+    }
+    if tokens
+        .get(*index)
+        .is_some_and(|token| token.eq_ignore_ascii_case("like"))
+    {
+        *index += 1;
+        let pattern = parse_add(tokens, index)?;
+        return Ok(Expr::Like {
+            value: Box::new(left),
+            pattern: Box::new(pattern),
+            negated,
+        });
+    }
+    if negated {
+        return Err(SqlError::Syntax("not".into()));
+    }
+    if let Some(op) = cmp_op(tokens.get(*index).map(String::as_str)) {
+        *index += 1;
+        let right = parse_add(tokens, index)?;
+        return Ok(Expr::Cmp {
+            left: Box::new(left),
+            op,
+            right: Box::new(right),
+        });
+    }
+    Ok(Expr::Value(left))
 }
 
-fn parse_cmp(tokens: &[String], index: &mut usize) -> Result<Cmp, SqlError> {
+fn cmp_op(token: Option<&str>) -> Option<Cmp> {
+    match token? {
+        "=" => Some(Cmp::Eq),
+        "<>" | "!=" => Some(Cmp::Ne),
+        "<" => Some(Cmp::Lt),
+        "<=" => Some(Cmp::Le),
+        ">" => Some(Cmp::Gt),
+        ">=" => Some(Cmp::Ge),
+        _ => None,
+    }
+}
+
+fn parse_add(tokens: &[String], index: &mut usize) -> Result<ValExpr, SqlError> {
+    let mut left = parse_mul(tokens, index)?;
+    while let Some(op) = match tokens.get(*index).map(String::as_str) {
+        Some("+") => Some(Arith::Add),
+        Some("-") => Some(Arith::Sub),
+        _ => None,
+    } {
+        *index += 1;
+        let right = parse_mul(tokens, index)?;
+        left = ValExpr::Bin {
+            op,
+            left: Box::new(left),
+            right: Box::new(right),
+        };
+    }
+    Ok(left)
+}
+
+fn parse_mul(tokens: &[String], index: &mut usize) -> Result<ValExpr, SqlError> {
+    let mut left = parse_unary(tokens, index)?;
+    while let Some(op) = match tokens.get(*index).map(String::as_str) {
+        Some("*") => Some(Arith::Mul),
+        Some("/") => Some(Arith::Div),
+        _ => None,
+    } {
+        *index += 1;
+        let right = parse_unary(tokens, index)?;
+        left = ValExpr::Bin {
+            op,
+            left: Box::new(left),
+            right: Box::new(right),
+        };
+    }
+    Ok(left)
+}
+
+fn parse_unary(tokens: &[String], index: &mut usize) -> Result<ValExpr, SqlError> {
+    if tokens.get(*index).map(String::as_str) == Some("-") {
+        *index += 1;
+        return Ok(ValExpr::Neg(Box::new(parse_unary(tokens, index)?)));
+    }
+    parse_primary(tokens, index)
+}
+
+fn parse_primary(tokens: &[String], index: &mut usize) -> Result<ValExpr, SqlError> {
     let token = tokens
         .get(*index)
-        .ok_or_else(|| SqlError::Syntax("operator".into()))?;
-    *index += 1;
-    match token.as_str() {
-        "=" => Ok(Cmp::Eq),
-        "<>" | "!=" => Ok(Cmp::Ne),
-        "<" => Ok(Cmp::Lt),
-        "<=" => Ok(Cmp::Le),
-        ">" => Ok(Cmp::Gt),
-        ">=" => Ok(Cmp::Ge),
-        other => Err(SqlError::Syntax(format!("operator {other}"))),
+        .ok_or_else(|| SqlError::Syntax("value".into()))?
+        .clone();
+    if token == "(" {
+        *index += 1;
+        let expr = parse_expr(tokens, index)?;
+        expect(tokens, index, ")")?;
+        return Ok(match expr {
+            Expr::Value(value) => value,
+            other => ValExpr::Pred(Box::new(other)),
+        });
     }
+    if token.eq_ignore_ascii_case("case") {
+        return parse_case(tokens, index);
+    }
+    *index += 1;
+    if token.starts_with('\'') {
+        return Ok(ValExpr::Literal(unquote(&token)));
+    }
+    if token.eq_ignore_ascii_case("null") {
+        return Ok(ValExpr::Literal(SQL_NULL.to_string()));
+    }
+    if token.eq_ignore_ascii_case("true") || token.eq_ignore_ascii_case("false") {
+        return Ok(ValExpr::Literal(token.to_ascii_lowercase()));
+    }
+    if token.parse::<i128>().is_ok() {
+        return Ok(ValExpr::Literal(token));
+    }
+    if token
+        .chars()
+        .any(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '.')
+    {
+        return Ok(ValExpr::Column(token.to_ascii_lowercase()));
+    }
+    Err(SqlError::Syntax(format!("value {token}")))
 }
 
-fn eval_expr(expr: &Expr, columns: &[String], row: &[String]) -> Result<bool, SqlError> {
+fn parse_case(tokens: &[String], index: &mut usize) -> Result<ValExpr, SqlError> {
+    expect(tokens, index, "case")?;
+    let mut arms = Vec::new();
+    while tokens
+        .get(*index)
+        .is_some_and(|token| token.eq_ignore_ascii_case("when"))
+    {
+        *index += 1;
+        let cond = parse_expr(tokens, index)?;
+        expect(tokens, index, "then")?;
+        let value = parse_add(tokens, index)?;
+        arms.push((cond, value));
+    }
+    if arms.is_empty() {
+        return Err(SqlError::Syntax("case".into()));
+    }
+    let else_arm = if tokens
+        .get(*index)
+        .is_some_and(|token| token.eq_ignore_ascii_case("else"))
+    {
+        *index += 1;
+        Some(Box::new(parse_add(tokens, index)?))
+    } else {
+        None
+    };
+    expect(tokens, index, "end")?;
+    Ok(ValExpr::Case { arms, else_arm })
+}
+
+fn eval_expr(expr: &Expr, columns: &[String], row: &[String]) -> Result<Truth, SqlError> {
     match expr {
+        Expr::Value(value) => truth_of_scalar(&eval_val(value, columns, row)?),
         Expr::And(items) => {
+            let mut acc = Truth::True;
             for item in items {
-                if !eval_expr(item, columns, row)? {
-                    return Ok(false);
+                acc = and_truth(acc, eval_expr(item, columns, row)?);
+                if acc == Truth::False {
+                    return Ok(Truth::False);
                 }
             }
-            Ok(true)
+            Ok(acc)
         }
         Expr::Or(items) => {
+            let mut acc = Truth::False;
             for item in items {
-                if eval_expr(item, columns, row)? {
-                    return Ok(true);
+                acc = or_truth(acc, eval_expr(item, columns, row)?);
+                if acc == Truth::True {
+                    return Ok(Truth::True);
                 }
             }
-            Ok(false)
+            Ok(acc)
         }
-        Expr::Cmp { column, op, value } => {
-            let cell = cell_at(columns, row, column)?;
-            if cell == SQL_NULL {
-                return Ok(false);
+        Expr::Not(inner) => Ok(eval_expr(inner, columns, row)?.not()),
+        Expr::Cmp { left, op, right } => {
+            let ordering = scalar_ord(
+                &eval_val(left, columns, row)?,
+                &eval_val(right, columns, row)?,
+            );
+            Ok(match ordering {
+                None => Truth::Unknown,
+                Some(ordering) => match op {
+                    Cmp::Eq => ordering.is_eq(),
+                    Cmp::Ne => ordering.is_ne(),
+                    Cmp::Lt => ordering.is_lt(),
+                    Cmp::Le => ordering.is_le(),
+                    Cmp::Gt => ordering.is_gt(),
+                    Cmp::Ge => ordering.is_ge(),
+                }
+                .then_some(Truth::True)
+                .unwrap_or(Truth::False),
+            })
+        }
+        Expr::Between { value, low, high } => {
+            let value = eval_val(value, columns, row)?;
+            let low = eval_val(low, columns, row)?;
+            let high = eval_val(high, columns, row)?;
+            if matches!(value, Scalar::Null)
+                || matches!(low, Scalar::Null)
+                || matches!(high, Scalar::Null)
+            {
+                return Ok(Truth::Unknown);
             }
-            Ok(cmp_values(cell, value, op))
-        }
-        Expr::Between { column, low, high } => {
-            let cell = cell_at(columns, row, column)?;
-            let Ok(number) = cell.parse::<i64>() else {
-                return Ok(false);
+            let Some(value) = number_of(&value) else {
+                return Ok(Truth::False);
             };
-            Ok(number >= *low && number <= *high)
+            let Some(low) = number_of(&low) else {
+                return Ok(Truth::False);
+            };
+            let Some(high) = number_of(&high) else {
+                return Ok(Truth::False);
+            };
+            Ok(if value >= low && value <= high {
+                Truth::True
+            } else {
+                Truth::False
+            })
         }
-        Expr::IsNull { column, negated } => {
-            let cell = cell_at(columns, row, column)?;
-            Ok((cell == SQL_NULL) != *negated)
+        Expr::IsNull { value, negated } => {
+            let is_null = matches!(eval_val(value, columns, row)?, Scalar::Null);
+            Ok(if is_null == *negated {
+                Truth::False
+            } else {
+                Truth::True
+            })
+        }
+        Expr::In {
+            value,
+            list,
+            negated,
+        } => {
+            let value = eval_val(value, columns, row)?;
+            if matches!(value, Scalar::Null) {
+                return Ok(Truth::Unknown);
+            }
+            let mut unknown = false;
+            for item in list {
+                match scalar_ord(&value, &eval_val(item, columns, row)?) {
+                    Some(ordering) if ordering.is_eq() => {
+                        return Ok(if *negated { Truth::False } else { Truth::True });
+                    }
+                    None => unknown = true,
+                    _ => {}
+                }
+            }
+            if unknown {
+                Ok(Truth::Unknown)
+            } else if *negated {
+                Ok(Truth::True)
+            } else {
+                Ok(Truth::False)
+            }
+        }
+        Expr::Like {
+            value,
+            pattern,
+            negated,
+        } => {
+            let value = eval_val(value, columns, row)?;
+            let pattern = eval_val(pattern, columns, row)?;
+            if matches!(value, Scalar::Null) || matches!(pattern, Scalar::Null) {
+                return Ok(Truth::Unknown);
+            }
+            let matched = like_match(&scalar_text(&value), &scalar_text(&pattern));
+            Ok(if matched == *negated {
+                Truth::False
+            } else {
+                Truth::True
+            })
         }
     }
 }
 
-fn cell_at<'a>(columns: &[String], row: &'a [String], name: &str) -> Result<&'a str, SqlError> {
-    let index = resolve_column(columns, name)?;
-    Ok(row.get(index).map(String::as_str).unwrap_or(""))
+fn and_truth(left: Truth, right: Truth) -> Truth {
+    match (left, right) {
+        (Truth::False, _) | (_, Truth::False) => Truth::False,
+        (Truth::Unknown, _) | (_, Truth::Unknown) => Truth::Unknown,
+        _ => Truth::True,
+    }
 }
 
-fn cmp_values(cell: &str, value: &str, op: &Cmp) -> bool {
-    let ordering = match (cell.parse::<i64>(), value.parse::<i64>()) {
-        (Ok(left), Ok(right)) => left.cmp(&right),
-        _ => cell.cmp(value),
-    };
+fn or_truth(left: Truth, right: Truth) -> Truth {
+    match (left, right) {
+        (Truth::True, _) | (_, Truth::True) => Truth::True,
+        (Truth::Unknown, _) | (_, Truth::Unknown) => Truth::Unknown,
+        _ => Truth::False,
+    }
+}
+
+fn truth_of_scalar(scalar: &Scalar) -> Result<Truth, SqlError> {
+    match scalar {
+        Scalar::Null => Ok(Truth::Unknown),
+        Scalar::Text(text) if text.eq_ignore_ascii_case("true") => Ok(Truth::True),
+        Scalar::Text(text) if text.eq_ignore_ascii_case("false") => Ok(Truth::False),
+        Scalar::Int(0) => Ok(Truth::False),
+        Scalar::Int(_) => Ok(Truth::True),
+        Scalar::Text(_) => Err(SqlError::Syntax("boolean".into())),
+    }
+}
+
+fn eval_val(expr: &ValExpr, columns: &[String], row: &[String]) -> Result<Scalar, SqlError> {
+    match expr {
+        ValExpr::Column(name) => {
+            let cell = row
+                .get(resolve_column(columns, name)?)
+                .map(String::as_str)
+                .unwrap_or("");
+            if cell == SQL_NULL {
+                Ok(Scalar::Null)
+            } else {
+                Ok(Scalar::Text(cell.to_string()))
+            }
+        }
+        ValExpr::Literal(value) => {
+            if value == SQL_NULL {
+                Ok(Scalar::Null)
+            } else {
+                Ok(Scalar::Text(value.clone()))
+            }
+        }
+        ValExpr::Neg(inner) => match eval_val(inner, columns, row)? {
+            Scalar::Null => Ok(Scalar::Null),
+            other => {
+                let Some(number) = number_of(&other) else {
+                    return Err(SqlError::Syntax("numeric".into()));
+                };
+                number
+                    .checked_neg()
+                    .map(Scalar::Int)
+                    .ok_or_else(|| SqlError::Syntax("overflow".into()))
+            }
+        },
+        ValExpr::Bin { op, left, right } => {
+            let left = eval_val(left, columns, row)?;
+            let right = eval_val(right, columns, row)?;
+            if matches!(left, Scalar::Null) || matches!(right, Scalar::Null) {
+                return Ok(Scalar::Null);
+            }
+            let Some(left) = number_of(&left) else {
+                return Err(SqlError::Syntax("numeric".into()));
+            };
+            let Some(right) = number_of(&right) else {
+                return Err(SqlError::Syntax("numeric".into()));
+            };
+            let value = match op {
+                Arith::Add => left.checked_add(right),
+                Arith::Sub => left.checked_sub(right),
+                Arith::Mul => left.checked_mul(right),
+                Arith::Div => {
+                    if right == 0 {
+                        return Err(SqlError::Syntax("division by zero".into()));
+                    }
+                    left.checked_div(right)
+                }
+            };
+            value
+                .map(Scalar::Int)
+                .ok_or_else(|| SqlError::Syntax("overflow".into()))
+        }
+        ValExpr::Case { arms, else_arm } => {
+            for (cond, value) in arms {
+                if eval_expr(cond, columns, row)?.is_true() {
+                    return eval_val(value, columns, row);
+                }
+            }
+            else_arm
+                .as_ref()
+                .map_or(Ok(Scalar::Null), |value| eval_val(value, columns, row))
+        }
+        ValExpr::Pred(inner) => Ok(match eval_expr(inner, columns, row)? {
+            Truth::True => Scalar::Text("true".into()),
+            Truth::False => Scalar::Text("false".into()),
+            Truth::Unknown => Scalar::Null,
+        }),
+    }
+}
+
+fn number_of(scalar: &Scalar) -> Option<i128> {
+    match scalar {
+        Scalar::Null => None,
+        Scalar::Int(number) => Some(*number),
+        Scalar::Text(text) => text.parse().ok(),
+    }
+}
+
+fn scalar_text(scalar: &Scalar) -> String {
+    match scalar {
+        Scalar::Null => String::new(),
+        Scalar::Int(number) => number.to_string(),
+        Scalar::Text(text) => text.clone(),
+    }
+}
+
+fn show_scalar(scalar: &Scalar) -> String {
+    match scalar {
+        Scalar::Null => String::new(),
+        Scalar::Int(number) => number.to_string(),
+        Scalar::Text(text) => show_cell(text),
+    }
+}
+
+fn scalar_group_key(scalar: &Scalar) -> String {
+    match scalar {
+        Scalar::Null => SQL_NULL.to_string(),
+        Scalar::Int(number) => number.to_string(),
+        Scalar::Text(text) if text == SQL_NULL => SQL_NULL.to_string(),
+        Scalar::Text(text) => text.clone(),
+    }
+}
+
+fn scalar_ord(left: &Scalar, right: &Scalar) -> Option<std::cmp::Ordering> {
+    match (left, right) {
+        (Scalar::Null, _) | (_, Scalar::Null) => None,
+        (Scalar::Int(left), Scalar::Int(right)) => Some(left.cmp(right)),
+        (Scalar::Int(left), Scalar::Text(right)) => Some(match right.parse::<i128>() {
+            Ok(right) => left.cmp(&right),
+            Err(_) => left.to_string().cmp(right),
+        }),
+        (Scalar::Text(left), Scalar::Int(right)) => Some(match left.parse::<i128>() {
+            Ok(left) => left.cmp(right),
+            Err(_) => left.cmp(&right.to_string()),
+        }),
+        (Scalar::Text(left), Scalar::Text(right)) => {
+            Some(match (left.parse::<i128>(), right.parse::<i128>()) {
+                (Ok(left), Ok(right)) => left.cmp(&right),
+                _ => left.cmp(right),
+            })
+        }
+    }
+}
+
+fn render_val(expr: &ValExpr) -> String {
+    match expr {
+        ValExpr::Column(name) => name.clone(),
+        ValExpr::Literal(value) => {
+            if value == SQL_NULL {
+                "null".to_string()
+            } else {
+                value.clone()
+            }
+        }
+        ValExpr::Neg(inner) => format!("-({})", render_val(inner)),
+        ValExpr::Bin { op, left, right } => format!(
+            "({} {} {})",
+            render_val(left),
+            arith_text(*op),
+            render_val(right)
+        ),
+        ValExpr::Case { arms, else_arm } => {
+            let mut text = String::from("case");
+            for (cond, value) in arms {
+                text.push_str(" when ");
+                text.push_str(&render_expr(cond));
+                text.push_str(" then ");
+                text.push_str(&render_val(value));
+            }
+            if let Some(value) = else_arm {
+                text.push_str(" else ");
+                text.push_str(&render_val(value));
+            }
+            text.push_str(" end");
+            text
+        }
+        ValExpr::Pred(inner) => format!("({})", render_expr(inner)),
+    }
+}
+
+fn render_val_outer(expr: &ValExpr) -> String {
+    match expr {
+        ValExpr::Bin { op, left, right } => format!(
+            "{} {} {}",
+            render_val(left),
+            arith_text(*op),
+            render_val(right)
+        ),
+        ValExpr::Neg(inner) => format!("-{}", render_val(inner)),
+        other => render_val(other),
+    }
+}
+
+fn render_expr(expr: &Expr) -> String {
+    match expr {
+        Expr::Value(value) => render_val(value),
+        Expr::And(items) => items
+            .iter()
+            .map(render_expr)
+            .collect::<Vec<_>>()
+            .join(" and "),
+        Expr::Or(items) => items
+            .iter()
+            .map(render_expr)
+            .collect::<Vec<_>>()
+            .join(" or "),
+        Expr::Not(inner) => format!("not {}", render_expr(inner)),
+        Expr::Cmp { left, op, right } => format!(
+            "{} {} {}",
+            render_val(left),
+            cmp_text(*op),
+            render_val(right)
+        ),
+        Expr::Between { value, low, high } => format!(
+            "{} between {} and {}",
+            render_val(value),
+            render_val(low),
+            render_val(high)
+        ),
+        Expr::IsNull { value, negated } => format!(
+            "{} is {}null",
+            render_val(value),
+            if *negated { "not " } else { "" }
+        ),
+        Expr::In {
+            value,
+            list,
+            negated,
+        } => format!(
+            "{} {}in ({})",
+            render_val(value),
+            if *negated { "not " } else { "" },
+            list.iter().map(render_val).collect::<Vec<_>>().join(", ")
+        ),
+        Expr::Like {
+            value,
+            pattern,
+            negated,
+        } => format!(
+            "{} {}like {}",
+            render_val(value),
+            if *negated { "not " } else { "" },
+            render_val(pattern)
+        ),
+    }
+}
+
+fn arith_text(op: Arith) -> &'static str {
     match op {
-        Cmp::Eq => ordering.is_eq(),
-        Cmp::Ne => ordering.is_ne(),
-        Cmp::Lt => ordering.is_lt(),
-        Cmp::Le => ordering.is_le(),
-        Cmp::Gt => ordering.is_gt(),
-        Cmp::Ge => ordering.is_ge(),
+        Arith::Add => "+",
+        Arith::Sub => "-",
+        Arith::Mul => "*",
+        Arith::Div => "/",
     }
 }
 
+fn cmp_text(op: Cmp) -> &'static str {
+    match op {
+        Cmp::Eq => "=",
+        Cmp::Ne => "<>",
+        Cmp::Lt => "<",
+        Cmp::Le => "<=",
+        Cmp::Gt => ">",
+        Cmp::Ge => ">=",
+    }
+}
+
+enum LikeTok {
+    Any,
+    One,
+    Char(char),
+}
+
+fn like_match(text: &str, pattern: &str) -> bool {
+    let text: Vec<char> = text.chars().collect();
+    let pattern = like_tokens(pattern);
+    let mut dp = vec![vec![false; pattern.len() + 1]; text.len() + 1];
+    dp[0][0] = true;
+    for (index, token) in pattern.iter().enumerate() {
+        if matches!(token, LikeTok::Any) {
+            dp[0][index + 1] = dp[0][index];
+        } else {
+            break;
+        }
+    }
+    for row in 1..=text.len() {
+        for column in 1..=pattern.len() {
+            dp[row][column] = match pattern[column - 1] {
+                LikeTok::Any => dp[row][column - 1] || dp[row - 1][column],
+                LikeTok::One => dp[row - 1][column - 1],
+                LikeTok::Char(ch) => dp[row - 1][column - 1] && text[row - 1] == ch,
+            };
+        }
+    }
+    dp[text.len()][pattern.len()]
+}
+
+fn like_tokens(pattern: &str) -> Vec<LikeTok> {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] == '\\' && index + 1 < chars.len() {
+            tokens.push(LikeTok::Char(chars[index + 1]));
+            index += 2;
+        } else if chars[index] == '%' {
+            tokens.push(LikeTok::Any);
+            index += 1;
+        } else if chars[index] == '_' {
+            tokens.push(LikeTok::One);
+            index += 1;
+        } else {
+            tokens.push(LikeTok::Char(chars[index]));
+            index += 1;
+        }
+    }
+    tokens
+}
 fn project_rows(stmt: &Stmt, result: QueryResult) -> Result<QueryResult, SqlError> {
     if stmt.columns == ["*"] {
         return Ok(show_result(result));
     }
-    let indexes = stmt
-        .columns
-        .iter()
-        .map(|name| resolve_column(&result.columns, name))
-        .collect::<Result<Vec<_>, _>>()?;
-    let rows = result
-        .rows
-        .into_iter()
-        .map(|row| {
-            indexes
-                .iter()
-                .map(|index| show_cell(row.get(*index).map(String::as_str).unwrap_or("")))
-                .collect()
-        })
-        .collect();
+    let mut rows = Vec::new();
+    for row in result.rows {
+        let mut out = Vec::new();
+        for (name, value) in stmt.columns.iter().zip(&stmt.select_values) {
+            if let Some(expr) = value {
+                out.push(show_scalar(&eval_val(expr, &result.columns, &row)?));
+            } else {
+                let index = resolve_column(&result.columns, name)?;
+                out.push(show_cell(row.get(index).map(String::as_str).unwrap_or("")));
+            }
+        }
+        rows.push(out);
+    }
     Ok(QueryResult {
         columns: stmt.headings.clone(),
         rows,
@@ -1887,8 +2628,12 @@ fn show_result(mut result: QueryResult) -> QueryResult {
 }
 
 fn group_rows(stmt: &Stmt, result: QueryResult) -> Result<QueryResult, SqlError> {
-    for name in stmt.columns.iter().filter(|name| !name.contains('(')) {
-        if stmt.group.iter().all(|group| group != name) {
+    for (name, value) in stmt.columns.iter().zip(&stmt.select_values) {
+        let aggregated = value.is_none() && name.contains('(');
+        if aggregated {
+            continue;
+        }
+        if stmt.group.iter().all(|group| render_val(group) != *name) {
             return Err(SqlError::Syntax(format!(
                 "column \"{name}\" must appear in GROUP BY"
             )));
@@ -1899,9 +2644,8 @@ fn group_rows(stmt: &Stmt, result: QueryResult) -> Result<QueryResult, SqlError>
         let key = stmt
             .group
             .iter()
-            .map(|name| {
-                resolve_column(&result.columns, name)
-                    .map(|index| row.get(index).cloned().unwrap_or_default())
+            .map(|expr| {
+                eval_val(expr, &result.columns, &row).map(|scalar| scalar_group_key(&scalar))
             })
             .collect::<Result<Vec<_>, _>>()?;
         if let Some((_, bucket)) = groups.iter_mut().find(|(existing, _)| existing == &key) {
@@ -1917,20 +2661,19 @@ fn group_rows(stmt: &Stmt, result: QueryResult) -> Result<QueryResult, SqlError>
     for (_, bucket) in groups {
         let mut out = Vec::new();
         let mut aggs = stmt.aggregates.iter();
-        for name in &stmt.columns {
-            if name.contains('(') {
+        let sample = bucket.first().cloned().unwrap_or_default();
+        for (name, value) in stmt.columns.iter().zip(&stmt.select_values) {
+            if value.is_none() && name.contains('(') {
                 let agg = aggs
                     .next()
                     .ok_or_else(|| SqlError::Syntax("aggregate".into()))?;
                 out.push(aggregate_text(&result.columns, &bucket, agg)?);
+            } else if let Some(expr) = value {
+                out.push(show_scalar(&eval_val(expr, &result.columns, &sample)?));
             } else {
                 let index = resolve_column(&result.columns, name)?;
                 out.push(show_cell(
-                    bucket
-                        .first()
-                        .and_then(|row| row.get(index))
-                        .map(String::as_str)
-                        .unwrap_or(""),
+                    sample.get(index).map(String::as_str).unwrap_or(""),
                 ));
             }
         }
@@ -2023,7 +2766,15 @@ fn tokenize(sql: &str) -> Vec<String> {
             tokens.push(value);
             continue;
         }
-        if ch == ',' || ch == '(' || ch == ')' || ch == '=' {
+        if ch == ','
+            || ch == '('
+            || ch == ')'
+            || ch == '='
+            || ch == '+'
+            || ch == '-'
+            || ch == '*'
+            || ch == '/'
+        {
             tokens.push(ch.to_string());
             continue;
         }
@@ -2041,7 +2792,11 @@ fn tokenize(sql: &str) -> Vec<String> {
         }
         let mut word = String::from(ch);
         while let Some(next) = chars.peek() {
-            if next.is_whitespace() || *next == ',' || *next == '(' || *next == ')' || *next == '='
+            if next.is_whitespace()
+                || matches!(
+                    *next,
+                    ',' | '(' | ')' | '=' | '+' | '-' | '*' | '/' | '<' | '>' | '!'
+                )
             {
                 break;
             }
@@ -2065,12 +2820,6 @@ fn expect(tokens: &[String], index: &mut usize, word: &str) -> Result<(), SqlErr
 
 fn unquote(value: &str) -> String {
     value.trim_matches('\'').to_string()
-}
-
-fn parse_i64(value: &str) -> Result<i64, SqlError> {
-    unquote(value)
-        .parse()
-        .map_err(|_| SqlError::Syntax(value.into()))
 }
 
 #[cfg(test)]
