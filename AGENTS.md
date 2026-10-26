@@ -25,6 +25,7 @@ QDB 是结构化内存数据库，用 Rust 实现。单机上只有一个写入�
 ```
 
 说明：[docs/2026-10-19-agent-pipeline.md](docs/2026-10-19-agent-pipeline.md)。角色卡：[`.agents/team/`](.agents/team/README.md)。交接物用 [`.agents/templates/`](.agents/templates/) 写到 `.agents/artifacts/`。门禁未过不得进入下一阶段。小修复可跳过规划和架构，不能跳过冒烟和简短评审。
+- **变更分级、DoD、引擎面门禁**见下文「生产级迭代」；清单模板 [`.agents/templates/dod.md`](.agents/templates/dod.md)；编排 skill **qdb-pipeline** / **qdb-dod**。
 
 ## 必读指针（按需加载）
 
@@ -65,8 +66,64 @@ QDB 是结构化内存数据库，用 Rust 实现。单机上只有一个写入�
 14. **库不做业务裁决**。时钟只认 UTC。交易所代码只是调用方给出的标识，库不解释其含义。开市时间、时区、夏令时、复权、涨跌停由业务系统在写入前处理。
 15. **手册随行为更新**。使用者能看见的行为有变化时，同一变更里改 [`docs/manual/`](docs/manual/index.md) 里对应的章。手册只写已经实现的用法。设计正文仍是实现约束。未实现的能力留在设计或日期文档里，不写进手册。
 16. **注释。** 公开函数的中文 `///` 要写全，结构对齐 Javadoc：第一句说明用途，然后是 `# Arguments`、`# Returns`、`# Errors`。`//` 只写不变量，`unsafe` 写 `// SAFETY:`。细则见 skill **qdb-dev** 的「注释」节。
+17. **生产级迭代（DoD / 分级 / 引擎面）**：见下一节；未满足不得声称「功能完成」或进入发布。
 
 与任何 skill 冲突时，以本文件和 `docs/design.md` 为准。
+
+## 生产级迭代（强制）
+
+### 变更分级
+
+| 级别 | 典型 | 可跳过 | **不可跳过** |
+|---|---|---|---|
+| hotfix | 单点 bug、文案、明显回归 | 规划 / 架构 | 冒烟或相关测试证据 +（建议）快速 Review |
+| feature | 新 API / SQL / 订阅 / 契约微调 | — | 规划摘要或验收条 + 开发 + `cargo test` 证据 + Review |
+| epic | ABI 大改、恢复路径重构、跨多 crate | — | 架构落盘 + 容量/延迟说明 + 回归包 + Review 阻断项清零 |
+
+用户未明确说「跳过流水线」时，**禁止**从编码直接跳到「做完了」。epic/feature 结束前加载 skill **qdb-dod** 自检。
+
+### Definition of Done（缺一不可）
+
+声称完成前必须同时具备：
+
+1. **验收**：Planner 验收标准（或 hotfix 自拟 1–3 条）每条有命令输出或测试名。
+2. **冒烟 / 测试**：默认 `cargo test --workspace -- --test-threads=1`；行为面再加与本改动相关的 HTTP / SQL / 恢复命令。**仅 `/health` 不算引擎完成。**
+3. **文档**：改 ABI / 恢复 / 订阅 / HTTP / 限制 → 同一变更更新 `docs/design.md` 对应节与 [`docs/manual/`](docs/manual/index.md) 对应章。
+4. **诚实边界**：未做完的能力（例：某协议未接）须在设计或日期文档标明；禁止写入手册当已实现。
+5. **运行态对齐**：用本轮构建的二进制（或已重建进程）验证；禁止只改源码未编译/未跑测就报绿。
+6. **收尾句式**（对人简报必填）：`已做 / 未做 / 已知风险 / 复验命令`。
+
+清单落盘：`.agents/artifacts/YYYY-MM-DD-<topic>-dod.md`（拷贝 [`.agents/templates/dod.md`](.agents/templates/dod.md)）。
+
+### 引擎面不变量（写入 / 查询 / ABI）
+
+与上文硬性约束同时生效：
+
+1. **先落盘再可见**：读者能看见的 `seq` 已在 WAL `fsync`；不得为「冒烟好看」跳过组提交语义。
+2. **已闭合 K 线只追加 revision**：早于当前桶的成交进 ticks、不改写已闭合棒（late-tick）；改聚合须有测试 + 手册句。
+3. **单写入者**：第二 `qdb` 进程必须在打开库前失败；改实例锁必测。
+4. **定点价格**：热路径与存储不用 `f64` 做金额比较。
+5. **gap 显式**：套圈或缺号不得假装连续；订阅续传语义与手册一致。
+6. **契约稳定**：破坏 `snapshots` / `klines` / `docs` / 查询参数上限时，DoD「已知风险」写清下游（含 EquityLab 客户端）影响；手册先于口头承诺。
+7. **可观测**：引擎改动至少验证一条 `/health` 失败条件或 `/metrics` 相关字段（若本次触及），或恢复后的 `applied_seq`。
+
+细则与验收剧本：[docs/2026-10-26-agent-dod-与引擎门禁.md](docs/2026-10-26-agent-dod-与引擎门禁.md)。
+
+### 评审阻断项（Reviewer 直接 block）
+
+- 实现与 `docs/design.md` 冲突且未先改设计
+- `unsafe` 出现在 `qdb-shm` / `qdb-wal` 之外
+- 行为变更未同步 `docs/manual/`
+- 密钥或 `data/` 进提交
+- 无验收 / 测试证据的 feature/epic「完成」
+- 把未实现能力写进手册当已交付
+- 破坏已文档化的 HTTP 上限或符号语义却无版本说明
+
+### 发布 / 回滚（Ops）
+
+- 整库测试 **与** 本功能冒烟同轮通过才可宣称发布。
+- 发布说明须含：**回滚二进制/commit** + 是否动 WAL / 数据目录（默认不动 WAL）。
+- 不默认 push；禁止打 Tag（同提交约定）。
 
 ## 自动化测试
 
@@ -103,6 +160,7 @@ cargo test --workspace -- --test-threads=1
 |---|---|
 | 在本仓实现或修改 | `qdb-dev` |
 | 按流水线推进 | `qdb-pipeline` |
+| 完成判据 / 可否发布 | `qdb-dod` |
 | 类型、crate、所有权 | `rust-program-design` |
 | 并发、共享内存 | `rust-concurrency-design` |
 | 行情概念 | `market-data-systems` |

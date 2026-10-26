@@ -6,7 +6,7 @@ description: >-
   or when the user wants work run as the QDB agent team.
 ---
 
-> **中文说明**：按「规划→架构→开发→测试→评审→发布→运维」推进 QDB。一次只主扮演一个角色，门禁通过再进入下一阶段。实现细节仍遵守 `qdb-dev`。
+> **中文说明**：按「规划→架构→开发→测试→评审→发布→运维」推进 QDB。一次只主扮演一个角色，门禁通过再进入下一阶段。实现细节仍遵守 `qdb-dev`。收尾强制 DoD（`qdb-dod`）。
 
 # QDB Pipeline
 
@@ -17,6 +17,7 @@ description: >-
 - 硬约束：[`AGENTS.md`](../../../AGENTS.md)
 - 设计正文：[`docs/design.md`](../../../docs/design.md)
 - 使用者手册：[`docs/manual/index.md`](../../../docs/manual/index.md)。行为变化时同一变更更新对应章节。
+- DoD / 引擎面：[`docs/2026-10-26-agent-dod-与引擎门禁.md`](../../../docs/2026-10-26-agent-dod-与引擎门禁.md)
 
 ## 过程
 
@@ -41,7 +42,11 @@ description: >-
 
 4. **门禁**：角色卡「完成判据」全部勾选后才进入下一阶段。
 
-5. **简报**
+5. **收尾 DoD**（feature / epic，或用户问「做完了吗」）
+   - 打开 skill **qdb-dod**，填写 [`.agents/templates/dod.md`](../../templates/dod.md) → artifacts。
+   - DoD fail → 回到开发/测试，不得 Release。
+
+6. **简报**
 
 ```text
 ## Pipeline status
@@ -63,7 +68,8 @@ description: >-
 | 测试 / 冒烟 | Test |
 | 审查 / review | Reviewer |
 | 发布 / 运维 / 恢复演练 | Ops |
-| 按流水线做完 | 从 Planner 走到 Ops |
+| DoD / 完成判据 / 可否发布 | `qdb-dod` |
+| 按流水线做完 | 从 Planner 走到 Ops，最后 DoD |
 
 ## 与其他 skill
 
@@ -71,4 +77,5 @@ description: >-
 - 新类型用 `rust-program-design`，并发和共享内存用 `rust-concurrency-design`。
 - 行情语义用 `market-data-systems` 和 `a-share-market`。
 - 评审用 `code-review`；`unsafe` 或共享内存再加 `differential-review`。
+- 收尾遵守 `qdb-dod`。
 - 用户要求提交时用 `commit`。未要求则不提交、不推送。

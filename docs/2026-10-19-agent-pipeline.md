@@ -28,14 +28,14 @@ Planner ──► Architect ──► Engine + Query
 | 开发 | Engine、Query | 对应 crate 与测试 | 该里程碑的验收命令能跑 |
 | 测试 | Test | 测试报告 | `cargo test --workspace -- --test-threads=1` 通过；`qdb-test` 表里已实现的每行都有测试名 |
 | 评审 | Reviewer | Standards / Spec 两轴 | 阻断项清零，或经人确认豁免 |
-| 发布 | Ops | 发布说明 | 恢复演练和 `/health` 通过 |
+| 发布 | Ops | 发布说明 | 恢复演练和 `/health` 通过；**DoD pass** |
 | 运维 | Ops | 指标、空窗、恢复步骤 | 已知故障写在发布说明里 |
 
 Engine 与 Query 可在架构门禁之后并行。共享的帧布局、`seq` 和符号格式以 Architect 更新后的 `docs/design.md` 为准。
 
 单会话里由当前代理按阶段扮演角色。交接物必须落在 `.agents/artifacts/`。没有落盘文件，不算阶段完成。
 
-小修复可以跳过规划和架构，不能跳过测试冒烟和一次简短评审。
+小修复可以跳过规划和架构，不能跳过测试冒烟和一次简短评审。feature / epic 在发布前须过 skill **qdb-dod**（见 [agent-dod-与引擎门禁](2026-10-26-agent-dod-与引擎门禁.md)）。
 
 ## 2. 角色
 

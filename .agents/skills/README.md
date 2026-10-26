@@ -7,7 +7,7 @@
 
 1. **流程类**：从 `equitylab/.agents/skills` 复制（该仓源自 deeplexcloud / mattpocock 系），加上本仓 **qdb-dev**。
 2. **栈专用**：从 equitylab 已安装的副本取来，只保留 Rust 通用实践和差分审查。来源见锁文件。
-3. **本仓编写**：`qdb-dev`、`qdb-pipeline`，加上 Rust 程序设计（`rust-program-design`、`rust-concurrency-design`）和行情前备知识（`market-data-systems`、`a-share-market`）。公开技能库里没有与本设计一致的对应物。
+3. **本仓编写**：`qdb-dev`、`qdb-pipeline`、`qdb-dod`，加上 Rust 程序设计（`rust-program-design`、`rust-concurrency-design`）和行情前备知识（`market-data-systems`、`a-share-market`）。公开技能库里没有与本设计一致的对应物。DoD 形态对齐 EquityLab 的 `equitylab-dod`，门禁改写为引擎 / WAL / 手册契约。
 
 ## 未放入（刻意跳过）
 
@@ -22,7 +22,8 @@
 | Skill | 用途 |
 |---|---|
 | [qdb-dev](./qdb-dev/SKILL.md) | 改 ABI、共享内存、WAL、聚合、SQL、订阅和恢复 |
-| [qdb-pipeline](./qdb-pipeline/SKILL.md) | 规划→架构→开发→测试→评审→发布→运维 |
+| [qdb-pipeline](./qdb-pipeline/SKILL.md) | 规划→架构→开发→测试→评审→发布→运维；收尾强制 DoD |
+| [qdb-dod](./qdb-dod/SKILL.md) | 完成判据：分级、冒烟证据、引擎面门禁、诚实边界 |
 | [qdb-test](./qdb-test/SKILL.md) | 提交前整库测试；分层、边界，以及尚未接入的覆盖率、loom、基准和 fuzz |
 
 ### 行情前备知识

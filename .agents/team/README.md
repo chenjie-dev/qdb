@@ -1,7 +1,8 @@
 # QDB Agent 团队
 
 流水线：[docs/2026-10-19-agent-pipeline.md](../../docs/2026-10-19-agent-pipeline.md)  
-编排技能：[qdb-pipeline](../skills/qdb-pipeline/SKILL.md)
+编排技能：[qdb-pipeline](../skills/qdb-pipeline/SKILL.md)  
+完成判据：[qdb-dod](../skills/qdb-dod/SKILL.md) · [DoD 与引擎门禁](../../docs/2026-10-26-agent-dod-与引擎门禁.md)
 
 | # | 角色 | 文件 |
 |---|---|---|
