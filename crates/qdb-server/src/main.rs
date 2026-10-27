@@ -1,6 +1,7 @@
 //! 行情进程。一台机器只运行一个实例，退出时卸下共享内存并清掉行情表。
 
 mod cluster;
+mod fanout;
 mod feed;
 mod ws;
 
@@ -733,8 +734,13 @@ fn handle(
                 );
             }
         };
+        let counters = databases.get(&name).ok().and_then(|engine| {
+            engine.lock().ok().map(|guard| fanout::Counters {
+                subscriber_count: guard.metrics().subscriber_count,
+            })
+        });
         std::thread::spawn(move || {
-            let _ = ws::accept(stream, &req, &path);
+            let _ = ws::accept(stream, &req, &path, counters);
         });
         return Ok(());
     }

@@ -1,14 +1,14 @@
 //! WebSocket 文本推送。一条连接执行一条 `SELECT`，先发当前行，再发新落盘的匹配行。
 //!
-//! 连接只读打开库，不持有写入者的锁。发送失败就关掉这条连接。
+//! 连接只读。同一个库的全部连接共用一个跟随线程，慢连接只关掉自己。
 
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-use qdb_sql::{captured_rows, live_rows, split_subscribe, SqlEngine};
-use qdb_store::Engine;
+use qdb_sql::split_subscribe;
 
+use crate::fanout::{self, Counters};
 use crate::feed::HttpRequest;
 
 const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -20,6 +20,7 @@ const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 /// * `stream` - 已经读完 HTTP 请求的连接。
 /// * `request` - 含 `Upgrade` 和 `Sec-WebSocket-Key` 的请求。
 /// * `database` - 库目录，不是实例根目录。
+/// * `counters` - 写入进程的订阅计数。测试里可以是 `None`。
 ///
 /// # Errors
 ///
@@ -28,6 +29,7 @@ pub fn accept(
     mut stream: TcpStream,
     request: &HttpRequest,
     database: &std::path::Path,
+    counters: Option<Counters>,
 ) -> std::io::Result<()> {
     let key = request
         .headers
@@ -52,12 +54,12 @@ pub fn accept(
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept_key}\r\n\r\n"
     );
     stream.write_all(resp.as_bytes())?;
-    let _ = stream.set_read_timeout(Some(Duration::from_millis(50)));
-    push(&mut stream, database);
+    let _ = stream.set_nodelay(true);
+    push(&mut stream, database, counters);
     Ok(())
 }
 
-fn push(stream: &mut TcpStream, database: &std::path::Path) {
+fn push(stream: &mut TcpStream, database: &std::path::Path, counters: Option<Counters>) {
     let Some(sql) = read_subscribe(stream) else {
         return;
     };
@@ -86,88 +88,32 @@ fn push(stream: &mut TcpStream, database: &std::path::Path) {
         );
         return;
     }
-    let mut engine = match Engine::open_read(database) {
-        Ok(engine) => engine,
-        Err(err) => {
-            let _ = send_text(
-                stream,
-                &format!(
-                    "{{\"type\":\"error\",\"message\":{}}}",
-                    json_string(&err.to_string())
-                ),
-            );
-            return;
-        }
-    };
-    let mut seen = Vec::new();
-    let mut primed = false;
-    match SqlEngine::new(&engine).query(&sql) {
-        Ok(result) => {
-            if send_text(stream, &snapshot_json(&result.columns, &result.rows)).is_err() {
-                return;
-            }
-            seen = captured_rows(&engine, &sql).unwrap_or(result.rows);
-            primed = true;
-        }
-        Err(err) if err.to_string().contains("symbol not found") => {
-            if send_text(stream, "{\"type\":\"waiting\"}").is_err() {
-                return;
-            }
-        }
-        Err(err) => {
-            let _ = send_text(
-                stream,
-                &format!(
-                    "{{\"type\":\"error\",\"message\":{}}}",
-                    json_string(&err.to_string())
-                ),
-            );
-            return;
-        }
-    }
+    let out = fanout::subscribe(database, sql, counters);
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(1)));
     loop {
         match read_frame(stream) {
-            Ok(Frame::Close) => return,
+            Ok(Frame::Close) => break,
             Ok(Frame::Ping(payload)) => {
                 if send_frame(stream, 0xA, &payload).is_err() {
-                    return;
+                    break;
                 }
             }
             Err(err)
                 if err.kind() == std::io::ErrorKind::TimedOut
                     || err.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(_) => return,
+            Err(_) => break,
             Ok(_) => {}
         }
-        let before = engine.applied_seq();
-        let changes = match engine.poll() {
-            Ok(changes) => changes,
-            Err(_) => return,
-        };
-        if changes.is_empty() && engine.applied_seq() == before {
-            continue;
-        }
-        if !primed {
-            if let Ok(result) = SqlEngine::new(&engine).query(&sql) {
-                if send_text(stream, &snapshot_json(&result.columns, &result.rows)).is_err() {
-                    return;
-                }
-                seen = captured_rows(&engine, &sql).unwrap_or(result.rows);
-                primed = true;
+        if let Some(text) = out.pop() {
+            if send_text(stream, &text).is_err() {
+                break;
             }
-            continue;
-        }
-        let rows = match live_rows(&engine, &sql, &changes, &seen) {
-            Ok(rows) => rows,
-            Err(_) => return,
-        };
-        for row in rows {
-            if send_text(stream, &row_json(&row)).is_err() {
-                return;
+            if text == "{\"type\":\"gap\"}" || text.contains("\"type\":\"error\"") {
+                break;
             }
-            seen.push(row);
         }
     }
+    out.close();
 }
 
 fn read_subscribe(stream: &mut TcpStream) -> Option<String> {
@@ -257,38 +203,6 @@ fn send_frame(stream: &mut TcpStream, opcode: u8, payload: &[u8]) -> std::io::Re
     }
     header.extend_from_slice(payload);
     stream.write_all(&header)
-}
-
-fn snapshot_json(columns: &[String], rows: &[Vec<String>]) -> String {
-    let mut out = String::from("{\"type\":\"snapshot\",\"columns\":[");
-    push_strings(&mut out, columns);
-    out.push_str("],\"rows\":[");
-    for (index, row) in rows.iter().enumerate() {
-        if index > 0 {
-            out.push(',');
-        }
-        out.push('[');
-        push_strings(&mut out, row);
-        out.push(']');
-    }
-    out.push_str("]}");
-    out
-}
-
-fn row_json(values: &[String]) -> String {
-    let mut out = String::from("{\"type\":\"row\",\"values\":[");
-    push_strings(&mut out, values);
-    out.push_str("]}");
-    out
-}
-
-fn push_strings(out: &mut String, values: &[String]) {
-    for (index, value) in values.iter().enumerate() {
-        if index > 0 {
-            out.push(',');
-        }
-        out.push_str(&json_string(value));
-    }
 }
 
 fn json_string(value: &str) -> String {
@@ -397,7 +311,9 @@ fn sha1(message: &[u8]) -> [u8; 20] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use qdb_store::Engine;
     use std::net::TcpListener;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::thread;
 
     #[test]
@@ -430,7 +346,7 @@ mod tests {
         let server = thread::spawn(move || {
             let mut stream = listener.accept().unwrap().0;
             let request = crate::feed::read_request(&mut stream).unwrap();
-            accept(stream, &request, &server_dir).unwrap();
+            accept(stream, &request, &server_dir, None).unwrap();
         });
         let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
         client
@@ -463,6 +379,84 @@ mod tests {
         server.join().unwrap();
         drop(writer);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn websocket_fans_one_batch_out_to_two_clients() {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("qdb-ws-fan-{n}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut writer = Engine::open(&dir).unwrap();
+        writer.write_trade("SSE", "600000", 1, 10, 1).unwrap();
+        let count = std::sync::Arc::new(AtomicU64::new(0));
+        let counters = Some(crate::fanout::Counters {
+            subscriber_count: std::sync::Arc::clone(&count),
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_dir = dir.clone();
+        thread::spawn(move || {
+            for _ in 0..2 {
+                let mut stream = listener.accept().unwrap().0;
+                let request = crate::feed::read_request(&mut stream).unwrap();
+                let dir = server_dir.clone();
+                let counters = counters.clone();
+                thread::spawn(move || {
+                    accept(stream, &request, &dir, counters).unwrap();
+                });
+            }
+        });
+        let mut first = handshake(port);
+        let mut second = handshake(port);
+        write_client_text(
+            &mut first,
+            "SELECT price FROM ticks WHERE symbol = 'SSE:600000'",
+        );
+        write_client_text(
+            &mut second,
+            "SELECT price FROM ticks WHERE symbol = 'SSE:600000'",
+        );
+        let left = read_server_text(&mut first).unwrap();
+        let right = read_server_text(&mut second).unwrap();
+        assert!(left.contains("\"type\":\"snapshot\""), "{left}");
+        assert!(right.contains("\"type\":\"snapshot\""), "{right}");
+        let started = std::time::Instant::now();
+        while count.load(Ordering::Acquire) != 2 && started.elapsed() < Duration::from_secs(1) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(count.load(Ordering::Acquire), 2);
+        writer.write_trade("SSE", "600000", 2, 20, 1).unwrap();
+        let left = read_server_text(&mut first).unwrap();
+        let right = read_server_text(&mut second).unwrap();
+        assert!(left.contains("20"), "{left}");
+        assert!(right.contains("20"), "{right}");
+        write_client_frame(&mut first, 0x8, &[]);
+        write_client_frame(&mut second, 0x8, &[]);
+        let started = std::time::Instant::now();
+        while count.load(Ordering::Acquire) != 0 && started.elapsed() < Duration::from_secs(1) {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(count.load(Ordering::Acquire), 0);
+        drop(writer);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn handshake(port: u16) -> TcpStream {
+        let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        client
+            .write_all(b"GET /v1/ws HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n")
+            .unwrap();
+        let mut prelude = Vec::new();
+        let mut byte = [0u8; 1];
+        while !prelude.windows(4).any(|window| window == b"\r\n\r\n") {
+            client.read_exact(&mut byte).unwrap();
+            prelude.push(byte[0]);
+        }
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client
     }
 
     fn write_client_text(stream: &mut TcpStream, text: &str) {

@@ -73,7 +73,7 @@ JSON：`{"items":[{"key":"binance:ticker:BTCUSDT","value":{}}]}`。值原样保�
 {"type":"row","values":["20"]}
 ```
 
-证券还不存在时先发 `{"type":"waiting"}`。语句错误发 `{"type":"error","message":"..."}` 并关闭。这是只读连接，读已经 `fsync` 的 WAL，大约每 50 毫秒看一次。写失败或客户端关闭就结束这条连接，不挡住写入线程。
+证券还不存在时先发 `{"type":"waiting"}`。语句错误发 `{"type":"error","message":"..."}` 并关闭。同一个库的全部连接共用一个跟随线程，读已经 `fsync` 的 WAL，空闲时大约每 1 毫秒一次。同一批新记录里，相同的增量 `SELECT` 只计算一次。每条连接有自己的发送队列，默认 4096 条，可用 `QDB_WS_QUEUE` 改。队列放不下时只向这条连接发 `{"type":"gap"}` 并关闭，写入线程和其他连接继续。活跃连接数在 `qdb_subscriber_count`。
 
 ### GET /v1/replicate?from=&repl_id=&db=
 

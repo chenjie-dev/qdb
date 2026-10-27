@@ -640,7 +640,7 @@ from_seq      希望收到的下一条 seq。0 表示从当前快照开始
 | --- | --- | --- |
 | 共享内存 | 第一版 | 读者自己维护 `cursor`，按 3.4 读帧 |
 | TCP 长度前缀帧 | 第一版 | 网关过滤后推送，payload 与共享内存帧相同 |
-| WebSocket 文本 | 已实现 | `GET /v1/ws`。客户端发一条 `SELECT`。服务端先推当前结果，再推新落盘且匹配的行。正文是 JSON，列与 `SELECT` 相同。慢连接只断开自己，不挡住写入 |
+| WebSocket 文本 | 已实现 | `GET /v1/ws`。客户端发一条 `SELECT`。每个库一个跟随线程读已经 `fsync` 的 WAL，空闲时大约 1 毫秒一次。同一批变更里相同的增量查询只投影一次。服务端先推当前结果，再推新行。慢连接的队列默认 4096 条，满了只向该连接发 `{"type":"gap"}` 并关闭，不挡住写入和其他订阅 |
 | gRPC server stream | 后续 | 同一套字段的 protobuf 映射 |
 
 TCP 帧：
@@ -682,7 +682,7 @@ sequenceDiagram
 
 ### 6.4 网关内部
 
-网关一个线程按 `write_seq` 读环形缓冲，匹配订阅者，写入每个订阅者的有界队列。队列默认 4096 帧。队列满时丢弃该订阅者的实时资格并发送 `Gap`，不减慢读取线程。
+网关按库跟随已经 `fsync` 的 WAL，匹配订阅者，写入每个订阅者的有界队列。WebSocket 使用这条路径：空闲时大约每 1 毫秒读一次，同一条增量 `SELECT` 在一批变更里只投影一次。队列默认 4096 条，可用 `QDB_WS_QUEUE` 调整，至少为 1。队列满时清空该连接的待发消息，放入一条 `{"type":"gap"}` 并关闭它，不减慢跟随线程，也不增加 `qdb_gap_total`。慢订阅者不让 `/health` 变成 503。
 
 WAL 重放使用单独的发送循环，补到 `write_seq` 之后再切入实时匹配。一个订阅者在重放完成前不接收实时帧，避免新旧交叉。
 
@@ -893,7 +893,7 @@ write_seq = applied_seq，但环形缓冲里不必塞入历史帧
 | `qdb_reader_lag_frames` | 每个已注册读者相对 `write_seq` 的距离 |
 | `qdb_ring_usage_ratio` | 第 3.6 节的使用率 |
 | `qdb_subscriber_count` | 活跃订阅 |
-| `qdb_gap_total` | 套圈、缺号、订阅队列满 |
+| `qdb_gap_total` | 套圈和缺号。订阅队列满只断开该连接，不计入这里 |
 | `qdb_late_tick_total` | 迟到 Tick |
 | `qdb_symbol_silence_seconds` | 交易时段内某符号距上一笔 Tick 的时间。第一版可以先做全局最后事件时间 |
 

@@ -111,7 +111,7 @@ pub fn crc_failed(&self) -> bool
 | `late_tick_total` | 时间早于当前桶、因而没进入 K 线的成交数 |
 | `crc_failed` | WAL 重放发现坏 CRC |
 | `heartbeat_ns` | 最近一次写入的 UTC 纳秒 |
-| `subscriber_count` | 预留。当前订阅函数不增加它 |
+| `subscriber_count` | 当前进程里活跃的 WebSocket 订阅。命令行 `SUBSCRIBE` 不增加它 |
 
 ## 直接使用聚合器
 

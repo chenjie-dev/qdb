@@ -260,6 +260,30 @@ pub fn split_subscribe(sql: &str) -> Result<Option<String>, SqlError> {
     Ok(Some(head.to_string()))
 }
 
+/// 这条 `SELECT` 的增量是否只由 [`Engine::poll`] 的变更决定。
+///
+/// 成交、报价和 K 线的列投影返回 `Ok(true)`。`symbols`、用户表、聚合、表达式、`UNION` 和连接要重算整表，返回 `Ok(false)`。
+///
+/// # Errors
+///
+/// 语句无法解析时返回 [`SqlError::Syntax`]。
+pub fn follows_changes(sql: &str) -> Result<bool, SqlError> {
+    Ok(incremental(&parse(sql)?))
+}
+
+fn incremental(stmt: &Stmt) -> bool {
+    stmt.joins.is_empty()
+        && stmt.aggregates.is_empty()
+        && stmt.union.is_empty()
+        && stmt.select_values.iter().all(|value| {
+            value
+                .as_ref()
+                .is_none_or(|expr| matches!(expr, ValExpr::Column(_)))
+        })
+        && stmt.table != "symbols"
+        && builtin_table(&stmt.table)
+}
+
 /// 把新变更投影成与这条 `SELECT` 相同的列。
 ///
 /// 成交、报价和 K 线按 `changes` 逐条投影，同一价格的新成交也会返回。`symbols`、用户表、聚合、表达式和 `UNION` 不看单条变更的列，而是重算后返回 `seen` 里没有的行。`LIMIT` 不截断这里的增量。
@@ -285,16 +309,7 @@ pub fn live_rows(
     seen: &[Vec<String>],
 ) -> Result<Vec<Vec<String>>, SqlError> {
     let stmt = parse(sql)?;
-    if !stmt.joins.is_empty()
-        || !stmt.aggregates.is_empty()
-        || !stmt.union.is_empty()
-        || stmt
-            .select_values
-            .iter()
-            .any(|value| matches!(value, Some(expr) if !matches!(expr, ValExpr::Column(_))))
-        || stmt.table == "symbols"
-        || !builtin_table(&stmt.table)
-    {
+    if !incremental(&stmt) {
         let mut wide = stmt.clone();
         wide.limit = 100_000;
         let rows = SqlEngine::new(engine).execute_query(&wide)?.rows;
