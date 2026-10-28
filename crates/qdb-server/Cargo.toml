@@ -24,5 +24,9 @@ name = "qdb-bench"
 path = "src/bin/qdb-bench.rs"
 
 [[bin]]
+name = "qdb-load"
+path = "src/bin/qdb-load.rs"
+
+[[bin]]
 name = "qdb-client"
 path = "src/bin/qdb-client.rs"

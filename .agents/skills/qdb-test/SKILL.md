@@ -82,7 +82,7 @@ cargo test --workspace -- --test-threads=1
 | 性能 | 48 笔成交的一次组提交，耗时小于逐条 `fsync` 的三分之一；512 笔、每 256 条一批时，`flush_count` 不超过 4，且 15 秒内完成；券商席位开盘在 `a_broker_desk_opening_keeps_venues_apart_and_closed_bars_intact`；256 个订阅者同时跟上在 `many_desk_subscribers_catch_up_while_the_writer_keeps_going`；128 路 WebSocket 各收各的标的在 `many_websocket_subscribers_each_get_their_own_symbol` |
 | 健康 | 无心跳可用，CRC 或缺口不可用，心跳超过 2 秒不可用 |
 | 实例 | 同一把实例锁上，第二个 qdb 进程启动失败，且不会先打开库 |
-| 行情中心 | 组提交在 flush 前不增加落盘次数；五档报价往返；from_seq=0 返回当前快照；检查点之后前缀损坏仍能打开 |
+| 行情中心 | 组提交在 flush 前不增加落盘次数；五档报价往返；from_seq=0 返回当前快照；检查点之后前缀损坏仍能打开；停牌只有报价、时钟只收本交易所、128 只证券各留自己的一笔、64 路查询读到同一收盘价、删掉共享内存后席位簿仍在，见 `qdb-suite` 的 `broker_ops` |
 | 退出 | `release` 后内存表为空，WAL 仍能再打开；SIGTERM 后进程退出并打印已释放内存 |
 
 ## 当前 SQL
@@ -121,7 +121,7 @@ cargo test --workspace -- --test-threads=1
 | 覆盖率 | 用 `cargo llvm-cov` 或 tarpaulin 出报告。核心 crate 行覆盖率不低于 80%。`qdb-sql` 解析、`qdb-agg`、`qdb-wal` 恢复不低于 90%。低于阈值则 CI 失败 |
 | loom | 只测环形缓冲和 seqlock。生产代码默认用标准库原子量；`cfg(loom)` 下改用 loom 的原子量、互斥锁和线程。测试里的调度都从 loom 来。模型仍是一个写入者和多个读者 |
 | 压测 | 一个写入者和多个只读查询同时运行一段时间。断言不 panic、已发布的行不丢、进程内存不随着重复查询无限增长 |
-| 基准 | `cargo bench`，文件在 `benches/`，`Cargo.toml` 里 `harness = false`。用 Criterion，输入套 `black_box`。场景：单条写入、批量写入、按标的加时间范围查询、数据量变大后的同一查询、订阅从写入到读者看见的延迟、标的数量增加后的内存。基准不放进 `cargo test`。核心路径变慢时，提交说明写原因。`cargo test` 里的性能仍只用设计中的倍数和时限 |
+| 基准 | `cargo bench` 尚未接入。生产负载用 `cargo run -p qdb-server --bin qdb-load --release`：预热不计入，同一负载 3 轮，报告 p50 / p99 / p999。数字只描述当次机器，不写进 `cargo test` 的合格线 |
 | fuzz | 对 SQL 文本、WAL 字节、行情 JSON 和行情文本做 fuzz。畸形长度、缺字段、超大整数、非数字价格都要拒绝或跳过，不 panic，也不把 `NaN` 写进价格。价格继续用 `i64` |
 | CI | 合并前跑格式、Clippy、`cargo test --workspace -- --test-threads=1`、覆盖率。loom 和 fuzz 单独一个任务。基准按计划比较历史结果，回退时要有说明 |
 
