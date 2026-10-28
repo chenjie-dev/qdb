@@ -193,7 +193,8 @@ fn many_desk_subscribers_catch_up_while_the_writer_keeps_going() {
                         continue;
                     };
                     if reader.ticks(id).len() >= expected_ticks(name.code) {
-                        let prices: Vec<_> = reader.ticks(id).iter().map(|tick| tick.price).collect();
+                        let prices: Vec<_> =
+                            reader.ticks(id).iter().map(|tick| tick.price).collect();
                         if name.code == "000001" && name.exchange == "SZSE" {
                             assert!(prices.iter().all(|price| *price != 99_900));
                         }
@@ -239,17 +240,61 @@ fn many_desk_subscribers_catch_up_while_the_writer_keeps_going() {
 
 fn book() -> Vec<Name> {
     vec![
-        Name { exchange: "SSE", code: "600519", open_px: 1_680_0000 },
-        Name { exchange: "SSE", code: "601318", open_px: 48_0000 },
-        Name { exchange: "SSE", code: "600000", open_px: 10_0000 },
-        Name { exchange: "SSE", code: "510050", open_px: 2_5000 },
-        Name { exchange: "SSE", code: "000001", open_px: 99_900 },
-        Name { exchange: "SZSE", code: "000001", open_px: 120_000 },
-        Name { exchange: "SZSE", code: "000002", open_px: 80_000 },
-        Name { exchange: "SZSE", code: "300750", open_px: 180_0000 },
-        Name { exchange: "BSE", code: "830799", open_px: 15_0000 },
-        Name { exchange: "HKEX", code: "00700", open_px: 320_0000 },
-        Name { exchange: "BINANCE", code: "BTCUSDT", open_px: 42_000_0000 },
+        Name {
+            exchange: "SSE",
+            code: "600519",
+            open_px: 1_680_0000,
+        },
+        Name {
+            exchange: "SSE",
+            code: "601318",
+            open_px: 48_0000,
+        },
+        Name {
+            exchange: "SSE",
+            code: "600000",
+            open_px: 10_0000,
+        },
+        Name {
+            exchange: "SSE",
+            code: "510050",
+            open_px: 2_5000,
+        },
+        Name {
+            exchange: "SSE",
+            code: "000001",
+            open_px: 99_900,
+        },
+        Name {
+            exchange: "SZSE",
+            code: "000001",
+            open_px: 120_000,
+        },
+        Name {
+            exchange: "SZSE",
+            code: "000002",
+            open_px: 80_000,
+        },
+        Name {
+            exchange: "SZSE",
+            code: "300750",
+            open_px: 180_0000,
+        },
+        Name {
+            exchange: "BSE",
+            code: "830799",
+            open_px: 15_0000,
+        },
+        Name {
+            exchange: "HKEX",
+            code: "00700",
+            open_px: 320_0000,
+        },
+        Name {
+            exchange: "BINANCE",
+            code: "BTCUSDT",
+            open_px: 42_000_0000,
+        },
     ]
 }
 

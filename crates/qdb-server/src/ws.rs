@@ -450,8 +450,12 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("qdb-ws-desk-{n}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut writer = Engine::open(&dir).unwrap();
-        writer.write_trade("SSE", "600519", 1, 1_680_0000, 100).unwrap();
-        writer.write_trade("SZSE", "000001", 1, 120_000, 100).unwrap();
+        writer
+            .write_trade("SSE", "600519", 1, 1_680_0000, 100)
+            .unwrap();
+        writer
+            .write_trade("SZSE", "000001", 1, 120_000, 100)
+            .unwrap();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let server_dir = dir.clone();

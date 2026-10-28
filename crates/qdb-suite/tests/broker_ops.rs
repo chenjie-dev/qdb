@@ -34,9 +34,7 @@ fn a_clock_seals_only_the_named_exchange() {
     engine
         .write_trade("SZSE", "000001", OPEN_NS, 120_000, 100)
         .unwrap();
-    engine
-        .write_clock("SSE", OPEN_NS + 60_000_000_000)
-        .unwrap();
+    engine.write_clock("SSE", OPEN_NS + 60_000_000_000).unwrap();
     let sse = engine.resolve("SSE:600519").unwrap();
     let szse = engine.resolve("SZSE:000001").unwrap();
     let sse_bar = engine.klines(sse, Period::S1);
@@ -133,17 +131,22 @@ fn the_desk_book_reopens_after_shared_memory_is_removed() {
     assert_eq!(engine.ticks(pingan)[0].price, 120_000);
     assert!(engine.ticks(etf).is_empty());
     assert_eq!(engine.quote(etf).unwrap().last, 2_5000);
-    assert_eq!(
-        engine.klines(maotai, Period::S1)[0].close,
-        1_680_0000
-    );
+    assert_eq!(engine.klines(maotai, Period::S1)[0].close, 1_680_0000);
 }
 
 fn name(index: usize) -> (&'static str, String, i64) {
     if index % 2 == 0 {
-        ("SSE", format!("{:06}", 600_000 + index / 2), 100_000 + index as i64)
+        (
+            "SSE",
+            format!("{:06}", 600_000 + index / 2),
+            100_000 + index as i64,
+        )
     } else {
-        ("SZSE", format!("{:06}", 1 + index / 2), 200_000 + index as i64)
+        (
+            "SZSE",
+            format!("{:06}", 1 + index / 2),
+            200_000 + index as i64,
+        )
     }
 }
 
