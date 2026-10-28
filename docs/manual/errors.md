@@ -29,6 +29,28 @@
 
 未知表的文案是 `syntax: unknown table 名称`。
 
+常见语法文案：
+
+| 文案 | 何时出现 |
+|---|---|
+| `syntax: symbol required` | `klines` 或 `snapshots` 的最外层 `AND` 里没有 `symbol = ...` |
+| `syntax: period required` | `klines` 没有 `period = ...` |
+| `syntax: unknown column 名称` | 选择列表、`WHERE` 或 `ORDER BY` 点了不存在的列 |
+| `syntax: column "名称" is ambiguous` | 连接后列名在多张表里出现，又没有表前缀 |
+| `syntax: column "名称" must appear in GROUP BY` | 非聚合表达式不在分组键里 |
+| `syntax: column "名称" does not exist` | 过滤或排序用了结果里没有的列 |
+| `syntax: each UNION query must have the same number of columns` | `UNION` 两侧列数不同 |
+| `syntax: cross join cannot have on` | `CROSS JOIN` 写了 `ON` |
+| `syntax: aggregate is not supported on join` | 连接查询里写了聚合 |
+| `syntax: division by zero` | 整数表达式除以 0 |
+| `syntax: numeric` | 四则运算的操作数不是整数 |
+| `syntax: boolean` | `WHERE` 里单独写了一个不能当布尔值的表达式 |
+| `syntax: duplicate key` | `INSERT` 违反主键 |
+| `syntax: table already exists` | `CREATE TABLE` 重名 |
+| `syntax: type mismatch` | `INSERT` 的值对不上列类型 |
+| `syntax: column count` | `INSERT` 的值个数和列数不同 |
+| `syntax: limit` | `LIMIT` 后面不是整数，或写了两次 |
+
 ## 订阅：`qdb_sub::SubError`
 
 | 变体 | 文案 | 原因 |

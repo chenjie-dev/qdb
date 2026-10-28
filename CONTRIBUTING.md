@@ -5,7 +5,7 @@ QDB 用 Rust 实现，采用 MIT 许可证。设计正文是 [docs/design.md](do
 ## 改动怎么进仓库
 
 1. 行为和设计冲突时，先改 `docs/design.md`，再改代码。
-2. 使用者能看见的行为，同一变更里更新 `docs/manual/` 里对应的章节。
+2. 使用者能看见的行为，同一变更里按 [docs/manual/index.md](docs/manual/index.md)「后续增补」更新对应章节。语法、说明、参数或输出、注意和示例都要补上。
 3. 提交前运行 `cargo test --workspace`。已经实现的行为要有测试，边界见 [.agents/skills/qdb-test/SKILL.md](.agents/skills/qdb-test/SKILL.md)。
 4. 提交说明用中文，格式是 `type: 描述`。`type` 取 `feat`、`fix`、`perf`、`refactor`、`chore`、`docs`、`style`。
 

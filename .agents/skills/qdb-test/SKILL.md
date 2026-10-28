@@ -87,7 +87,7 @@ cargo test --workspace -- --test-threads=1
 
 ## 当前 SQL
 
-只测 [`docs/manual/sql.md`](../../../docs/manual/sql.md) 里已经写明的语法。下面每一条都要有测试名。子查询、`UPDATE`、`DELETE`、窗口函数、连接上的聚合，断言为失败，不能当成已支持。
+只测 [`docs/manual/sql.md`](../../../docs/manual/sql.md) 里已经写明的语法。新语法先按 [`docs/manual/index.md`](../../../docs/manual/index.md)「后续增补」写进那一章，再改下面的表并补测试。下面每一条都要有测试名。子查询、`UPDATE`、`DELETE`、窗口函数、连接上的聚合，断言为失败，不能当成已支持。
 
 | 写法 | 必须碰到的边界 |
 |---|---|

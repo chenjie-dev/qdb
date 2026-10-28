@@ -1,6 +1,6 @@
 # 教程
 
-本页用库接口写入两笔成交，再查出 1 分钟 K 线。服务进程只提供健康检查，不接收写入和 SQL。
+本页用库接口写入两笔成交，再查出 1 分钟 K 线。服务进程的 HTTP 写入和 WebSocket 见 [服务进程](server.md)。
 
 ## 环境
 
@@ -57,7 +57,7 @@ assert_eq!(result.rows.len(), 1);
 cargo run -p qdb-server -- data
 ```
 
-默认监听 `127.0.0.1:9090`。`GET /health` 返回 `ok`，`GET /metrics` 返回序号计数。这个进程打开数据库后只提供这两个路径，不接受写入。
+默认监听 `127.0.0.1:9090`。`GET /health` 返回 `ok`，`GET /metrics` 返回序号计数。写入、K 线和 WebSocket 订阅见 [服务进程](server.md)。SQL 也可以不经进程，直接对上面的 `Engine` 调用。
 
 ## 下一步
 
