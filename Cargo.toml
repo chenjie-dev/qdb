@@ -9,6 +9,7 @@ members = [
     "crates/qdb-sql",
     "crates/qdb-sub",
     "crates/qdb-server",
+    "crates/qdb-suite",
 ]
 
 [workspace.package]
@@ -29,3 +30,4 @@ qdb-agg = { path = "crates/qdb-agg" }
 qdb-store = { path = "crates/qdb-store" }
 qdb-sql = { path = "crates/qdb-sql" }
 qdb-sub = { path = "crates/qdb-sub" }
+qdb-suite = { path = "crates/qdb-suite" }

@@ -1,0 +1,14 @@
+[package]
+name = "qdb-suite"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+description = "通过公开接口做的验收套件。不访问交易所，也不读私有字段。"
+
+[dependencies]
+qdb-abi.workspace = true
+qdb-sql.workspace = true
+qdb-store.workspace = true
+qdb-sub.workspace = true

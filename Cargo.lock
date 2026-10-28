@@ -218,6 +218,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "qdb-suite"
+version = "0.1.0"
+dependencies = [
+ "qdb-abi",
+ "qdb-sql",
+ "qdb-store",
+ "qdb-sub",
+]
+
+[[package]]
 name = "qdb-wal"
 version = "0.1.0"
 dependencies = [

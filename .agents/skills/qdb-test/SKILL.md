@@ -26,7 +26,7 @@ cargo test --workspace -- --test-threads=1
 
 ## 分层
 
-单元测试放在对应 crate 的 `#[cfg(test)]` 里，测纯函数。集成测试放在 `tests/`，每个文件单独编译，只调用 `pub` 接口。两类测试都要碰到正常值、边界值、异常值。
+单元测试放在对应 crate 的 `#[cfg(test)]` 里，测纯函数。集成测试放在各 crate 的 `tests/`，以及验收套件 [`crates/qdb-suite`](../../../crates/qdb-suite)。每个文件单独编译，只调用 `pub` 接口。`qdb-suite` 用夹具独占临时目录，事件时间从固定 UTC 纪元加偏移。两类测试都要碰到正常值、边界值、异常值。
 
 | 层 | 已经要覆盖的行为 |
 |---|---|
