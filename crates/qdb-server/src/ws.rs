@@ -442,6 +442,71 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn many_websocket_subscribers_each_get_their_own_symbol() {
+        const CLIENTS: usize = 128;
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("qdb-ws-desk-{n}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut writer = Engine::open(&dir).unwrap();
+        writer.write_trade("SSE", "600519", 1, 1_680_0000, 100).unwrap();
+        writer.write_trade("SZSE", "000001", 1, 120_000, 100).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server_dir = dir.clone();
+        thread::spawn(move || {
+            for _ in 0..(CLIENTS + 1) {
+                let mut stream = listener.accept().unwrap().0;
+                let request = crate::feed::read_request(&mut stream).unwrap();
+                let dir = server_dir.clone();
+                thread::spawn(move || {
+                    accept(stream, &request, &dir, None).unwrap();
+                });
+            }
+        });
+        let mut maotai: Vec<TcpStream> = (0..CLIENTS).map(|_| handshake(port)).collect();
+        let mut ping_an = handshake(port);
+        for client in &mut maotai {
+            write_client_text(
+                client,
+                "SELECT price FROM ticks WHERE symbol = 'SSE:600519'",
+            );
+        }
+        write_client_text(
+            &mut ping_an,
+            "SELECT price FROM ticks WHERE symbol = 'SZSE:000001'",
+        );
+        for client in &mut maotai {
+            let snapshot = read_server_text(client).unwrap();
+            assert!(snapshot.contains("16800000"), "{snapshot}");
+            assert!(!snapshot.contains("120000"), "{snapshot}");
+        }
+        let snapshot = read_server_text(&mut ping_an).unwrap();
+        assert!(snapshot.contains("120000"), "{snapshot}");
+        assert!(!snapshot.contains("16800000"), "{snapshot}");
+        writer
+            .write_trade("SSE", "600519", 2, 1_680_0700, 100)
+            .unwrap();
+        writer
+            .write_trade("SZSE", "000001", 2, 120_100, 100)
+            .unwrap();
+        for client in &mut maotai {
+            let row = read_server_text(client).unwrap();
+            assert!(row.contains("16800700"), "{row}");
+            assert!(!row.contains("120100"), "{row}");
+        }
+        let row = read_server_text(&mut ping_an).unwrap();
+        assert!(row.contains("120100"), "{row}");
+        assert!(!row.contains("16800700"), "{row}");
+        for client in &mut maotai {
+            write_client_frame(client, 0x8, &[]);
+        }
+        write_client_frame(&mut ping_an, 0x8, &[]);
+        drop(writer);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn handshake(port: u16) -> TcpStream {
         let mut client = TcpStream::connect(("127.0.0.1", port)).unwrap();
         client

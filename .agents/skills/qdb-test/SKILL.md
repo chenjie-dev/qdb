@@ -79,7 +79,7 @@ cargo test --workspace -- --test-threads=1
 | 复制 | 复制 ID 对得上只发增量，对不上从 0 全量；偏移超过已落盘位置被拒绝；更高任期停止旧写入者；只读打开拒绝再写 |
 | 可见性 | 门闩打开后，只读打开看不到还没 `publish_visible` 的成交；发布到较早偏移时，更晚的成交仍不可见 |
 | 集群与切换 | 槽外写入返回 421，槽内返回 200；空键槽号是 0；槽表有缺口或重叠时拒绝；`QDB_FAILOVER_MS=200` 时，主进程退出后 2 秒内副本升主；`0` 关闭自动切换 |
-| 性能 | 48 笔成交的一次组提交，耗时小于逐条 `fsync` 的三分之一；512 笔、每 256 条一批时，`flush_count` 不超过 4，且 15 秒内完成 |
+| 性能 | 48 笔成交的一次组提交，耗时小于逐条 `fsync` 的三分之一；512 笔、每 256 条一批时，`flush_count` 不超过 4，且 15 秒内完成；券商席位开盘在 `a_broker_desk_opening_keeps_venues_apart_and_closed_bars_intact`；256 个订阅者同时跟上在 `many_desk_subscribers_catch_up_while_the_writer_keeps_going`；128 路 WebSocket 各收各的标的在 `many_websocket_subscribers_each_get_their_own_symbol` |
 | 健康 | 无心跳可用，CRC 或缺口不可用，心跳超过 2 秒不可用 |
 | 实例 | 同一把实例锁上，第二个 qdb 进程启动失败，且不会先打开库 |
 | 行情中心 | 组提交在 flush 前不增加落盘次数；五档报价往返；from_seq=0 返回当前快照；检查点之后前缀损坏仍能打开 |
