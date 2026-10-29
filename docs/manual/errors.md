@@ -39,7 +39,7 @@
 | `syntax: column "名称" is ambiguous` | 连接后列名在多张表里出现，又没有表前缀 |
 | `syntax: column "名称" must appear in GROUP BY` | 非聚合表达式不在分组键里 |
 | `syntax: column "名称" does not exist` | 过滤或排序用了结果里没有的列 |
-| `syntax: each UNION query must have the same number of columns` | `UNION` 两侧列数不同 |
+| `syntax: each UNION query must have the same number of columns` | `UNION`、`INTERSECT` 或 `EXCEPT` 两侧列数不同 |
 | `syntax: cross join cannot have on` | `CROSS JOIN` 写了 `ON` |
 | `syntax: aggregate is not supported on join` | 连接查询里写了聚合 |
 | `syntax: division by zero` | 整数表达式除以 0 |

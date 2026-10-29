@@ -1,6 +1,6 @@
 //! 只读 SQL 子集，以及 `CREATE TABLE`、`INSERT`（含 `EXPECT`）和按主键的 `DELETE`。
 //!
-//! 语法边界见 `docs/manual/sql.md`。`WHERE`、表达式、`CASE`、`GROUP BY`、`HAVING`、`DISTINCT`、`UNION` 和 `ORDER BY` 都会生效。
+//! 语法边界见 `docs/manual/sql.md`。`WHERE`、表达式、`CASE`、`GROUP BY`、`HAVING`、`DISTINCT`、`UNION`、`INTERSECT`、`EXCEPT` 和 `ORDER BY` 都会生效。
 #![forbid(unsafe_code)]
 
 use qdb_abi::{KlineBody, Period};
@@ -92,7 +92,7 @@ impl<'a> SqlEngine<'a> {
 
     /// 执行 `SELECT`、`SHOW` 或 `DESCRIBE`。不写 WAL。
     ///
-    /// `WHERE` 在扫描之后过滤，可以写比较、四则运算、`CASE`、`IN` 和 `LIKE`。`GROUP BY` 每个分组一行，`HAVING` 再过滤分组。`DISTINCT` 去重。`UNION` 拼接结果后再排序。`ORDER BY` 在 `LIMIT` 之前排序。`LIMIT` 不能超过 100000。
+    /// `WHERE` 在扫描之后过滤，可以写比较、四则运算、`CASE`、`IN` 和 `LIKE`。`GROUP BY` 每个分组一行，`HAVING` 再过滤分组。`DISTINCT` 去重。`UNION`、`INTERSECT` 和 `EXCEPT` 先按优先级合并再排序。`INTERSECT` 只连接相邻的 `SELECT`。`ORDER BY` 在 `LIMIT` 之前排序。`LIMIT` 不能超过 100000。
     /// 不带 `symbol` 的 `ticks` 会多一列 `symbol`。`JOIN` 按 PostgreSQL 的内连接和外连接匹配，多表时列名是 `别名.列名`。
     ///
     /// # Arguments
@@ -137,22 +137,37 @@ impl<'a> SqlEngine<'a> {
         if stmt.limit > 100_000 {
             return Err(SqlError::Limit(stmt.limit));
         }
-        if stmt.union.is_empty() {
+        if stmt.set.is_empty() {
             return self.execute_stmt(stmt);
         }
         let mut combined = self.execute_stmt(&union_branch(stmt))?;
-        for (all, branch) in &stmt.union {
-            let next = self.execute_stmt(&union_branch(branch))?;
-            if next.columns.len() != combined.columns.len() {
+        // INTERSECT 比 UNION、EXCEPT 更紧，只连接相邻的 SELECT。先算完这些交，再从左到右做并和差。
+        // ALL 按行的出现次数取较小值或做差；不加 ALL 时，整行文本相同只保留左表里第一次出现的那一行。
+        let width = combined.columns.len();
+        let mut tail: Vec<(SetOp, bool, Vec<Vec<String>>)> = Vec::new();
+        for link in &stmt.set {
+            let next = self.execute_stmt(&union_branch(&link.stmt))?;
+            if next.columns.len() != width {
                 return Err(SqlError::Syntax(
                     "each UNION query must have the same number of columns".into(),
                 ));
             }
-            combined.rows.extend(next.rows);
-            if !all {
-                let mut seen = std::collections::HashSet::new();
-                combined.rows.retain(|row| seen.insert(row.clone()));
+            if link.op == SetOp::Intersect {
+                let target = match tail.last_mut() {
+                    Some((_, _, rows)) => rows,
+                    None => &mut combined.rows,
+                };
+                *target = intersect_rows(target, &next.rows, link.all);
+            } else {
+                tail.push((link.op, link.all, next.rows));
             }
+        }
+        for (op, all, rows) in tail {
+            combined.rows = match op {
+                SetOp::Union => union_rows(combined.rows, rows, all),
+                SetOp::Except => except_rows(combined.rows, rows, all),
+                SetOp::Intersect => intersect_rows(&combined.rows, &rows, all),
+            };
         }
         if !stmt.order.is_empty() {
             sort_rows(&mut combined, &stmt.order)?;
@@ -176,7 +191,7 @@ impl<'a> SqlEngine<'a> {
         fetch.headings = vec!["*".into()];
         fetch.select_values = vec![None];
         fetch.aggregates.clear();
-        fetch.union.clear();
+        fetch.set.clear();
         fetch.distinct = false;
         fetch.order.clear();
         fetch.group.clear();
@@ -269,7 +284,7 @@ pub fn split_subscribe(sql: &str) -> Result<Option<String>, SqlError> {
 
 /// 这条 `SELECT` 的增量是否只由 [`Engine::poll`] 的变更决定。
 ///
-/// 成交、报价和 K 线的列投影返回 `Ok(true)`。`symbols`、用户表、聚合、表达式、`UNION` 和连接要重算整表，返回 `Ok(false)`。
+/// 成交、报价和 K 线的列投影返回 `Ok(true)`。`symbols`、用户表、聚合、表达式、`UNION`、`INTERSECT`、`EXCEPT` 和连接要重算整表，返回 `Ok(false)`。
 ///
 /// # Errors
 ///
@@ -281,7 +296,7 @@ pub fn follows_changes(sql: &str) -> Result<bool, SqlError> {
 fn incremental(stmt: &Stmt) -> bool {
     stmt.joins.is_empty()
         && stmt.aggregates.is_empty()
-        && stmt.union.is_empty()
+        && stmt.set.is_empty()
         && stmt.select_values.iter().all(|value| {
             value
                 .as_ref()
@@ -293,7 +308,7 @@ fn incremental(stmt: &Stmt) -> bool {
 
 /// 把新变更投影成与这条 `SELECT` 相同的列。
 ///
-/// 成交、报价和 K 线按 `changes` 逐条投影，同一价格的新成交也会返回。`symbols`、用户表、聚合、表达式和 `UNION` 不看单条变更的列，而是重算后返回 `seen` 里没有的行。`LIMIT` 不截断这里的增量。
+/// 成交、报价和 K 线按 `changes` 逐条投影，同一价格的新成交也会返回。`symbols`、用户表、聚合、表达式、`UNION`、`INTERSECT` 和 `EXCEPT` 不看单条变更的列，而是重算后返回 `seen` 里没有的行。`LIMIT` 不截断这里的增量。
 ///
 /// # Arguments
 ///
@@ -520,7 +535,7 @@ struct Stmt {
     group: Vec<ValExpr>,
     having: Option<Expr>,
     order: Vec<OrderKey>,
-    union: Vec<(bool, Stmt)>,
+    set: Vec<SetLink>,
     symbol: Option<String>,
     period: Option<Period>,
     ts_from: Option<i64>,
@@ -536,9 +551,88 @@ struct Agg {
     column: String,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SetOp {
+    Union,
+    Intersect,
+    Except,
+}
+
+#[derive(Clone)]
+struct SetLink {
+    op: SetOp,
+    all: bool,
+    stmt: Stmt,
+}
+
+fn set_op(token: Option<&String>) -> Option<SetOp> {
+    match token.map(|token| token.to_ascii_lowercase()).as_deref() {
+        Some("union") => Some(SetOp::Union),
+        Some("intersect") => Some(SetOp::Intersect),
+        Some("except") => Some(SetOp::Except),
+        _ => None,
+    }
+}
+
+fn row_counts(rows: &[Vec<String>]) -> std::collections::HashMap<Vec<String>, usize> {
+    let mut counts = std::collections::HashMap::new();
+    for row in rows {
+        *counts.entry(row.clone()).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn union_rows(mut left: Vec<Vec<String>>, right: Vec<Vec<String>>, all: bool) -> Vec<Vec<String>> {
+    left.extend(right);
+    if !all {
+        let mut seen = std::collections::HashSet::new();
+        left.retain(|row| seen.insert(row.clone()));
+    }
+    left
+}
+
+fn intersect_rows(left: &[Vec<String>], right: &[Vec<String>], all: bool) -> Vec<Vec<String>> {
+    let mut right_counts = row_counts(right);
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for row in left {
+        if all {
+            if let Some(count) = right_counts.get_mut(row) {
+                if *count > 0 {
+                    *count -= 1;
+                    out.push(row.clone());
+                }
+            }
+        } else if right_counts.contains_key(row) && seen.insert(row.clone()) {
+            out.push(row.clone());
+        }
+    }
+    out
+}
+
+fn except_rows(left: Vec<Vec<String>>, right: Vec<Vec<String>>, all: bool) -> Vec<Vec<String>> {
+    let mut right_counts = row_counts(&right);
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for row in left {
+        if all {
+            if let Some(count) = right_counts.get_mut(&row) {
+                if *count > 0 {
+                    *count -= 1;
+                    continue;
+                }
+            }
+            out.push(row);
+        } else if !right_counts.contains_key(&row) && seen.insert(row.clone()) {
+            out.push(row);
+        }
+    }
+    out
+}
+
 fn union_branch(stmt: &Stmt) -> Stmt {
     let mut bare = stmt.clone();
-    bare.union.clear();
+    bare.set.clear();
     bare.order.clear();
     bare.limit = 100_000;
     bare
@@ -649,10 +743,7 @@ fn parse(sql: &str) -> Result<Stmt, SqlError> {
     let tokens = tokenize(sql);
     let mut index = 0;
     let mut stmt = parse_select(&tokens, &mut index)?;
-    while tokens
-        .get(index)
-        .is_some_and(|token| token.eq_ignore_ascii_case("union"))
-    {
+    while let Some(op) = set_op(tokens.get(index)) {
         index += 1;
         let all = if tokens
             .get(index)
@@ -663,7 +754,11 @@ fn parse(sql: &str) -> Result<Stmt, SqlError> {
         } else {
             false
         };
-        stmt.union.push((all, parse_select(&tokens, &mut index)?));
+        stmt.set.push(SetLink {
+            op,
+            all,
+            stmt: parse_select(&tokens, &mut index)?,
+        });
     }
     parse_order_and_limit(&tokens, &mut index, &mut stmt)?;
     if let Some(token) = tokens.get(index) {
@@ -848,7 +943,7 @@ fn parse_select(tokens: &[String], index: &mut usize) -> Result<Stmt, SqlError> 
         group,
         having,
         order: Vec::new(),
-        union: Vec::new(),
+        set: Vec::new(),
         symbol,
         period,
         ts_from,
@@ -1962,6 +2057,8 @@ fn clause_word(token: &str) -> bool {
             | "on"
             | "outer"
             | "union"
+            | "intersect"
+            | "except"
             | "having"
             | "distinct"
     )

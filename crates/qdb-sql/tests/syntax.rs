@@ -546,3 +546,52 @@ fn expect_replaces_only_the_matching_seq() {
     assert_eq!(row.rows[0][0], "yes");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn intersect_binds_tighter_than_union_and_except_counts_copies() {
+    let (dir, mut engine) = open();
+    note(&mut engine);
+    SqlEngine::execute(&mut engine, "CREATE TABLE log (id INT64)").unwrap();
+    SqlEngine::execute(&mut engine, "INSERT INTO log VALUES (1), (1)").unwrap();
+    let sql = SqlEngine::new(&engine);
+    assert_eq!(
+        sql.query(
+            "SELECT id FROM note WHERE id = 1 UNION SELECT id FROM note WHERE id = 2 INTERSECT SELECT id FROM note WHERE id = 2 ORDER BY id",
+        )
+        .unwrap()
+        .rows,
+        vec![vec!["1".to_string()], vec!["2".to_string()]]
+    );
+    assert_eq!(
+        sql.query(
+            "SELECT id FROM note WHERE id IN (1, 2) EXCEPT SELECT id FROM note WHERE id = 1",
+        )
+        .unwrap()
+        .rows,
+        vec![vec!["2".to_string()]]
+    );
+    assert_eq!(
+        sql.query("SELECT id FROM log INTERSECT ALL SELECT id FROM note WHERE id = 1")
+            .unwrap()
+            .rows,
+        vec![vec!["1".to_string()]]
+    );
+    assert_eq!(
+        sql.query("SELECT id FROM log EXCEPT ALL SELECT id FROM note WHERE id = 1")
+            .unwrap()
+            .rows,
+        vec![vec!["1".to_string()]]
+    );
+    assert!(sql
+        .query("SELECT id FROM log EXCEPT SELECT id FROM note WHERE id = 1")
+        .unwrap()
+        .rows
+        .is_empty());
+    assert_eq!(
+        sql.query("SELECT id, code FROM note INTERSECT SELECT id FROM note")
+            .unwrap_err()
+            .to_string(),
+        "syntax: each UNION query must have the same number of columns"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

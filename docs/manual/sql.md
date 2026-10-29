@@ -152,7 +152,7 @@ predicate = value [ comparison value
 5. `HAVING`。
 6. 计算选择列表，得到结果列名。
 7. `DISTINCT`。
-8. `UNION` 或 `UNION ALL`。
+8. `UNION`、`INTERSECT` 或 `EXCEPT`，可带 `ALL`。
 9. `ORDER BY`。
 10. `LIMIT`。
 
@@ -285,20 +285,23 @@ WHERE s.symbol IS NULL;
 
 ## UNION
 
-把多段 `SELECT` 的行接在一起。
+把多段 `SELECT` 的行按集合运算接在一起。`INTERSECT` 和 `EXCEPT` 用同一套位置对齐。
 
 ### 语法
 
 ```text
-query = select { "UNION" ["ALL"] select }
+query = select { setop select }
         [ORDER BY ...] [LIMIT integer]
+setop = ("UNION" | "INTERSECT" | "EXCEPT") ["ALL"]
 ```
 
 ### 说明
 
-`UNION` 去掉完全相同的结果行。`UNION ALL` 保留重复。每一段的列数必须相同，否则 `syntax: each UNION query must have the same number of columns`。结果列名用第一段。后面的段不看列名，只按位置对齐。
+`UNION` 去掉完全相同的结果行。`UNION ALL` 保留重复。`INTERSECT` 只留两边都出现过的行。`EXCEPT` 留下左边有、右边没有的行。不加 `ALL` 时，整行文本相同只保留左段里第一次出现的那一行。`ALL` 按出现次数：`INTERSECT ALL` 取两边次数的较小值，`EXCEPT ALL` 用左边的次数减去右边的次数，减到 0 就不再留下。
 
-`A UNION ALL B UNION C` 先保留 A 和 B 的重复，再与 C 一起去重。`A UNION B UNION ALL C` 先对 A 和 B 去重，再把 C 全部接上。
+每一段的列数必须相同，否则 `syntax: each UNION query must have the same number of columns`。`INTERSECT` 和 `EXCEPT` 列数不对也是这句。结果列名用第一段。后面的段不看列名，只按位置对齐。
+
+`INTERSECT` 比 `UNION` 和 `EXCEPT` 更紧，只连接相邻的 `SELECT`。`A UNION B INTERSECT C` 是 `A UNION (B INTERSECT C)`。`UNION` 和 `EXCEPT` 从左到右。`A UNION ALL B UNION C` 先保留 A 和 B 的重复，再与 C 一起去重。`A UNION B UNION ALL C` 先对 A 和 B 去重，再把 C 全部接上。
 
 `ORDER BY` 和 `LIMIT` 只能写在整段查询的最后，作用在合并之后的结果上。写在中间一段的后面是语法错误。
 
@@ -309,11 +312,15 @@ SELECT id FROM note WHERE id = 2
 UNION
 SELECT id FROM note WHERE id = 1
 ORDER BY id;
+
+SELECT id FROM note WHERE id IN (1, 2)
+EXCEPT
+SELECT id FROM note WHERE id = 1;
 ```
 
 ### 兼容性
 
-没有 `INTERSECT`、`EXCEPT`，也不能用括号把一段 `SELECT` 单独排序。
+不能用括号把一段 `SELECT` 单独排序，也不能用括号改变 `INTERSECT` 的优先级。
 
 ## 聚合函数
 
@@ -683,14 +690,14 @@ WebSocket `GET /v1/ws` 接受同一套 `SELECT`，见 [服务进程](server.md)�
 
 ## 与 PostgreSQL 的差异
 
-已经按 PostgreSQL 的规则实现的是：内连接和外连接、`CROSS JOIN`、`ON` 等值、`WHERE` 的与或和非、整数比较、`BETWEEN`、`IN`、`LIKE`、搜索形式的 `CASE`、`GROUP BY`、`HAVING`、`DISTINCT`、`UNION` / `UNION ALL`、先 `ORDER BY` 再 `LIMIT`、列别名，以及空值不参与等值。
+已经按 PostgreSQL 的规则实现的是：内连接和外连接、`CROSS JOIN`、`ON` 等值、`WHERE` 的与或和非、整数比较、`BETWEEN`、`IN`、`LIKE`、搜索形式的 `CASE`、`GROUP BY`、`HAVING`、`DISTINCT`、`UNION` / `INTERSECT` / `EXCEPT` 及各自的 `ALL`、先 `ORDER BY` 再 `LIMIT`、列别名，以及空值不参与等值。
 
 还没有，写出来就是语法错误：
 
 | 类别 | 未实现 |
 |---|---|
 | 查询 | 子查询、`WITH`、`LATERAL`、`VALUES` 作为 `FROM`、`TABLE` |
-| 集合 | `INTERSECT`、`EXCEPT`、带括号的分支排序 |
+| 集合 | 带括号的分支排序，以及用括号改变 `INTERSECT` 的优先级 |
 | 窗口 | `OVER`、`rank`、`lag`、`lead` |
 | 表达式 | `CASE 列 WHEN`、`COALESCE`、`NULLIF`、`CAST`、`::`、四则以外的函数、正则 |
 | 谓词 | `ILIKE`、`SIMILAR TO`、`ANY` / `ALL`、数组、`IS TRUE` |
@@ -698,4 +705,4 @@ WebSocket `GET /v1/ws` 接受同一套 `SELECT`，见 [服务进程](server.md)�
 | 目录 | `information_schema`、`pg_catalog` |
 | 协议 | 预编译语句、参数绑定、PostgreSQL 线协议 |
 
-订阅的增量按到达顺序追加，不按语句里的 `ORDER BY` 重排整段输出。带表达式或 `UNION` 的订阅会重算当前结果，而不是只投影这一条变更。
+订阅的增量按到达顺序追加，不按语句里的 `ORDER BY` 重排整段输出。带表达式、`UNION`、`INTERSECT` 或 `EXCEPT` 的订阅会重算当前结果，而不是只投影这一条变更。

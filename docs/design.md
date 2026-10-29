@@ -447,8 +447,9 @@ struct SnapshotPod {
 
 ```text
 statement   = query
-query       = select { "UNION" ["ALL"] select }
+query       = select { setop select }
               ["ORDER BY" order] ["LIMIT" integer]
+setop       = ("UNION" | "INTERSECT" | "EXCEPT") ["ALL"]
 select      = "SELECT" ["DISTINCT"] projection "FROM" from_item
               ["WHERE" expr] ["GROUP BY" group] ["HAVING" expr]
 projection  = "*" | item { "," item }
@@ -551,7 +552,7 @@ WHERE symbol = 'SZSE:000001';
 4. 查询开始时 Acquire 读取 `applied_seq`。扫描跳过 `seq` 更大的行。未闭合 K 线和快照若 `seq` 更大，或 seqlock 失败，重试最多 3 次，仍失败则返回 `Busy`。
 5. `WHERE` 支持 `AND` / `OR` / `NOT`、比较、四则运算、`CASE`、`IN`、`LIKE`、`BETWEEN` 和 `IS NULL`。`symbol` 与 `period` 写在最外层 `AND` 上，供扫描使用。
 6. 有 `GROUP BY` 时按分组键各出一行。分组键可以是表达式。没有分组的聚合仍是一行。选择列表里的非聚合表达式必须出现在分组键中。`HAVING` 过滤分组结果。
-7. `DISTINCT` 去掉重复行。`UNION` 去掉整行重复，`UNION ALL` 保留。`ORDER BY` 和 `LIMIT` 作用在整段结果上，包括 `UNION` 之后。整数按数值比，其余按文本比。`FIRST` / `LAST` 按组内存储顺序。
+7. `DISTINCT` 去掉重复行。`UNION` 去掉整行重复，`UNION ALL` 保留。`INTERSECT` 只留两边都有的行，`EXCEPT` 从左边去掉右边有的行。带 `ALL` 时按出现次数，否则整行文本相同只留一次。`INTERSECT` 比 `UNION` 和 `EXCEPT` 更紧，只连接相邻的 `SELECT`。`ORDER BY` 和 `LIMIT` 作用在整段结果上。整数按数值比，其余按文本比。`FIRST` / `LAST` 按组内存储顺序。
 8. `SUM` 用 `i128` 累加，溢出返回错误。`AVG` 返回十进制文本，不使用二进制浮点。
 
 和 PostgreSQL 的差别：没有子查询、`WITH`、窗口函数。连接产生的空值显示为空文本。表达式结果是整数文本。
