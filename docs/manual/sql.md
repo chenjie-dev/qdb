@@ -64,7 +64,7 @@ when   = "WHEN" expr "THEN" value
 | 1 | `OR` | 左 |
 | 2 | `AND` | 左 |
 | 3 | `NOT` | 右 |
-| 4 | `=` `<>` `!=` `<` `<=` `>` `>=` `BETWEEN` `IN` `LIKE` `IS NULL` | 左 |
+| 4 | `=` `<>` `!=` `<` `<=` `>` `>=` `BETWEEN` `IN` `LIKE` `IS NULL` `IS TRUE` `IS FALSE` `IS UNKNOWN` | 左 |
 | 5 | `+` `-` | 左 |
 | 6 | `*` `/` | 左 |
 | 7 | 一元 `-` | 右 |
@@ -139,7 +139,7 @@ predicate = value [ comparison value
                   | "BETWEEN" value "AND" value
                   | ["NOT"] "IN" "(" value { "," value } ")"
                   | ["NOT"] "LIKE" value
-                  | "IS" ["NOT"] "NULL" ]
+                  | "IS" ["NOT"] ("NULL" | "TRUE" | "FALSE" | "UNKNOWN") ]
           | "(" expr ")"
 ```
 
@@ -153,9 +153,15 @@ predicate = value [ comparison value
 | `value NOT LIKE pattern` | 不匹配，且两边都不是空值 |
 | `value IS NULL` | `value` 是空值 |
 | `value IS NOT NULL` | `value` 不是空值 |
+| `value IS TRUE` | `value` 是真。假和未知都使这个谓词为假 |
+| `value IS FALSE` | `value` 是假。真和未知都使这个谓词为假 |
+| `value IS UNKNOWN` | `value` 是未知。真和假都使这个谓词为假 |
+| `value IS NOT TRUE` | `value` 不是真，包括假和未知 |
+| `value IS NOT FALSE` | `value` 不是假，包括真和未知 |
+| `value IS NOT UNKNOWN` | `value` 不是未知 |
 | `NOT predicate` | 内部为假。内部是未知时，结果仍是未知 |
 
-单独一个布尔列可以当条件：`WHERE active` 等价于值是 `true`。单独一个整数或普通字符串返回 `syntax: boolean`。
+单独一个布尔列可以当条件：`WHERE active` 等价于值是 `true`。单独一个普通字符串返回 `syntax: boolean`。整数表达式里，`0` 是假，其余整数是真。列里存的数字仍是文本，`id IS TRUE` 返回 `syntax: boolean`，`(id + 0) IS TRUE` 才按整数判断。`IS TRUE`、`IS FALSE` 和 `IS UNKNOWN` 用同一套规则，但谓词本身只有真或假。`IS` 后面不是这几个词时返回 `syntax: is`。
 
 `AND` / `OR` / `NOT`：
 
@@ -751,7 +757,7 @@ WebSocket `GET /v1/ws` 接受同一套 `SELECT`，见 [服务进程](server.md)�
 | 集合 | 没有括号时，不能把 `ORDER BY` 写在中间一段的后面 |
 | 窗口 | `OVER`、`rank`、`lag`、`lead` |
 | 表达式 | 四则以外的函数、正则。`CAST` 只接受 `INT64`、`STRING`、`BOOL` |
-| 谓词 | `ILIKE`、`SIMILAR TO`、`ANY` / `ALL`、数组、`IS TRUE` |
+| 谓词 | `ILIKE`、`SIMILAR TO`、`ANY` / `ALL`、数组 |
 | 写入 | `UPDATE`、`TRUNCATE`、`ALTER`、`DROP`、`COPY`。`DELETE` 只按主键追加墓碑 |
 | 目录 | `information_schema`、`pg_catalog` |
 | 协议 | 预编译语句、参数绑定、PostgreSQL 线协议 |

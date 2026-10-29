@@ -44,7 +44,8 @@
 | `syntax: aggregate is not supported on join` | 连接查询里写了聚合 |
 | `syntax: division by zero` | 整数表达式除以 0 |
 | `syntax: numeric` | 四则运算的操作数不是整数 |
-| `syntax: boolean` | `WHERE` 里单独写了一个不能当布尔值的表达式 |
+| `syntax: boolean` | `WHERE` 里单独写了一个不能当布尔值的表达式，或 `IS TRUE` 的对象不是布尔值、整数 |
+| `syntax: is` | `IS` 后面不是 `NULL`、`TRUE`、`FALSE` 或 `UNKNOWN` |
 | `syntax: coalesce` | `COALESCE` 没有参数 |
 | `syntax: cast` | 值不能转换成目标类型 |
 | `syntax: unknown type 名称` | `CREATE TABLE` 或 `CAST` 用了 `INT64`、`STRING`、`BOOL` 以外的类型 |

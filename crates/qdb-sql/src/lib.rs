@@ -92,7 +92,7 @@ impl<'a> SqlEngine<'a> {
 
     /// 执行 `SELECT`、`SHOW` 或 `DESCRIBE`。不写 WAL。
     ///
-    /// `WHERE` 在扫描之后过滤，可以写比较、四则运算、`CASE`、`COALESCE`、`NULLIF`、`CAST`、`IN` 和 `LIKE`。`CASE 列 WHEN 值` 按相等比较，空值不会命中另一个空值。`COALESCE` 取第一个非空值，空字符串不算空值。`NULLIF` 只在两边相等时变成空值。`CAST` 和 `::` 只在 `INT64`、`STRING`、`BOOL` 之间转换，空值保持空值。`GROUP BY` 每个分组一行，`HAVING` 再过滤分组。`DISTINCT` 去重。`UNION`、`INTERSECT` 和 `EXCEPT` 先按优先级合并再排序。`INTERSECT` 只连接相邻的操作数。括号先算出里面的结果，可以改这个优先级，里面的 `ORDER BY` 和 `LIMIT` 也先生效。`ORDER BY` 在 `LIMIT` 之前排序。`LIMIT` 不能超过 100000。
+    /// `WHERE` 在扫描之后过滤，可以写比较、四则运算、`CASE`、`COALESCE`、`NULLIF`、`CAST`、`IN` 和 `LIKE`。`CASE 列 WHEN 值` 按相等比较，空值不会命中另一个空值。`COALESCE` 取第一个非空值，空字符串不算空值。`NULLIF` 只在两边相等时变成空值。`CAST` 和 `::` 只在 `INT64`、`STRING`、`BOOL` 之间转换，空值保持空值。`IS TRUE`、`IS FALSE` 和 `IS UNKNOWN` 的结果只有真或假。`GROUP BY` 每个分组一行，`HAVING` 再过滤分组。`DISTINCT` 去重。`UNION`、`INTERSECT` 和 `EXCEPT` 先按优先级合并再排序。`INTERSECT` 只连接相邻的操作数。括号先算出里面的结果，可以改这个优先级，里面的 `ORDER BY` 和 `LIMIT` 也先生效。`ORDER BY` 在 `LIMIT` 之前排序。`LIMIT` 不能超过 100000。
     /// 不带 `symbol` 的 `ticks` 会多一列 `symbol`。`JOIN` 按 PostgreSQL 的内连接和外连接匹配，多表时列名是 `别名.列名`。
     ///
     /// # Arguments
@@ -730,6 +730,13 @@ enum ValExpr {
     },
 }
 
+#[derive(Clone, Copy)]
+enum BoolTest {
+    True,
+    False,
+    Unknown,
+}
+
 #[derive(Clone)]
 enum Expr {
     Value(ValExpr),
@@ -748,6 +755,11 @@ enum Expr {
     },
     IsNull {
         value: Box<ValExpr>,
+        negated: bool,
+    },
+    IsBool {
+        value: Box<ValExpr>,
+        test: BoolTest,
         negated: bool,
     },
     In {
@@ -2504,9 +2516,29 @@ fn parse_comparison(tokens: &[String], index: &mut usize) -> Result<Expr, SqlErr
         } else {
             false
         };
-        expect(tokens, index, "null")?;
-        return Ok(Expr::IsNull {
+        let test = tokens
+            .get(*index)
+            .ok_or_else(|| SqlError::Syntax("is".into()))?;
+        if test.eq_ignore_ascii_case("null") {
+            *index += 1;
+            return Ok(Expr::IsNull {
+                value: Box::new(left),
+                negated,
+            });
+        }
+        let test = if test.eq_ignore_ascii_case("true") {
+            BoolTest::True
+        } else if test.eq_ignore_ascii_case("false") {
+            BoolTest::False
+        } else if test.eq_ignore_ascii_case("unknown") {
+            BoolTest::Unknown
+        } else {
+            return Err(SqlError::Syntax("is".into()));
+        };
+        *index += 1;
+        return Ok(Expr::IsBool {
             value: Box::new(left),
+            test,
             negated,
         });
     }
@@ -2899,6 +2931,24 @@ fn eval_expr(expr: &Expr, columns: &[String], row: &[String]) -> Result<Truth, S
                 Truth::True
             })
         }
+        Expr::IsBool {
+            value,
+            test,
+            negated,
+        } => {
+            let truth = truth_of_scalar(&eval_val(value, columns, row)?)?;
+            // 这个谓词只有真或假，不会是未知。非布尔文本失败。整数表达式里 0 是假，其余整数是真。列里的数字文本仍按文本判断。
+            let matched = match test {
+                BoolTest::True => matches!(truth, Truth::True),
+                BoolTest::False => matches!(truth, Truth::False),
+                BoolTest::Unknown => matches!(truth, Truth::Unknown),
+            };
+            Ok(if matched == *negated {
+                Truth::False
+            } else {
+                Truth::True
+            })
+        }
         Expr::In {
             value,
             list,
@@ -3266,6 +3316,20 @@ fn render_expr(expr: &Expr) -> String {
             "{} is {}null",
             render_val(value),
             if *negated { "not " } else { "" }
+        ),
+        Expr::IsBool {
+            value,
+            test,
+            negated,
+        } => format!(
+            "{} is {}{}",
+            render_val(value),
+            if *negated { "not " } else { "" },
+            match test {
+                BoolTest::True => "true",
+                BoolTest::False => "false",
+                BoolTest::Unknown => "unknown",
+            }
         ),
         Expr::In {
             value,

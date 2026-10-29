@@ -776,3 +776,58 @@ fn cast_converts_int_string_and_bool_and_keeps_null() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn is_true_false_and_unknown_are_never_unknown() {
+    let (dir, mut engine) = open();
+    note(&mut engine);
+    let sql = SqlEngine::new(&engine);
+    assert_eq!(
+        sql.query("SELECT id FROM note WHERE active IS TRUE")
+            .unwrap()
+            .rows,
+        vec![vec!["1".to_string()]]
+    );
+    assert_eq!(
+        sql.query("SELECT id FROM note WHERE active IS FALSE")
+            .unwrap()
+            .rows,
+        vec![vec!["2".to_string()]]
+    );
+    assert_eq!(
+        sql.query("SELECT id FROM note WHERE active IS NOT TRUE")
+            .unwrap()
+            .rows,
+        vec![vec!["2".to_string()]]
+    );
+    assert_eq!(
+        sql.query("SELECT id FROM note WHERE null IS UNKNOWN AND id = 1")
+            .unwrap()
+            .rows,
+        vec![vec!["1".to_string()]]
+    );
+    assert!(sql
+        .query("SELECT id FROM note WHERE null IS TRUE")
+        .unwrap()
+        .rows
+        .is_empty());
+    assert_eq!(
+        sql.query("SELECT id FROM note WHERE (id + 0) IS TRUE AND id = 1")
+            .unwrap()
+            .rows,
+        vec![vec!["1".to_string()]]
+    );
+    assert_eq!(
+        sql.query("SELECT id FROM note WHERE 'text' IS TRUE")
+            .unwrap_err()
+            .to_string(),
+        "syntax: boolean"
+    );
+    assert_eq!(
+        sql.query("SELECT id FROM note WHERE active IS maybe")
+            .unwrap_err()
+            .to_string(),
+        "syntax: is"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
