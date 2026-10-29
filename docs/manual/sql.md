@@ -73,10 +73,13 @@ when   = "WHEN" expr "THEN" value
 
 任一操作数是空值时，四则运算的结果是空值，不报错。
 
-`CASE` 只接受带 `WHEN` 条件的形式，不接受 `CASE 列 WHEN 值`。按书写顺序取第一个为真的分支。都不是真，有 `ELSE` 就用 `ELSE`，否则结果是空值。`ELSE` 可以省略。
+`CASE` 有两种写法。`CASE WHEN 条件` 按书写顺序取第一个为真的分支。`CASE 值 WHEN 比较值` 用相等比较，命中规则与 `=` 相同：空值不等于任何值，包括另一个空值，所以 `CASE null WHEN null` 不会命中。都没有命中时，有 `ELSE` 就用 `ELSE`，否则结果是空值。`ELSE` 可以省略。
 
 ```sql
 SELECT CASE WHEN id > 1 THEN 'hi' ELSE 'lo' END AS band
+FROM note;
+
+SELECT CASE id WHEN 1 THEN 'one' ELSE 'other' END
 FROM note;
 ```
 
@@ -724,7 +727,7 @@ WebSocket `GET /v1/ws` 接受同一套 `SELECT`，见 [服务进程](server.md)�
 | 查询 | 子查询、`WITH`、`LATERAL`、`VALUES` 作为 `FROM`、`TABLE` |
 | 集合 | 没有括号时，不能把 `ORDER BY` 写在中间一段的后面 |
 | 窗口 | `OVER`、`rank`、`lag`、`lead` |
-| 表达式 | `CASE 列 WHEN`、`CAST`、`::`、四则以外的函数、正则 |
+| 表达式 | `CAST`、`::`、四则以外的函数、正则 |
 | 谓词 | `ILIKE`、`SIMILAR TO`、`ANY` / `ALL`、数组、`IS TRUE` |
 | 写入 | `UPDATE`、`TRUNCATE`、`ALTER`、`DROP`、`COPY`。`DELETE` 只按主键追加墓碑 |
 | 目录 | `information_schema`、`pg_catalog` |

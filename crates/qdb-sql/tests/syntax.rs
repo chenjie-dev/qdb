@@ -698,3 +698,37 @@ fn coalesce_skips_null_and_nullif_clears_equal_values() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn simple_case_matches_by_equality_and_null_does_not_match_null() {
+    let (dir, mut engine) = open();
+    note(&mut engine);
+    let sql = SqlEngine::new(&engine);
+    assert_eq!(
+        sql.query(
+            "SELECT CASE id WHEN 1 THEN 'one' WHEN 2 THEN 'two' ELSE 'other' END FROM note WHERE id = 1",
+        )
+        .unwrap()
+        .rows,
+        vec![vec!["one".to_string()]]
+    );
+    assert_eq!(
+        sql.query("SELECT CASE id WHEN 2 THEN 'two' ELSE 'other' END FROM note WHERE id = 1")
+            .unwrap()
+            .rows,
+        vec![vec!["other".to_string()]]
+    );
+    assert_eq!(
+        sql.query("SELECT CASE null WHEN null THEN 'hit' ELSE 'miss' END FROM note WHERE id = 1",)
+            .unwrap()
+            .rows,
+        vec![vec!["miss".to_string()]]
+    );
+    assert_eq!(
+        sql.query("SELECT CASE id WHEN 1 THEN 'one' END FROM note WHERE id = 2")
+            .unwrap()
+            .rows,
+        vec![vec![String::new()]]
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

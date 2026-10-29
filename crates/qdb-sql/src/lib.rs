@@ -92,7 +92,7 @@ impl<'a> SqlEngine<'a> {
 
     /// 执行 `SELECT`、`SHOW` 或 `DESCRIBE`。不写 WAL。
     ///
-    /// `WHERE` 在扫描之后过滤，可以写比较、四则运算、`CASE`、`COALESCE`、`NULLIF`、`IN` 和 `LIKE`。`COALESCE` 取第一个非空值，空字符串不算空值。`NULLIF` 只在两边相等时变成空值。`GROUP BY` 每个分组一行，`HAVING` 再过滤分组。`DISTINCT` 去重。`UNION`、`INTERSECT` 和 `EXCEPT` 先按优先级合并再排序。`INTERSECT` 只连接相邻的操作数。括号先算出里面的结果，可以改这个优先级，里面的 `ORDER BY` 和 `LIMIT` 也先生效。`ORDER BY` 在 `LIMIT` 之前排序。`LIMIT` 不能超过 100000。
+    /// `WHERE` 在扫描之后过滤，可以写比较、四则运算、`CASE`、`COALESCE`、`NULLIF`、`IN` 和 `LIKE`。`CASE 列 WHEN 值` 按相等比较，空值不会命中另一个空值。`COALESCE` 取第一个非空值，空字符串不算空值。`NULLIF` 只在两边相等时变成空值。`GROUP BY` 每个分组一行，`HAVING` 再过滤分组。`DISTINCT` 去重。`UNION`、`INTERSECT` 和 `EXCEPT` 先按优先级合并再排序。`INTERSECT` 只连接相邻的操作数。括号先算出里面的结果，可以改这个优先级，里面的 `ORDER BY` 和 `LIMIT` 也先生效。`ORDER BY` 在 `LIMIT` 之前排序。`LIMIT` 不能超过 100000。
     /// 不带 `symbol` 的 `ticks` 会多一列 `symbol`。`JOIN` 按 PostgreSQL 的内连接和外连接匹配，多表时列名是 `别名.列名`。
     ///
     /// # Arguments
@@ -2686,15 +2686,40 @@ fn parse_primary(tokens: &[String], index: &mut usize) -> Result<ValExpr, SqlErr
 fn parse_case(tokens: &[String], index: &mut usize) -> Result<ValExpr, SqlError> {
     expect(tokens, index, "case")?;
     let mut arms = Vec::new();
-    while tokens
+    if tokens
         .get(*index)
         .is_some_and(|token| token.eq_ignore_ascii_case("when"))
     {
-        *index += 1;
-        let cond = parse_expr(tokens, index)?;
-        expect(tokens, index, "then")?;
-        let value = parse_add(tokens, index)?;
-        arms.push((cond, value));
+        while tokens
+            .get(*index)
+            .is_some_and(|token| token.eq_ignore_ascii_case("when"))
+        {
+            *index += 1;
+            let cond = parse_expr(tokens, index)?;
+            expect(tokens, index, "then")?;
+            let value = parse_add(tokens, index)?;
+            arms.push((cond, value));
+        }
+    } else {
+        let operand = parse_add(tokens, index)?;
+        // 简单形式只做相等比较。空值不等于任何值，包括另一个空值，所以不会命中。
+        while tokens
+            .get(*index)
+            .is_some_and(|token| token.eq_ignore_ascii_case("when"))
+        {
+            *index += 1;
+            let probe = parse_add(tokens, index)?;
+            expect(tokens, index, "then")?;
+            let value = parse_add(tokens, index)?;
+            arms.push((
+                Expr::Cmp {
+                    left: Box::new(operand.clone()),
+                    op: Cmp::Eq,
+                    right: Box::new(probe),
+                },
+                value,
+            ));
+        }
     }
     if arms.is_empty() {
         return Err(SqlError::Syntax("case".into()));

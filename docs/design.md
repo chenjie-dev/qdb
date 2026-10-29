@@ -470,9 +470,11 @@ mul         = unary { ("*" | "/") unary }
 unary       = ["-"] primary
 primary     = ident | literal | "(" expr ")"
             | "CASE" when { when } ["ELSE" value] "END"
+            | "CASE" value simple { simple } ["ELSE" value] "END"
             | "COALESCE" "(" value { "," value } ")"
             | "NULLIF" "(" value "," value ")"
 when        = "WHEN" expr "THEN" value
+simple      = "WHEN" value "THEN" value
 comp        = "=" | "<>" | "!=" | "<" | "<=" | ">" | ">="
 group       = value { "," value }
 order       = ident ["ASC" | "DESC"] { "," ident ["ASC" | "DESC"] }
