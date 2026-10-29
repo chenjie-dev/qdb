@@ -80,6 +80,24 @@ SELECT CASE WHEN id > 1 THEN 'hi' ELSE 'lo' END AS band
 FROM note;
 ```
 
+### COALESCE 和 NULLIF
+
+```text
+COALESCE "(" value { "," value } ")"
+NULLIF "(" value "," value ")"
+```
+
+`COALESCE` 从左到右返回第一个不是空值的参数。参数都是空值时结果是空值。空字符串不是空值，`coalesce('', 'x')` 得到空字符串。没有参数时返回 `syntax: coalesce`。
+
+`NULLIF` 两边按比较规则相等时返回空值，否则返回左边。空值不等于任何值，包括另一个空值，所以 `nullif(null, null)` 仍是空值。参数不是两个时返回 `syntax: nullif`。
+
+不写括号时，`coalesce` 和 `nullif` 仍是普通列名。
+
+```sql
+SELECT coalesce(null, id) FROM note WHERE id = 1;
+SELECT nullif(id, 1) FROM note WHERE id = 1;
+```
+
 选择列表里的表达式可以用 `AS 别名` 改结果列名。不写 `AS` 时，列名就是表达式文本，例如 `id / 2`。别名可以用在 `ORDER BY` 和 `HAVING`，不能用在 `WHERE` 和 `GROUP BY`。
 
 ## 谓词
@@ -697,7 +715,7 @@ WebSocket `GET /v1/ws` 接受同一套 `SELECT`，见 [服务进程](server.md)�
 
 ## 与 PostgreSQL 的差异
 
-已经按 PostgreSQL 的规则实现的是：内连接和外连接、`CROSS JOIN`、`ON` 等值、`WHERE` 的与或和非、整数比较、`BETWEEN`、`IN`、`LIKE`、搜索形式的 `CASE`、`GROUP BY`、`HAVING`、`DISTINCT`、`UNION` / `INTERSECT` / `EXCEPT` 及各自的 `ALL`、先 `ORDER BY` 再 `LIMIT`、列别名，以及空值不参与等值。
+已经按 PostgreSQL 的规则实现的是：内连接和外连接、`CROSS JOIN`、`ON` 等值、`WHERE` 的与或和非、整数比较、`BETWEEN`、`IN`、`LIKE`、搜索形式的 `CASE`、`COALESCE`、`NULLIF`、`GROUP BY`、`HAVING`、`DISTINCT`、`UNION` / `INTERSECT` / `EXCEPT` 及各自的 `ALL`、先 `ORDER BY` 再 `LIMIT`、列别名，以及空值不参与等值。
 
 还没有，写出来就是语法错误：
 
@@ -706,7 +724,7 @@ WebSocket `GET /v1/ws` 接受同一套 `SELECT`，见 [服务进程](server.md)�
 | 查询 | 子查询、`WITH`、`LATERAL`、`VALUES` 作为 `FROM`、`TABLE` |
 | 集合 | 没有括号时，不能把 `ORDER BY` 写在中间一段的后面 |
 | 窗口 | `OVER`、`rank`、`lag`、`lead` |
-| 表达式 | `CASE 列 WHEN`、`COALESCE`、`NULLIF`、`CAST`、`::`、四则以外的函数、正则 |
+| 表达式 | `CASE 列 WHEN`、`CAST`、`::`、四则以外的函数、正则 |
 | 谓词 | `ILIKE`、`SIMILAR TO`、`ANY` / `ALL`、数组、`IS TRUE` |
 | 写入 | `UPDATE`、`TRUNCATE`、`ALTER`、`DROP`、`COPY`。`DELETE` 只按主键追加墓碑 |
 | 目录 | `information_schema`、`pg_catalog` |

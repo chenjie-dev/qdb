@@ -626,3 +626,75 @@ fn parentheses_group_set_ops_and_limit_the_inner_query() {
     assert!(sql.query("(SELECT id FROM note").is_err());
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn coalesce_skips_null_and_nullif_clears_equal_values() {
+    let (dir, mut engine) = open();
+    note(&mut engine);
+    let sql = SqlEngine::new(&engine);
+    assert_eq!(
+        sql.query("SELECT coalesce(null, id) FROM note WHERE id = 1")
+            .unwrap()
+            .rows,
+        vec![vec!["1".to_string()]]
+    );
+    assert_eq!(
+        sql.query("SELECT coalesce('', 'x') FROM note WHERE id = 1")
+            .unwrap()
+            .rows,
+        vec![vec![String::new()]]
+    );
+    assert_eq!(
+        sql.query("SELECT coalesce(null, null) FROM note WHERE id = 1")
+            .unwrap()
+            .rows,
+        vec![vec![String::new()]]
+    );
+    assert_eq!(
+        sql.query("SELECT id FROM note WHERE coalesce(null, null) IS NULL AND id = 1")
+            .unwrap()
+            .rows,
+        vec![vec!["1".to_string()]]
+    );
+    assert!(sql
+        .query("SELECT id FROM note WHERE coalesce('', 'x') IS NULL")
+        .unwrap()
+        .rows
+        .is_empty());
+    assert!(sql
+        .query("SELECT id FROM note WHERE coalesce(null, id) IS NULL")
+        .unwrap()
+        .rows
+        .is_empty());
+    assert_eq!(
+        sql.query("SELECT nullif(id, 1) FROM note WHERE id = 1")
+            .unwrap()
+            .rows,
+        vec![vec![String::new()]]
+    );
+    assert_eq!(
+        sql.query("SELECT nullif(id, 2) FROM note WHERE id = 1")
+            .unwrap()
+            .rows,
+        vec![vec!["1".to_string()]]
+    );
+    assert_eq!(
+        sql.query("SELECT nullif(null, null) FROM note WHERE id = 1")
+            .unwrap()
+            .rows,
+        vec![vec![String::new()]]
+    );
+    assert_eq!(
+        sql.query("SELECT coalesce() FROM note")
+            .unwrap_err()
+            .to_string(),
+        "syntax: coalesce"
+    );
+    assert_eq!(
+        sql.query("SELECT nullif(id) FROM note")
+            .unwrap_err()
+            .to_string(),
+        "syntax: nullif"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

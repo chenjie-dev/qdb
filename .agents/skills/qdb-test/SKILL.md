@@ -95,7 +95,7 @@ cargo test --workspace -- --test-threads=1
 | `WHERE` | `symbol`、`period` 缺失或未知；`ts BETWEEN` 含两端；`snapshots` 无 `symbol`；`symbols` 忽略 `symbol`；`<`、`>`、`<>`、`AND`、`OR`、`IS NULL`；`symbol` 只写在 `OR` 里时 `klines` 失败 |
 | 聚合 | `MAX` `MIN` `SUM` `AVG` `COUNT` `FIRST` `LAST` 各一次；未知函数失败；空结果是空文本；非聚合列不在 `GROUP BY` 里失败 |
 | `ORDER BY` / `GROUP BY` / `HAVING` / `DISTINCT` | `ORDER BY` 在 `LIMIT` 前排序，整数按数值；`GROUP BY` 每个键一行，分组键可以是表达式；`HAVING` 过滤分组；`DISTINCT` 去重；`AS` 别名可用于 `ORDER BY` |
-| 表达式 / `CASE` / `IN` / `LIKE` / `UNION` | `*` 比 `+` 更紧；整数除法向零截断；除以 0 失败；`000001` 仍按原文本返回；`CASE WHEN`；`IN` 含空值且不相等时无行；`LIKE` 的 `%` 和 `_`；`UNION` 去重，`UNION ALL` 保留，列数不同失败；`INTERSECT` 比 `UNION` 更紧；括号先算内层，可以改这个优先级，里面的 `ORDER BY` 和 `LIMIT` 先生效；`EXCEPT` 去掉右边有的行；`ALL` 按出现次数 |
+| 表达式 / `CASE` / `IN` / `LIKE` / `UNION` | `*` 比 `+` 更紧；整数除法向零截断；除以 0 失败；`000001` 仍按原文本返回；`CASE WHEN`；`COALESCE` 取第一个非空值，空字符串不算空值；`NULLIF` 只在两边相等时变成空值；`IN` 含空值且不相等时无行；`LIKE` 的 `%` 和 `_`；`UNION` 去重，`UNION ALL` 保留，列数不同失败；`INTERSECT` 比 `UNION` 更紧；括号先算内层，可以改这个优先级，里面的 `ORDER BY` 和 `LIMIT` 先生效；`EXCEPT` 去掉右边有的行；`ALL` 按出现次数 |
 | `LIMIT` | 缺省 1000；`0` 得到空；`100000` 通过；`100001` 失败；缺数字失败 |
 | `SUBSCRIBE` | 只从 `SELECT` 末尾剥掉；`query` 遇到它失败；`SHOW` 末尾失败 |
 | `SHOW` / `DESCRIBE` / `DESC` | 四张行情表和用户表；未知表失败 |

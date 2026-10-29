@@ -1,6 +1,6 @@
 //! 只读 SQL 子集，以及 `CREATE TABLE`、`INSERT`（含 `EXPECT`）和按主键的 `DELETE`。
 //!
-//! 语法边界见 `docs/manual/sql.md`。`WHERE`、表达式、`CASE`、`GROUP BY`、`HAVING`、`DISTINCT`、`UNION`、`INTERSECT`、`EXCEPT` 和 `ORDER BY` 都会生效。
+//! 语法边界见 `docs/manual/sql.md`。`WHERE`、表达式、`CASE`、`COALESCE`、`NULLIF`、`GROUP BY`、`HAVING`、`DISTINCT`、`UNION`、`INTERSECT`、`EXCEPT` 和 `ORDER BY` 都会生效。
 #![forbid(unsafe_code)]
 
 use qdb_abi::{KlineBody, Period};
@@ -92,7 +92,7 @@ impl<'a> SqlEngine<'a> {
 
     /// 执行 `SELECT`、`SHOW` 或 `DESCRIBE`。不写 WAL。
     ///
-    /// `WHERE` 在扫描之后过滤，可以写比较、四则运算、`CASE`、`IN` 和 `LIKE`。`GROUP BY` 每个分组一行，`HAVING` 再过滤分组。`DISTINCT` 去重。`UNION`、`INTERSECT` 和 `EXCEPT` 先按优先级合并再排序。`INTERSECT` 只连接相邻的操作数。括号先算出里面的结果，可以改这个优先级，里面的 `ORDER BY` 和 `LIMIT` 也先生效。`ORDER BY` 在 `LIMIT` 之前排序。`LIMIT` 不能超过 100000。
+    /// `WHERE` 在扫描之后过滤，可以写比较、四则运算、`CASE`、`COALESCE`、`NULLIF`、`IN` 和 `LIKE`。`COALESCE` 取第一个非空值，空字符串不算空值。`NULLIF` 只在两边相等时变成空值。`GROUP BY` 每个分组一行，`HAVING` 再过滤分组。`DISTINCT` 去重。`UNION`、`INTERSECT` 和 `EXCEPT` 先按优先级合并再排序。`INTERSECT` 只连接相邻的操作数。括号先算出里面的结果，可以改这个优先级，里面的 `ORDER BY` 和 `LIMIT` 也先生效。`ORDER BY` 在 `LIMIT` 之前排序。`LIMIT` 不能超过 100000。
     /// 不带 `symbol` 的 `ticks` 会多一列 `symbol`。`JOIN` 按 PostgreSQL 的内连接和外连接匹配，多表时列名是 `别名.列名`。
     ///
     /// # Arguments
@@ -719,6 +719,11 @@ enum ValExpr {
         else_arm: Option<Box<ValExpr>>,
     },
     Pred(Box<Expr>),
+    Coalesce(Vec<ValExpr>),
+    NullIf {
+        left: Box<ValExpr>,
+        right: Box<ValExpr>,
+    },
 }
 
 #[derive(Clone)]
@@ -2651,6 +2656,11 @@ fn parse_primary(tokens: &[String], index: &mut usize) -> Result<ValExpr, SqlErr
     if token.eq_ignore_ascii_case("case") {
         return parse_case(tokens, index);
     }
+    if (token.eq_ignore_ascii_case("coalesce") || token.eq_ignore_ascii_case("nullif"))
+        && tokens.get(*index + 1).map(String::as_str) == Some("(")
+    {
+        return parse_null_fn(tokens, index);
+    }
     *index += 1;
     if token.starts_with('\'') {
         return Ok(ValExpr::Literal(unquote(&token)));
@@ -2700,6 +2710,44 @@ fn parse_case(tokens: &[String], index: &mut usize) -> Result<ValExpr, SqlError>
     };
     expect(tokens, index, "end")?;
     Ok(ValExpr::Case { arms, else_arm })
+}
+
+fn parse_null_fn(tokens: &[String], index: &mut usize) -> Result<ValExpr, SqlError> {
+    let name = tokens
+        .get(*index)
+        .ok_or_else(|| SqlError::Syntax("value".into()))?
+        .to_ascii_lowercase();
+    *index += 1;
+    expect(tokens, index, "(")?;
+    let mut args = Vec::new();
+    if tokens.get(*index).is_some_and(|token| token != ")") {
+        loop {
+            let expr = parse_expr(tokens, index)?;
+            args.push(match expr {
+                Expr::Value(value) => value,
+                other => ValExpr::Pred(Box::new(other)),
+            });
+            if tokens.get(*index).is_some_and(|token| token == ",") {
+                *index += 1;
+                continue;
+            }
+            break;
+        }
+    }
+    expect(tokens, index, ")")?;
+    if name == "coalesce" {
+        if args.is_empty() {
+            return Err(SqlError::Syntax("coalesce".into()));
+        }
+        return Ok(ValExpr::Coalesce(args));
+    }
+    let [left, right] = args
+        .try_into()
+        .map_err(|_| SqlError::Syntax("nullif".into()))?;
+    Ok(ValExpr::NullIf {
+        left: Box::new(left),
+        right: Box::new(right),
+    })
 }
 
 fn eval_expr(expr: &Expr, columns: &[String], row: &[String]) -> Result<Truth, SqlError> {
@@ -2926,6 +2974,25 @@ fn eval_val(expr: &ValExpr, columns: &[String], row: &[String]) -> Result<Scalar
             Truth::False => Scalar::Text("false".into()),
             Truth::Unknown => Scalar::Null,
         }),
+        ValExpr::Coalesce(args) => {
+            // 从左到右取第一个非空值。空字符串不是空值，不会被跳过。
+            for arg in args {
+                let value = eval_val(arg, columns, row)?;
+                if !matches!(value, Scalar::Null) {
+                    return Ok(value);
+                }
+            }
+            Ok(Scalar::Null)
+        }
+        ValExpr::NullIf { left, right } => {
+            let left = eval_val(left, columns, row)?;
+            let right = eval_val(right, columns, row)?;
+            // 只有比较结果为相等才变成空值。空值与空值比较是未知，所以留下左边。
+            match scalar_ord(&left, &right) {
+                Some(ordering) if ordering.is_eq() => Ok(Scalar::Null),
+                _ => Ok(left),
+            }
+        }
     }
 }
 
@@ -3016,6 +3083,13 @@ fn render_val(expr: &ValExpr) -> String {
             text
         }
         ValExpr::Pred(inner) => format!("({})", render_expr(inner)),
+        ValExpr::Coalesce(args) => format!(
+            "coalesce({})",
+            args.iter().map(render_val).collect::<Vec<_>>().join(", ")
+        ),
+        ValExpr::NullIf { left, right } => {
+            format!("nullif({}, {})", render_val(left), render_val(right))
+        }
     }
 }
 

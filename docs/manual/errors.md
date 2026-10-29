@@ -45,6 +45,8 @@
 | `syntax: division by zero` | 整数表达式除以 0 |
 | `syntax: numeric` | 四则运算的操作数不是整数 |
 | `syntax: boolean` | `WHERE` 里单独写了一个不能当布尔值的表达式 |
+| `syntax: coalesce` | `COALESCE` 没有参数 |
+| `syntax: nullif` | `NULLIF` 的参数不是两个 |
 | `syntax: duplicate key` | `INSERT` 的主键已经可见，或同一句里出现了两次。多行时整句不写 |
 | `syntax: table already exists` | `CREATE TABLE` 重名 |
 | `syntax: type mismatch` | `INSERT` 的值对不上列类型 |
