@@ -508,8 +508,11 @@ fn one_insert_writes_every_tuple_or_none() {
     );
     assert_eq!(
         message(
-            SqlEngine::execute(&mut engine, "INSERT INTO note VALUES (7, 'ok'), ('bad', 'x')")
-                .unwrap_err()
+            SqlEngine::execute(
+                &mut engine,
+                "INSERT INTO note VALUES (7, 'ok'), ('bad', 'x')"
+            )
+            .unwrap_err()
         ),
         "syntax: type mismatch"
     );
@@ -533,5 +536,86 @@ fn one_insert_writes_every_tuple_or_none() {
             .rows,
         vec![vec!["1".to_string()], vec!["2".to_string()]]
     );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn a_composite_primary_key_can_delete_several_rows() {
+    let (dir, mut engine) = open();
+    SqlEngine::execute(
+        &mut engine,
+        "CREATE TABLE pair (a INT64 PRIMARY KEY, b STRING PRIMARY KEY, code STRING)",
+    )
+    .unwrap();
+    SqlEngine::execute(
+        &mut engine,
+        "INSERT INTO pair VALUES (1, 'x', 'one'), (2, 'y', 'two'), (3, 'z', 'three')",
+    )
+    .unwrap();
+    assert_eq!(
+        message(
+            SqlEngine::execute(
+                &mut engine,
+                "DELETE FROM pair WHERE (b, a) IN (('y', 9), ('z', 3))",
+            )
+            .unwrap_err()
+        ),
+        "syntax: key not found"
+    );
+    assert_eq!(
+        SqlEngine::new(&engine)
+            .query("SELECT a FROM pair ORDER BY a")
+            .unwrap()
+            .rows,
+        vec![
+            vec!["1".to_string()],
+            vec!["2".to_string()],
+            vec!["3".to_string()]
+        ]
+    );
+    let deleted = SqlEngine::execute(
+        &mut engine,
+        "DELETE FROM pair WHERE (b, a) IN (('y', 2), ('x', 1))",
+    )
+    .unwrap();
+    assert_eq!(deleted.rows, vec![vec!["deleted".to_string()]]);
+    assert_eq!(
+        message(
+            SqlEngine::execute(
+                &mut engine,
+                "DELETE FROM pair WHERE (a, b) IN ((3, 'z'), (3, 'z'))",
+            )
+            .unwrap_err()
+        ),
+        "syntax: duplicate key"
+    );
+    assert_eq!(
+        message(SqlEngine::execute(&mut engine, "DELETE FROM pair WHERE a IN (3)").unwrap_err()),
+        "syntax: primary key required"
+    );
+    assert_eq!(
+        message(
+            SqlEngine::execute(
+                &mut engine,
+                "DELETE FROM pair WHERE (a, b) IN ((3, 'z', 'no'))"
+            )
+            .unwrap_err()
+        ),
+        "syntax: column count"
+    );
+    drop(engine);
+    let engine = Engine::open(&dir).unwrap();
+    assert_eq!(
+        SqlEngine::new(&engine)
+            .query("SELECT code FROM pair WHERE a = 3")
+            .unwrap()
+            .rows,
+        vec![vec!["three".to_string()]]
+    );
+    assert!(SqlEngine::new(&engine)
+        .query("SELECT code FROM pair WHERE a = 1")
+        .unwrap()
+        .rows
+        .is_empty());
     let _ = std::fs::remove_dir_all(dir);
 }

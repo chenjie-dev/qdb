@@ -52,7 +52,7 @@ impl<'a> SqlEngine<'a> {
 
     /// 执行一条语句。`CREATE`、`INSERT` 和 `DELETE` 写入 WAL，其余交给 [`SqlEngine::query`]。
     ///
-    /// 末尾分号会被去掉。写入语句在默认组提交下会 `fsync`。`INSERT ... EXPECT n` 在序号不符时不写 WAL。一条 `INSERT` 写多行时，后一行失败则整句不写。`DELETE ... IN` 在任一键不可见或列表有重复时也不写。
+    /// 末尾分号会被去掉。写入语句在默认组提交下会 `fsync`。`INSERT ... EXPECT n` 在序号不符时不写 WAL。一条 `INSERT` 写多行时，后一行失败则整句不写。`DELETE ... IN` 在任一键不可见或列表有重复时也不写。复合主键的 `IN` 用 `(列, ...) IN ((值, ...), ...)`。
     ///
     /// # Arguments
     ///
@@ -1552,6 +1552,9 @@ fn exec_delete(engine: &mut Engine, tokens: &[String]) -> Result<QueryResult, Sq
         .table_schema(&name)
         .cloned()
         .ok_or(SqlError::NotFound)?;
+    if tokens.get(index).is_some_and(|token| token == "(") {
+        return exec_delete_tuples(engine, tokens, &name, &schema, index);
+    }
     if tokens
         .get(index + 1)
         .is_some_and(|token| token.eq_ignore_ascii_case("in"))
@@ -1683,6 +1686,83 @@ fn exec_delete_in(
         columns: vec!["result".into()],
         rows: vec![vec!["deleted".into()]],
     })
+}
+
+fn exec_delete_tuples(
+    engine: &mut Engine,
+    tokens: &[String],
+    name: &str,
+    schema: &TableSchema,
+    mut index: usize,
+) -> Result<QueryResult, SqlError> {
+    expect(tokens, &mut index, "(")?;
+    let mut columns = Vec::new();
+    while tokens.get(index).is_some_and(|token| token != ")") {
+        let column = tokens
+            .get(index)
+            .ok_or_else(|| SqlError::Syntax("column".into()))?
+            .to_ascii_lowercase();
+        index += 1;
+        columns.push(column);
+        if tokens.get(index).is_some_and(|token| token == ",") {
+            index += 1;
+        }
+    }
+    expect(tokens, &mut index, ")")?;
+    expect(tokens, &mut index, "in")?;
+    expect(tokens, &mut index, "(")?;
+    if tokens.get(index).is_some_and(|token| token == ")") {
+        return Err(SqlError::Syntax("primary key required".into()));
+    }
+    let mut tuples = vec![read_raw_tuple(tokens, &mut index)?];
+    while tokens.get(index).is_some_and(|token| token == ",")
+        && tokens.get(index + 1).is_some_and(|token| token == "(")
+    {
+        index += 1;
+        tuples.push(read_raw_tuple(tokens, &mut index)?);
+    }
+    expect(tokens, &mut index, ")")?;
+    if index != tokens.len() || columns.is_empty() {
+        return Err(SqlError::Syntax("primary key required".into()));
+    }
+    let pk: Vec<&ColumnDef> = schema
+        .columns
+        .iter()
+        .filter(|column| column.primary_key)
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    if columns.len() != pk.len()
+        || columns.iter().any(|name| !seen.insert(name.clone()))
+        || pk
+            .iter()
+            .any(|column| !columns.iter().any(|name| name == &column.name))
+    {
+        return Err(SqlError::Syntax("primary key required".into()));
+    }
+    let mut keys = Vec::with_capacity(tuples.len());
+    for raws in &tuples {
+        if raws.len() != columns.len() {
+            return Err(SqlError::Syntax("column count".into()));
+        }
+        let mut key = Vec::with_capacity(pk.len());
+        for column in &pk {
+            let position = columns
+                .iter()
+                .position(|name| name == &column.name)
+                .ok_or_else(|| SqlError::Syntax("primary key required".into()))?;
+            key.push(parse_cell(column.ty, &raws[position])?);
+        }
+        keys.push(key);
+    }
+    engine.delete_rows(name, &keys).map_err(map_store)?;
+    Ok(deleted_result())
+}
+
+fn deleted_result() -> QueryResult {
+    QueryResult {
+        columns: vec!["result".into()],
+        rows: vec![vec!["deleted".into()]],
+    }
 }
 
 fn parse_cell(ty: ColumnType, raw: &str) -> Result<Cell, SqlError> {

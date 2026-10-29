@@ -48,8 +48,8 @@
 | `syntax: duplicate key` | `INSERT` 的主键已经可见，或同一句里出现了两次。多行时整句不写 |
 | `syntax: table already exists` | `CREATE TABLE` 重名 |
 | `syntax: type mismatch` | `INSERT` 的值对不上列类型 |
-| `syntax: column count` | `INSERT` 的值个数和列数不同 |
-| `syntax: primary key required` | `DELETE` 没有写全主键，或写了主键以外的条件 |
+| `syntax: column count` | `INSERT` 的值个数和列数不同，或复合主键 `DELETE` 的一行值个数不对 |
+| `syntax: primary key required` | `DELETE` 没有写全主键，或写了主键以外的条件。多列主键不能用单列 `IN` |
 | `syntax: reserved table` | `DELETE` 的对象是 `symbols`、`ticks`、`snapshots` 或 `klines` |
 | `syntax: key not found` | `DELETE` 的主键当前没有可见行 |
 | `syntax: seq conflict` | `INSERT ... EXPECT` 的序号不是该主键当前可见序号 |
