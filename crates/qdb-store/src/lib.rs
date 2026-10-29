@@ -45,6 +45,8 @@ pub enum StoreError {
     DuplicateKey,
     #[error("key not found")]
     KeyNotFound,
+    #[error("seq conflict")]
+    Conflict,
     #[error("type mismatch")]
     TypeMismatch,
     #[error("schema: {0}")]
@@ -467,6 +469,58 @@ impl Engine {
         self.ensure_writable()?;
         let payload = self.tables.encode_row(table, values)?;
         self.commit(MsgType::RowInsert, 0, 0, 0, 0, &payload, 0)
+    }
+
+    /// 仅当主键当前可见序号等于 `expected` 时写入。
+    ///
+    /// `expected` 为 0 表示这个键必须还不存在，成功时是普通插入。大于 0 时覆盖该行，并让新的 `seq` 成为下次期望值。不符则不写 WAL。
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - 调用方建成、带主键的表。
+    /// * `values` - 与列数、类型一一对应。主键列决定被比较的行。
+    /// * `expected` - 调用方看到的可见 `seq`。0 表示键应当不存在。
+    ///
+    /// # Returns
+    ///
+    /// 这次提交的 `seq`。
+    ///
+    /// # Errors
+    ///
+    /// * [`StoreError::Conflict`] - 可见序号不是 `expected`。
+    /// * [`StoreError::Schema`] - 没有主键，或表不是调用方建成的。
+    /// * [`StoreError::ReadOnly`] - 只读引擎。
+    pub fn insert_expect(
+        &mut self,
+        table: &str,
+        values: &[Cell],
+        expected: u64,
+    ) -> Result<u64, StoreError> {
+        self.ensure_writable()?;
+        if table::BUILTIN_TABLES.contains(&table) {
+            return Err(StoreError::Schema("reserved table".into()));
+        }
+        let schema = self
+            .tables
+            .schema(table)
+            .cloned()
+            .ok_or(StoreError::NotFound)?;
+        let key: Vec<Cell> = values
+            .iter()
+            .zip(&schema.columns)
+            .filter(|(_, column)| column.primary_key)
+            .map(|(value, _)| value.clone())
+            .collect();
+        if key.is_empty() {
+            return Err(StoreError::Schema("primary key required".into()));
+        }
+        match self.tables.visible_seq(table, &key)? {
+            None if expected == 0 => return self.insert_row(table, values),
+            Some(seq) if seq == expected && expected != 0 => {}
+            _ => return Err(StoreError::Conflict),
+        }
+        let payload = self.tables.encode_expect(table, values, expected)?;
+        self.commit(MsgType::RowReplace, 0, 0, 0, 0, &payload, 0)
     }
 
     /// 按主键为用户表写一条墓碑。
@@ -1775,7 +1829,12 @@ impl Engine {
                 Ok(Vec::new())
             }
             Some(MsgType::RowInsert) => {
-                self.tables.insert_encoded(&record.payload)?;
+                self.tables.insert_encoded(&record.payload, record.seq)?;
+                self.agg.note_seq(record.seq)?;
+                Ok(Vec::new())
+            }
+            Some(MsgType::RowReplace) => {
+                self.tables.replace_encoded(&record.payload, record.seq)?;
                 self.agg.note_seq(record.seq)?;
                 Ok(Vec::new())
             }

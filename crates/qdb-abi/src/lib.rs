@@ -52,6 +52,8 @@ pub enum MsgType {
     RowInsert = 9,
     /// 用户表按主键写一条墓碑。已落盘的旧行还在 WAL 里，查询不再返回这个键。
     RowDelete = 10,
+    /// 调用方表按期望 `seq` 覆盖当前主键。期望不符时不写入。
+    RowReplace = 11,
 }
 
 impl MsgType {
@@ -59,7 +61,7 @@ impl MsgType {
     ///
     /// # Arguments
     ///
-    /// * `value` - 1 到 10。其余值没有对应类型。
+    /// * `value` - 1 到 11。其余值没有对应类型。
     ///
     /// # Returns
     ///
@@ -76,6 +78,7 @@ impl MsgType {
             8 => Self::TableSchema,
             9 => Self::RowInsert,
             10 => Self::RowDelete,
+            11 => Self::RowReplace,
             _ => return None,
         })
     }

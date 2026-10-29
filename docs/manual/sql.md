@@ -434,17 +434,22 @@ CREATE TABLE note (
 ### 语法
 
 ```text
-INSERT INTO name VALUES "(" value { "," value } ")"
+INSERT INTO name VALUES "(" value { "," value } ")" ["EXPECT" integer]
 ```
 
 ### 说明
 
 值的个数必须等于列数，否则 `syntax: column count`。类型不对返回 `syntax: type mismatch`。主键冲突返回 `syntax: duplicate key`。负数写成 `-10`。布尔值写成 `true` 或 `false`。不能指定列清单，也不能一次插入多行。
 
+`EXPECT n` 写在值列表后面。`n` 为 0 时，这个主键必须还不存在。`n` 大于 0 时，必须等于 `SELECT` 里该行的 `seq`，然后用新行覆盖它，并得到新的 `seq`。对不上返回 `syntax: seq conflict`，不写日志。没有主键的表不能带 `EXPECT`。
+
+调用方用 `CREATE TABLE` 建成的表，查询结果在列的最后多一列 `seq`。它不是 `DESCRIBE` 里的列。`SELECT *` 也会带上它。
+
 ### 示例
 
 ```sql
 INSERT INTO note VALUES (1, 'SSE:600000', true);
+INSERT INTO note VALUES (1, 'SSE:600000', false) EXPECT 4;
 ```
 
 ### 兼容性

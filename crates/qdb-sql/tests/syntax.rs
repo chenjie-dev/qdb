@@ -498,3 +498,51 @@ fn delete_hides_the_primary_key_until_it_is_inserted_again() {
     assert!(SqlEngine::execute(&mut engine, "DELETE FROM pair WHERE a IN (1)").is_err());
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn expect_replaces_only_the_matching_seq() {
+    let (dir, mut engine) = open();
+    note(&mut engine);
+    let sql = SqlEngine::new(&engine);
+    let seq = sql.query("SELECT seq FROM note WHERE id = 1").unwrap().rows[0][0]
+        .parse::<u64>()
+        .unwrap();
+    assert!(SqlEngine::execute(
+        &mut engine,
+        &format!(
+            "INSERT INTO note VALUES (1, 'no', false) EXPECT {}",
+            seq + 1
+        )
+    )
+    .is_err());
+    assert_eq!(
+        SqlEngine::new(&engine)
+            .query("SELECT code FROM note WHERE id = 1")
+            .unwrap()
+            .rows,
+        vec![vec!["SZSE:000001".to_string()]]
+    );
+    SqlEngine::execute(
+        &mut engine,
+        &format!("INSERT INTO note VALUES (1, 'yes', false) EXPECT {seq}"),
+    )
+    .unwrap();
+    let sql = SqlEngine::new(&engine);
+    let row = sql
+        .query("SELECT code, seq FROM note WHERE id = 1")
+        .unwrap();
+    assert_eq!(row.rows[0][0], "yes");
+    assert_ne!(row.rows[0][1], seq.to_string());
+    assert!(SqlEngine::execute(
+        &mut engine,
+        "INSERT INTO note VALUES (9, 'z', true) EXPECT 0"
+    )
+    .is_ok());
+    drop(engine);
+    let engine = Engine::open(&dir).unwrap();
+    let row = SqlEngine::new(&engine)
+        .query("SELECT code FROM note WHERE id = 1")
+        .unwrap();
+    assert_eq!(row.rows[0][0], "yes");
+    let _ = std::fs::remove_dir_all(dir);
+}

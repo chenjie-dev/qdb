@@ -109,6 +109,8 @@ pub struct TableSet {
     secondary: HashMap<String, HashMap<String, HashMap<Vec<u8>, Vec<usize>>>>,
     /// 墓碑行的下标。快照只写出仍然可见的行。
     deleted: HashMap<String, HashSet<usize>>,
+    /// 与 `rows` 对齐。可见行的值是写入它的 `seq`。0 表示这份快照没有记下序号。
+    seqs: HashMap<String, Vec<u64>>,
 }
 
 impl TableSet {
@@ -120,22 +122,22 @@ impl TableSet {
             .filter(|name| !BUILTIN_TABLES.contains(&name.as_str()))
             .collect();
         push_u16(&mut out, names.len() as u16);
-        for name in names {
-            let schema = &self.schemas[&name];
+        for name in &names {
+            let schema = &self.schemas[name];
             let encoded = Self::encode_schema(schema);
             out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
             out.extend_from_slice(&encoded);
-            let rows = &self.rows[&name];
-            let dead = self.deleted.get(&name);
-            let live: Vec<&Vec<Cell>> = rows
+            let rows = &self.rows[name];
+            let dead = self.deleted.get(name);
+            let live: Vec<(usize, &Vec<Cell>)> = rows
                 .iter()
                 .enumerate()
                 .filter(|(index, _)| !dead.is_some_and(|set| set.contains(index)))
-                .map(|(_, row)| row)
+                .map(|(index, row)| (index, row))
                 .collect();
             out.extend_from_slice(&(live.len() as u32).to_le_bytes());
-            for row in live {
-                for cell in row {
+            for (_, row) in &live {
+                for cell in *row {
                     match cell {
                         Cell::Int64(value) => out.extend_from_slice(&value.to_le_bytes()),
                         Cell::Bool(value) => out.push(u8::from(*value)),
@@ -144,12 +146,30 @@ impl TableSet {
                 }
             }
         }
+        out.extend_from_slice(b"QSEQ");
+        for name in &names {
+            let rows = &self.rows[name];
+            let dead = self.deleted.get(name);
+            for (index, _) in rows.iter().enumerate() {
+                if dead.is_some_and(|set| set.contains(&index)) {
+                    continue;
+                }
+                let seq = self
+                    .seqs
+                    .get(name)
+                    .and_then(|seqs| seqs.get(index))
+                    .copied()
+                    .unwrap_or(0);
+                out.extend_from_slice(&seq.to_le_bytes());
+            }
+        }
         out
     }
 
     pub fn from_bytes(&mut self, bytes: &[u8]) -> Result<(), StoreError> {
         let mut cursor = 0;
         let count = take_u16(bytes, &mut cursor)? as usize;
+        let mut loaded = Vec::new();
         for _ in 0..count {
             let len = take_u32(bytes, &mut cursor)? as usize;
             let end = cursor + len;
@@ -171,7 +191,23 @@ impl TableSet {
                     });
                 }
                 let payload = self.encode_row(&schema.name, &values)?;
-                self.insert_encoded(&payload)?;
+                self.insert_encoded(&payload, 0)?;
+            }
+            loaded.push((schema.name, row_count));
+        }
+        if bytes.get(cursor..cursor + 4) == Some(b"QSEQ") {
+            cursor += 4;
+            for (name, count) in loaded {
+                for index in 0..count {
+                    let seq = take_u64(bytes, &mut cursor)?;
+                    if let Some(slot) = self
+                        .seqs
+                        .get_mut(&name)
+                        .and_then(|seqs| seqs.get_mut(index))
+                    {
+                        *slot = seq;
+                    }
+                }
             }
         }
         Ok(())
@@ -336,6 +372,15 @@ impl TableSet {
     }
 
     pub fn encode_row(&self, table: &str, values: &[Cell]) -> Result<Vec<u8>, StoreError> {
+        self.encode_row_at(table, values, false)
+    }
+
+    fn encode_row_at(
+        &self,
+        table: &str,
+        values: &[Cell],
+        allow_present: bool,
+    ) -> Result<Vec<u8>, StoreError> {
         let schema = self.schemas.get(table).ok_or(StoreError::NotFound)?;
         if values.len() != schema.columns.len() {
             return Err(StoreError::Schema("column count".into()));
@@ -351,10 +396,11 @@ impl TableSet {
             }
         }
         if let Some(key) = primary_key(schema, values) {
-            if self
-                .primary
-                .get(table)
-                .is_some_and(|index| index.contains_key(&key))
+            if !allow_present
+                && self
+                    .primary
+                    .get(table)
+                    .is_some_and(|index| index.contains_key(&key))
             {
                 return Err(StoreError::DuplicateKey);
             }
@@ -371,7 +417,7 @@ impl TableSet {
         Ok(out)
     }
 
-    pub fn insert_encoded(&mut self, bytes: &[u8]) -> Result<(), StoreError> {
+    pub fn insert_encoded(&mut self, bytes: &[u8], seq: u64) -> Result<(), StoreError> {
         let mut cursor = 0;
         let table = take_str(bytes, &mut cursor)?;
         let schema = self
@@ -418,7 +464,131 @@ impl TableSet {
                 .or_default()
                 .push(row_index);
         }
-        self.rows.entry(table).or_default().push(values);
+        self.rows.entry(table.clone()).or_default().push(values);
+        self.seqs.entry(table).or_default().push(seq);
+        Ok(())
+    }
+
+    /// 当前可见行的 `seq`。没有这行时返回 `None`。
+    ///
+    /// # Errors
+    ///
+    /// 表不存在、没有主键或键的形状不对时返回错误。
+    pub fn visible_seq(&self, table: &str, key: &[Cell]) -> Result<Option<u64>, StoreError> {
+        let schema = self.schemas.get(table).ok_or(StoreError::NotFound)?;
+        let pk: Vec<&ColumnDef> = schema
+            .columns
+            .iter()
+            .filter(|column| column.primary_key)
+            .collect();
+        if pk.is_empty() {
+            return Err(StoreError::Schema("primary key required".into()));
+        }
+        if key.len() != pk.len() {
+            return Err(StoreError::Schema("column count".into()));
+        }
+        for (value, column) in key.iter().zip(&pk) {
+            if !value.matches(column.ty) {
+                return Err(StoreError::TypeMismatch);
+            }
+        }
+        let Some(index) = self
+            .primary
+            .get(table)
+            .and_then(|index| index.get(&key_bytes(key)).copied())
+        else {
+            return Ok(None);
+        };
+        Ok(Some(
+            self.seqs
+                .get(table)
+                .and_then(|seqs| seqs.get(index))
+                .copied()
+                .unwrap_or(0),
+        ))
+    }
+
+    /// 编码一条带期望 `seq` 的覆盖。期望必须等于当前可见序号，且不能为 0。
+    ///
+    /// # Errors
+    ///
+    /// 期望不符时返回 [`StoreError::Conflict`]。
+    pub fn encode_expect(
+        &self,
+        table: &str,
+        values: &[Cell],
+        expected: u64,
+    ) -> Result<Vec<u8>, StoreError> {
+        if expected == 0 {
+            return Err(StoreError::Conflict);
+        }
+        let schema = self.schemas.get(table).ok_or(StoreError::NotFound)?;
+        let key: Vec<Cell> = values
+            .iter()
+            .zip(&schema.columns)
+            .filter(|(_, column)| column.primary_key)
+            .map(|(value, _)| value.clone())
+            .collect();
+        if key.is_empty() {
+            return Err(StoreError::Schema("primary key required".into()));
+        }
+        match self.visible_seq(table, &key)? {
+            Some(seq) if seq == expected => {}
+            _ => return Err(StoreError::Conflict),
+        }
+        let row = self.encode_row_at(table, values, true)?;
+        let mut out = expected.to_le_bytes().to_vec();
+        out.extend(row);
+        Ok(out)
+    }
+
+    /// 应用覆盖。期望序号必须仍是这个主键的可见序号。
+    ///
+    /// # Errors
+    ///
+    /// 期望不符、表不存在或载荷截断时返回错误。
+    pub fn replace_encoded(&mut self, bytes: &[u8], seq: u64) -> Result<(), StoreError> {
+        if bytes.len() < 8 {
+            return Err(StoreError::Schema("truncated".into()));
+        }
+        let expected = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
+        let mut cursor = 8;
+        let table = take_str(bytes, &mut cursor)?;
+        let schema = self
+            .schemas
+            .get(&table)
+            .cloned()
+            .ok_or(StoreError::NotFound)?;
+        let mut values = Vec::with_capacity(schema.columns.len());
+        for column in &schema.columns {
+            values.push(match column.ty {
+                ColumnType::Int64 => Cell::Int64(take_i64(bytes, &mut cursor)?),
+                ColumnType::Bool => Cell::Bool(take_u8(bytes, &mut cursor)? == 1),
+                ColumnType::String => Cell::String(take_str(bytes, &mut cursor)?),
+            });
+        }
+        let key: Vec<Cell> = values
+            .iter()
+            .zip(&schema.columns)
+            .filter(|(_, column)| column.primary_key)
+            .map(|(value, _)| value.clone())
+            .collect();
+        if self.visible_seq(&table, &key)? != Some(expected) {
+            return Err(StoreError::Conflict);
+        }
+        let index = self
+            .primary
+            .get(&table)
+            .and_then(|index| index.get(&key_bytes(&key)).copied())
+            .ok_or(StoreError::Conflict)?;
+        self.replace_row(&table, &schema, index, values);
+        if let Some(slot) = self
+            .seqs
+            .get_mut(&table)
+            .and_then(|seqs| seqs.get_mut(index))
+        {
+            *slot = seq;
+        }
         Ok(())
     }
 
@@ -430,7 +600,7 @@ impl TableSet {
         limit: usize,
     ) -> Result<(Vec<String>, Vec<Vec<String>>), StoreError> {
         let schema = self.schemas.get(table).ok_or(StoreError::NotFound)?;
-        let columns: Vec<String> = schema
+        let mut columns: Vec<String> = schema
             .columns
             .iter()
             .map(|column| column.name.clone())
@@ -442,7 +612,8 @@ impl TableSet {
             }
             _ => None,
         };
-        let mut out = Vec::new();
+        let mut out: Vec<Vec<String>> = Vec::new();
+        let mut emitted = Vec::new();
         if let Some(indexes) = indexes {
             for index in indexes {
                 if out.len() >= limit {
@@ -453,6 +624,7 @@ impl TableSet {
                 }
                 if let Some(row) = rows.get(index) {
                     out.push(row.iter().map(Cell::display).collect());
+                    emitted.push(self.row_seq(table, index));
                 }
             }
         } else {
@@ -476,6 +648,13 @@ impl TableSet {
                     }
                 }
                 out.push(row.iter().map(Cell::display).collect());
+                emitted.push(self.row_seq(table, index));
+            }
+        }
+        if !BUILTIN_TABLES.contains(&table) {
+            columns.push("seq".into());
+            for (row, seq) in out.iter_mut().zip(emitted.iter()) {
+                row.push(seq.to_string());
             }
         }
         Ok((columns, out))
@@ -645,6 +824,14 @@ impl TableSet {
             .get(table)
             .is_some_and(|set| set.contains(&index))
     }
+
+    fn row_seq(&self, table: &str, index: usize) -> u64 {
+        self.seqs
+            .get(table)
+            .and_then(|seqs| seqs.get(index))
+            .copied()
+            .unwrap_or(0)
+    }
 }
 
 /// 行情四表的字典。调用方不能用 `CREATE TABLE` 替换它们。
@@ -788,6 +975,7 @@ impl TableSet {
         }
         self.index_secondary(table, &schema, row_index, &values);
         self.rows.entry(table.to_string()).or_default().push(values);
+        self.seqs.entry(table.to_string()).or_default().push(0);
         Ok(())
     }
 
@@ -930,6 +1118,19 @@ fn take_u8(bytes: &[u8], cursor: &mut usize) -> Result<u8, StoreError> {
         .ok_or_else(|| StoreError::Schema("truncated".into()))?;
     *cursor += 1;
     Ok(value)
+}
+
+fn take_u64(bytes: &[u8], cursor: &mut usize) -> Result<u64, StoreError> {
+    let end = cursor
+        .checked_add(8)
+        .ok_or_else(|| StoreError::Schema("truncated".into()))?;
+    let raw: [u8; 8] = bytes
+        .get(*cursor..end)
+        .ok_or_else(|| StoreError::Schema("truncated".into()))?
+        .try_into()
+        .unwrap();
+    *cursor = end;
+    Ok(u64::from_le_bytes(raw))
 }
 
 fn take_u32(bytes: &[u8], cursor: &mut usize) -> Result<u32, StoreError> {

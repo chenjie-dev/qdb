@@ -1051,7 +1051,7 @@ impl<'a> SqlEngine<'a> {
             .ok_or_else(|| SqlError::Syntax(format!("unknown table {table}")))?
             .clone();
         let filter = match (&stmt.eq_column, &stmt.eq_value) {
-            (Some(column), Some(raw)) => {
+            (Some(column), Some(raw)) if schema.columns.iter().any(|item| item.name == *column) => {
                 let definition = schema
                     .columns
                     .iter()
@@ -1423,6 +1423,24 @@ fn exec_insert(engine: &mut Engine, tokens: &[String]) -> Result<QueryResult, Sq
         }
     }
     expect(tokens, &mut index, ")")?;
+    let mut expected = None;
+    if tokens
+        .get(index)
+        .is_some_and(|token| token.eq_ignore_ascii_case("expect"))
+    {
+        index += 1;
+        let raw = tokens
+            .get(index)
+            .ok_or_else(|| SqlError::Syntax("seq".into()))?;
+        let seq = raw
+            .parse::<u64>()
+            .map_err(|_| SqlError::Syntax("seq".into()))?;
+        expected = Some(seq);
+        index += 1;
+    }
+    if index != tokens.len() {
+        return Err(SqlError::Syntax("value".into()));
+    }
     if raws.len() != schema.columns.len() {
         return Err(SqlError::Syntax("column count".into()));
     }
@@ -1431,7 +1449,13 @@ fn exec_insert(engine: &mut Engine, tokens: &[String]) -> Result<QueryResult, Sq
         .zip(&schema.columns)
         .map(|(raw, column)| parse_cell(column.ty, raw))
         .collect::<Result<Vec<_>, _>>()?;
-    engine.insert_row(&name, &values).map_err(map_store)?;
+    if let Some(seq) = expected {
+        engine
+            .insert_expect(&name, &values, seq)
+            .map_err(map_store)?;
+    } else {
+        engine.insert_row(&name, &values).map_err(map_store)?;
+    }
     Ok(QueryResult {
         columns: vec!["result".into()],
         rows: vec![vec!["inserted".into()]],
@@ -1606,6 +1630,7 @@ fn map_store(err: StoreError) -> SqlError {
         StoreError::TableExists => SqlError::Syntax("table already exists".into()),
         StoreError::DuplicateKey => SqlError::Syntax("duplicate key".into()),
         StoreError::KeyNotFound => SqlError::Syntax("key not found".into()),
+        StoreError::Conflict => SqlError::Syntax("seq conflict".into()),
         StoreError::TypeMismatch => SqlError::Syntax("type mismatch".into()),
         StoreError::Schema(message) => SqlError::Syntax(message),
         other => SqlError::Store(other.to_string()),
