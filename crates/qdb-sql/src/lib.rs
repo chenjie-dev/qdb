@@ -52,7 +52,7 @@ impl<'a> SqlEngine<'a> {
 
     /// 执行一条语句。`CREATE`、`INSERT` 和 `DELETE` 写入 WAL，其余交给 [`SqlEngine::query`]。
     ///
-    /// 末尾分号会被去掉。写入语句在默认组提交下会 `fsync`。`INSERT ... EXPECT n` 在序号不符时不写 WAL。`DELETE ... IN` 在任一键不可见或列表有重复时也不写。
+    /// 末尾分号会被去掉。写入语句在默认组提交下会 `fsync`。`INSERT ... EXPECT n` 在序号不符时不写 WAL。一条 `INSERT` 写多行时，后一行失败则整句不写。`DELETE ... IN` 在任一键不可见或列表有重复时也不写。
     ///
     /// # Arguments
     ///
@@ -1400,32 +1400,17 @@ fn exec_insert(engine: &mut Engine, tokens: &[String]) -> Result<QueryResult, Sq
         .to_ascii_lowercase();
     index += 1;
     expect(tokens, &mut index, "values")?;
-    expect(tokens, &mut index, "(")?;
     let schema = engine
         .table_schema(&name)
         .cloned()
         .ok_or(SqlError::NotFound)?;
-    let mut raws = Vec::new();
-    while tokens.get(index).is_some_and(|token| token != ")") {
-        let token = tokens
-            .get(index)
-            .ok_or_else(|| SqlError::Syntax("value".into()))?;
-        if token == "-" {
-            index += 1;
-            let number = tokens
-                .get(index)
-                .ok_or_else(|| SqlError::Syntax("value".into()))?;
-            raws.push(format!("-{}", unquote(number)));
-            index += 1;
-        } else {
-            raws.push(unquote(token));
-            index += 1;
-        }
-        if tokens.get(index).is_some_and(|token| token == ",") {
-            index += 1;
-        }
+    let mut tuples = vec![read_raw_tuple(tokens, &mut index)?];
+    while tokens.get(index).is_some_and(|token| token == ",")
+        && tokens.get(index + 1).is_some_and(|token| token == "(")
+    {
+        index += 1;
+        tuples.push(read_raw_tuple(tokens, &mut index)?);
     }
-    expect(tokens, &mut index, ")")?;
     let mut expected = None;
     let mut expire_at = None;
     loop {
@@ -1445,29 +1430,68 @@ fn exec_insert(engine: &mut Engine, tokens: &[String]) -> Result<QueryResult, Sq
         }
         return Err(SqlError::Syntax("value".into()));
     }
-    if raws.len() != schema.columns.len() {
-        return Err(SqlError::Syntax("column count".into()));
+    if tuples.len() > 1 && expected.is_some() {
+        return Err(SqlError::Syntax("expect".into()));
     }
-    let values = raws
-        .iter()
-        .zip(&schema.columns)
-        .map(|(raw, column)| parse_cell(column.ty, raw))
-        .collect::<Result<Vec<_>, _>>()?;
-    if let Some(seq) = expected {
-        engine
-            .insert_timed(&name, &values, Some(seq), expire_at)
-            .map_err(map_store)?;
-    } else if expire_at.is_some() {
-        engine
-            .insert_timed(&name, &values, None, expire_at)
-            .map_err(map_store)?;
+    let mut rows = Vec::with_capacity(tuples.len());
+    for raws in &tuples {
+        if raws.len() != schema.columns.len() {
+            return Err(SqlError::Syntax("column count".into()));
+        }
+        rows.push(
+            raws.iter()
+                .zip(&schema.columns)
+                .map(|(raw, column)| parse_cell(column.ty, raw))
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+    }
+    if tuples.len() == 1 {
+        if let Some(seq) = expected {
+            engine
+                .insert_timed(&name, &rows[0], Some(seq), expire_at)
+                .map_err(map_store)?;
+        } else if expire_at.is_some() {
+            engine
+                .insert_timed(&name, &rows[0], None, expire_at)
+                .map_err(map_store)?;
+        } else {
+            engine.insert_row(&name, &rows[0]).map_err(map_store)?;
+        }
     } else {
-        engine.insert_row(&name, &values).map_err(map_store)?;
+        engine
+            .insert_rows(&name, &rows, expire_at)
+            .map_err(map_store)?;
     }
     Ok(QueryResult {
         columns: vec!["result".into()],
         rows: vec![vec!["inserted".into()]],
     })
+}
+
+fn read_raw_tuple(tokens: &[String], index: &mut usize) -> Result<Vec<String>, SqlError> {
+    expect(tokens, index, "(")?;
+    let mut raws = Vec::new();
+    while tokens.get(*index).is_some_and(|token| token != ")") {
+        let token = tokens
+            .get(*index)
+            .ok_or_else(|| SqlError::Syntax("value".into()))?;
+        if token == "-" {
+            *index += 1;
+            let number = tokens
+                .get(*index)
+                .ok_or_else(|| SqlError::Syntax("value".into()))?;
+            raws.push(format!("-{}", unquote(number)));
+            *index += 1;
+        } else {
+            raws.push(unquote(token));
+            *index += 1;
+        }
+        if tokens.get(*index).is_some_and(|token| token == ",") {
+            *index += 1;
+        }
+    }
+    expect(tokens, index, ")")?;
+    Ok(raws)
 }
 
 fn read_u64(tokens: &[String], index: &mut usize) -> Result<u64, SqlError> {

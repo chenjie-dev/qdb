@@ -571,6 +571,59 @@ impl Engine {
         self.commit(MsgType::RowInsert, 0, 0, 0, 0, &payload, 0)
     }
 
+    /// 一次插入多行。先把每一行都编码完，再按顺序提交。
+    ///
+    /// 后一行主键冲突、类型不对，或同一批里主键重复时，前面的行也不写 WAL。没有主键的表只追加。`expire_at` 非空时每一行带同一个截止时间，表必须有主键。`EXPECT` 不走这里。默认每一条都会 `fsync`，除非组提交还没凑满。
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - 调用方建成的表。带截止时间时不能是引擎登记的四张表。
+    /// * `rows` - 每行与列顺序、列数、类型一一对应。至少一行。
+    /// * `expire_at` - `None` 或 `Some(0)` 表示没有截止时间。非 0 是 UTC 纳秒，写在每一行后面。
+    ///
+    /// # Returns
+    ///
+    /// 每行自己的 `seq`，顺序与 `rows` 相同。
+    ///
+    /// # Errors
+    ///
+    /// 与 [`Engine::insert_row`] 相同。带截止时间但没有主键时返回 [`StoreError::Schema`]。
+    pub fn insert_rows(
+        &mut self,
+        table: &str,
+        rows: &[Vec<Cell>],
+        expire_at: Option<i64>,
+    ) -> Result<Vec<u64>, StoreError> {
+        self.ensure_writable()?;
+        if expire_at.is_some() && expire_at != Some(0) {
+            if table::BUILTIN_TABLES.contains(&table) {
+                return Err(StoreError::Schema("reserved table".into()));
+            }
+            let schema = self
+                .tables
+                .schema(table)
+                .cloned()
+                .ok_or(StoreError::NotFound)?;
+            if !schema.columns.iter().any(|column| column.primary_key) {
+                return Err(StoreError::Schema("primary key required".into()));
+            }
+        }
+        // 编码只检查键和类型。通过之后再逐条提交，避免后一行失败时前一行已经落盘。
+        let mut payloads = self.tables.encode_inserts(table, rows)?;
+        if let Some(expire_at) = expire_at {
+            if expire_at != 0 {
+                for payload in &mut payloads {
+                    payload.extend_from_slice(&expire_at.to_le_bytes());
+                }
+            }
+        }
+        let mut seqs = Vec::with_capacity(payloads.len());
+        for payload in &payloads {
+            seqs.push(self.commit(MsgType::RowInsert, 0, 0, 0, 0, payload, 0)?);
+        }
+        Ok(seqs)
+    }
+
     /// 把截止时间不晚于 `deadline_ns` 的可见行收成墓碑。
     ///
     /// 水位是调用方给出的 UTC 纳秒，不是本机时钟。没有截止时间的行保留。没有主键的表跳过。先收集再提交，没有命中时不写 WAL。每个命中的键一条墓碑。

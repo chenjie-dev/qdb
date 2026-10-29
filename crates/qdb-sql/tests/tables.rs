@@ -450,3 +450,88 @@ fn expect_can_replace_the_deadline() {
         .is_empty());
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn one_insert_writes_every_tuple_or_none() {
+    let (dir, mut engine) = open();
+    SqlEngine::execute(
+        &mut engine,
+        "CREATE TABLE note (id INT64 PRIMARY KEY, code STRING)",
+    )
+    .unwrap();
+    SqlEngine::execute(&mut engine, "CREATE TABLE log (id INT64, code STRING)").unwrap();
+    let inserted = SqlEngine::execute(
+        &mut engine,
+        "INSERT INTO note VALUES (1, 'a'), (2, 'b') EXPIRE AT 100",
+    )
+    .unwrap();
+    assert_eq!(inserted.rows, vec![vec!["inserted".to_string()]]);
+    assert_eq!(
+        SqlEngine::new(&engine)
+            .query("SELECT id FROM note ORDER BY id")
+            .unwrap()
+            .rows,
+        vec![vec!["1".to_string()], vec!["2".to_string()]]
+    );
+    SqlEngine::execute(&mut engine, "INSERT INTO log VALUES (1, 'x'), (2, 'y')").unwrap();
+    assert_eq!(
+        message(
+            SqlEngine::execute(
+                &mut engine,
+                "INSERT INTO note VALUES (3, 'c'), (1, 'again')"
+            )
+            .unwrap_err()
+        ),
+        "syntax: duplicate key"
+    );
+    assert!(SqlEngine::new(&engine)
+        .query("SELECT code FROM note WHERE id = 3")
+        .unwrap()
+        .rows
+        .is_empty());
+    assert_eq!(
+        message(
+            SqlEngine::execute(&mut engine, "INSERT INTO note VALUES (4, 'd'), (4, 'e')")
+                .unwrap_err()
+        ),
+        "syntax: duplicate key"
+    );
+    assert_eq!(
+        message(
+            SqlEngine::execute(
+                &mut engine,
+                "INSERT INTO note VALUES (5, 'f'), (6, 'g') EXPECT 0",
+            )
+            .unwrap_err()
+        ),
+        "syntax: expect"
+    );
+    assert_eq!(
+        message(
+            SqlEngine::execute(&mut engine, "INSERT INTO note VALUES (7, 'ok'), ('bad', 'x')")
+                .unwrap_err()
+        ),
+        "syntax: type mismatch"
+    );
+    assert!(SqlEngine::new(&engine)
+        .query("SELECT code FROM note WHERE id = 7")
+        .unwrap()
+        .rows
+        .is_empty());
+    drop(engine);
+    let mut engine = Engine::open(&dir).unwrap();
+    SqlEngine::execute(&mut engine, "EXPIRE AT 100").unwrap();
+    assert!(SqlEngine::new(&engine)
+        .query("SELECT id FROM note")
+        .unwrap()
+        .rows
+        .is_empty());
+    assert_eq!(
+        SqlEngine::new(&engine)
+            .query("SELECT id FROM log ORDER BY id")
+            .unwrap()
+            .rows,
+        vec![vec!["1".to_string()], vec!["2".to_string()]]
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

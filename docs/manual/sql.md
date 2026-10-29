@@ -429,21 +429,24 @@ CREATE TABLE note (
 
 ## INSERT
 
-按建表时的列顺序插入一行。成功时 `columns` 是 `result`，`rows` 是 `inserted`。语句写入 WAL。
+按建表时的列顺序插入一行或多行。成功时 `columns` 是 `result`，`rows` 是 `inserted`。语句写入 WAL。多行时每一行仍有自己的 `seq`。
 
 ### 语法
 
 ```text
-INSERT INTO name VALUES "(" value { "," value } ")" ["EXPECT" integer]
+INSERT INTO name VALUES tuple { "," tuple } ["EXPECT" integer] ["EXPIRE AT" integer]
+tuple = "(" value { "," value } ")"
 ```
 
 ### 说明
 
-值的个数必须等于列数，否则 `syntax: column count`。类型不对返回 `syntax: type mismatch`。主键冲突返回 `syntax: duplicate key`。负数写成 `-10`。布尔值写成 `true` 或 `false`。不能指定列清单，也不能一次插入多行。
+值的个数必须等于列数，否则 `syntax: column count`。类型不对返回 `syntax: type mismatch`。主键冲突返回 `syntax: duplicate key`。负数写成 `-10`。布尔值写成 `true` 或 `false`。不能指定列清单。
+
+`VALUES` 后面可以写多个元组。先检查全部行，再逐行提交。后一行类型不对、主键已经存在，或同一句里主键重复时，前面的行也不写入，返回 `syntax: duplicate key` 或对应的类型错误。没有主键的表则每行都追加。多个元组不能再写 `EXPECT`，否则 `syntax: expect`。
 
 `EXPECT n` 写在值列表后面。`n` 为 0 时，这个主键必须还不存在。`n` 大于 0 时，必须等于 `SELECT` 里该行的 `seq`，然后用新行覆盖它，并得到新的 `seq`。对不上返回 `syntax: seq conflict`，不写日志。没有主键的表不能带 `EXPECT`。
 
-`EXPIRE AT n` 也可以写在值列表后面，和 `EXPECT` 的顺序不限。`n` 是 UTC 纳秒。`0` 表示这行没有截止时间。非 0 时，之后的 `EXPIRE AT` 水位只要大于或等于它，就把这个主键收成墓碑。
+`EXPIRE AT n` 也可以写在值列表后面，和 `EXPECT` 的顺序不限。多个元组时它作用在这一句的每一行上。`n` 是 UTC 纳秒。`0` 表示这行没有截止时间。非 0 时，之后的 `EXPIRE AT` 水位只要大于或等于它，就把这个主键收成墓碑。
 
 调用方用 `CREATE TABLE` 建成的表，查询结果在列的最后多一列 `seq`。它不是 `DESCRIBE` 里的列。`SELECT *` 也会带上它。
 
@@ -453,11 +456,12 @@ INSERT INTO name VALUES "(" value { "," value } ")" ["EXPECT" integer]
 INSERT INTO note VALUES (1, 'SSE:600000', true);
 INSERT INTO note VALUES (1, 'SSE:600000', false) EXPECT 4;
 INSERT INTO note VALUES (2, 'kept', true) EXPIRE AT 1700000000000000000;
+INSERT INTO note VALUES (3, 'a', true), (4, 'b', false);
 ```
 
 ### 兼容性
 
-没有 `INSERT INTO t (列) VALUES ...`、`RETURNING` 和 `ON CONFLICT`。
+没有 `INSERT INTO t (列) VALUES ...`、`RETURNING` 和 `ON CONFLICT`。多个元组不能各自带不同的 `EXPECT` 或 `EXPIRE AT`。
 
 ## DELETE
 
@@ -683,7 +687,7 @@ WebSocket `GET /v1/ws` 接受同一套 `SELECT`，见 [服务进程](server.md)�
 | 窗口 | `OVER`、`rank`、`lag`、`lead` |
 | 表达式 | `CASE 列 WHEN`、`COALESCE`、`NULLIF`、`CAST`、`::`、四则以外的函数、正则 |
 | 谓词 | `ILIKE`、`SIMILAR TO`、`ANY` / `ALL`、数组、`IS TRUE` |
-| 写入 | `UPDATE`、`DELETE`、`TRUNCATE`、`ALTER`、`DROP`、`COPY` |
+| 写入 | `UPDATE`、`TRUNCATE`、`ALTER`、`DROP`、`COPY`。`DELETE` 只按主键追加墓碑 |
 | 目录 | `information_schema`、`pg_catalog` |
 | 协议 | 预编译语句、参数绑定、PostgreSQL 线协议 |
 

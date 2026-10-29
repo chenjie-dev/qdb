@@ -407,6 +407,49 @@ impl TableSet {
         self.encode_row_at(table, values, false)
     }
 
+    /// 把多行都编码成插入载荷，但不改内存。
+    ///
+    /// 某一行类型不对、主键已经可见，或同一批里主键重复时，一行载荷都不返回。没有主键的表不比较行与行。
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - 已经存在的表。
+    /// * `rows` - 每行的值与列顺序一致。至少一行。
+    ///
+    /// # Returns
+    ///
+    /// 与 `rows` 顺序相同的载荷。
+    ///
+    /// # Errors
+    ///
+    /// * [`StoreError::NotFound`] - 表不存在。
+    /// * [`StoreError::DuplicateKey`] - 主键已经可见，或这一批里出现了两次。
+    /// * [`StoreError::TypeMismatch`] - 某个值的类型和列定义不一致。
+    /// * [`StoreError::Schema`] - 没有行、列数不对，或字符串超过 1024 字节。
+    pub fn encode_inserts(
+        &self,
+        table: &str,
+        rows: &[Vec<Cell>],
+    ) -> Result<Vec<Vec<u8>>, StoreError> {
+        if rows.is_empty() {
+            return Err(StoreError::Schema("column count".into()));
+        }
+        let schema = self.schemas.get(table).ok_or(StoreError::NotFound)?.clone();
+        let mut seen = Vec::new();
+        let mut payloads = Vec::with_capacity(rows.len());
+        for values in rows {
+            let payload = self.encode_row_at(table, values, false)?;
+            if let Some(key) = primary_key(&schema, values) {
+                if seen.iter().any(|earlier| earlier == &key) {
+                    return Err(StoreError::DuplicateKey);
+                }
+                seen.push(key);
+            }
+            payloads.push(payload);
+        }
+        Ok(payloads)
+    }
+
     fn encode_row_at(
         &self,
         table: &str,
