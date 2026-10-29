@@ -619,3 +619,88 @@ fn a_composite_primary_key_can_delete_several_rows() {
         .is_empty());
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn insert_by_column_list_reorders_values_and_rejects_a_partial_list() {
+    let (dir, mut engine) = open();
+    SqlEngine::execute(
+        &mut engine,
+        "CREATE TABLE note (id INT64 PRIMARY KEY, code STRING, active BOOL)",
+    )
+    .unwrap();
+    SqlEngine::execute(
+        &mut engine,
+        "INSERT INTO note (active, id, code) VALUES (true, 1, 'a'), (false, 2, 'b')",
+    )
+    .unwrap();
+    assert_eq!(
+        SqlEngine::new(&engine)
+            .query("SELECT id, code, active FROM note ORDER BY id")
+            .unwrap()
+            .rows,
+        vec![
+            vec!["1".to_string(), "a".to_string(), "true".to_string()],
+            vec!["2".to_string(), "b".to_string(), "false".to_string()]
+        ]
+    );
+    assert_eq!(
+        message(
+            SqlEngine::execute(&mut engine, "INSERT INTO note (id, code) VALUES (3, 'c')")
+                .unwrap_err()
+        ),
+        "syntax: column count"
+    );
+    assert_eq!(
+        message(
+            SqlEngine::execute(
+                &mut engine,
+                "INSERT INTO note (id, id, code) VALUES (3, 4, 'c')",
+            )
+            .unwrap_err()
+        ),
+        "syntax: duplicate column"
+    );
+    assert_eq!(
+        message(
+            SqlEngine::execute(
+                &mut engine,
+                "INSERT INTO note (id, code, missing) VALUES (3, 'c', true)",
+            )
+            .unwrap_err()
+        ),
+        "syntax: unknown column missing"
+    );
+    assert_eq!(
+        message(
+            SqlEngine::execute(
+                &mut engine,
+                "INSERT INTO note (code, id, active) VALUES ('nope', 'bad', true)",
+            )
+            .unwrap_err()
+        ),
+        "syntax: type mismatch"
+    );
+    assert!(SqlEngine::new(&engine)
+        .query("SELECT code FROM note WHERE id = 3")
+        .unwrap()
+        .rows
+        .is_empty());
+    let seq = SqlEngine::new(&engine)
+        .query("SELECT seq FROM note WHERE id = 1")
+        .unwrap()
+        .rows[0][0]
+        .clone();
+    SqlEngine::execute(
+        &mut engine,
+        &format!("INSERT INTO note (code, active, id) VALUES ('later', false, 1) EXPECT {seq}"),
+    )
+    .unwrap();
+    assert_eq!(
+        SqlEngine::new(&engine)
+            .query("SELECT code, active FROM note WHERE id = 1")
+            .unwrap()
+            .rows,
+        vec![vec!["later".to_string(), "false".to_string()]]
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

@@ -429,18 +429,21 @@ CREATE TABLE note (
 
 ## INSERT
 
-按建表时的列顺序插入一行或多行。成功时 `columns` 是 `result`，`rows` 是 `inserted`。语句写入 WAL。多行时每一行仍有自己的 `seq`。
+插入一行或多行。不写列名时按建表顺序。写了列名时按清单顺序填值，再排回建表顺序后写入。成功时 `columns` 是 `result`，`rows` 是 `inserted`。语句写入 WAL。多行时每一行仍有自己的 `seq`。
 
 ### 语法
 
 ```text
-INSERT INTO name VALUES tuple { "," tuple } ["EXPECT" integer] ["EXPIRE AT" integer]
+INSERT INTO name ["(" column { "," column } ")"] VALUES tuple { "," tuple }
+    ["EXPECT" integer] ["EXPIRE AT" integer]
 tuple = "(" value { "," value } ")"
 ```
 
 ### 说明
 
-值的个数必须等于列数，否则 `syntax: column count`。类型不对返回 `syntax: type mismatch`。主键冲突返回 `syntax: duplicate key`。负数写成 `-10`。布尔值写成 `true` 或 `false`。不能指定列清单。
+不写列清单时，值的个数和顺序必须等于建表列，否则 `syntax: column count`。写了列清单时，每个列名恰好一次，并且必须是全部建表列，顺序不限；值的顺序跟清单一致，写入前再排回建表顺序。清单里列名重复返回 `syntax: duplicate column`。点了不存在的列返回 `syntax: unknown column 名称`。少了列，或某一行的值个数和清单不一致，返回 `syntax: column count`。这些失败都不写 WAL。没有默认值，不能省略列。
+
+类型不对返回 `syntax: type mismatch`。主键冲突返回 `syntax: duplicate key`。负数写成 `-10`。布尔值写成 `true` 或 `false`。
 
 `VALUES` 后面可以写多个元组。先检查全部行，再逐行提交。后一行类型不对、主键已经存在，或同一句里主键重复时，前面的行也不写入，返回 `syntax: duplicate key` 或对应的类型错误。没有主键的表则每行都追加。多个元组不能再写 `EXPECT`，否则 `syntax: expect`。
 
@@ -457,11 +460,12 @@ INSERT INTO note VALUES (1, 'SSE:600000', true);
 INSERT INTO note VALUES (1, 'SSE:600000', false) EXPECT 4;
 INSERT INTO note VALUES (2, 'kept', true) EXPIRE AT 1700000000000000000;
 INSERT INTO note VALUES (3, 'a', true), (4, 'b', false);
+INSERT INTO note (active, id, code) VALUES (true, 5, 'named');
 ```
 
 ### 兼容性
 
-没有 `INSERT INTO t (列) VALUES ...`、`RETURNING` 和 `ON CONFLICT`。多个元组不能各自带不同的 `EXPECT` 或 `EXPIRE AT`。
+没有 `RETURNING` 和 `ON CONFLICT`。列清单不能只写一部分列。多个元组不能各自带不同的 `EXPECT` 或 `EXPIRE AT`。
 
 ## DELETE
 

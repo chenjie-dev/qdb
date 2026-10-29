@@ -52,7 +52,7 @@ impl<'a> SqlEngine<'a> {
 
     /// 执行一条语句。`CREATE`、`INSERT` 和 `DELETE` 写入 WAL，其余交给 [`SqlEngine::query`]。
     ///
-    /// 末尾分号会被去掉。写入语句在默认组提交下会 `fsync`。`INSERT ... EXPECT n` 在序号不符时不写 WAL。一条 `INSERT` 写多行时，后一行失败则整句不写。`DELETE ... IN` 在任一键不可见或列表有重复时也不写。复合主键的 `IN` 用 `(列, ...) IN ((值, ...), ...)`。
+    /// 末尾分号会被去掉。写入语句在默认组提交下会 `fsync`。`INSERT ... EXPECT n` 在序号不符时不写 WAL。一条 `INSERT` 写多行时，后一行失败则整句不写。`INSERT INTO t (列, ...)` 的列必须是建表列的一个排列，缺列、重复列或未知列不写 WAL。`DELETE ... IN` 在任一键不可见或列表有重复时也不写。复合主键的 `IN` 用 `(列, ...) IN ((值, ...), ...)`，值按写出的列对齐后再排成建表时的主键顺序。
     ///
     /// # Arguments
     ///
@@ -1399,6 +1399,25 @@ fn exec_insert(engine: &mut Engine, tokens: &[String]) -> Result<QueryResult, Sq
         .ok_or_else(|| SqlError::Syntax("table".into()))?
         .to_ascii_lowercase();
     index += 1;
+    let listed = if tokens.get(index).is_some_and(|token| token == "(") {
+        index += 1;
+        let mut names = Vec::new();
+        while tokens.get(index).is_some_and(|token| token != ")") {
+            let column = tokens
+                .get(index)
+                .ok_or_else(|| SqlError::Syntax("column".into()))?
+                .to_ascii_lowercase();
+            index += 1;
+            names.push(column);
+            if tokens.get(index).is_some_and(|token| token == ",") {
+                index += 1;
+            }
+        }
+        expect(tokens, &mut index, ")")?;
+        Some(names)
+    } else {
+        None
+    };
     expect(tokens, &mut index, "values")?;
     let schema = engine
         .table_schema(&name)
@@ -1433,17 +1452,10 @@ fn exec_insert(engine: &mut Engine, tokens: &[String]) -> Result<QueryResult, Sq
     if tuples.len() > 1 && expected.is_some() {
         return Err(SqlError::Syntax("expect".into()));
     }
+    // 没有默认值。列清单必须先排成建表顺序，全部行的类型都通过之后才写 WAL。
     let mut rows = Vec::with_capacity(tuples.len());
     for raws in &tuples {
-        if raws.len() != schema.columns.len() {
-            return Err(SqlError::Syntax("column count".into()));
-        }
-        rows.push(
-            raws.iter()
-                .zip(&schema.columns)
-                .map(|(raw, column)| parse_cell(column.ty, raw))
-                .collect::<Result<Vec<_>, _>>()?,
-        );
+        rows.push(align_insert_row(&schema, listed.as_deref(), raws)?);
     }
     if tuples.len() == 1 {
         if let Some(seq) = expected {
@@ -1466,6 +1478,50 @@ fn exec_insert(engine: &mut Engine, tokens: &[String]) -> Result<QueryResult, Sq
         columns: vec!["result".into()],
         rows: vec![vec!["inserted".into()]],
     })
+}
+
+fn align_insert_row(
+    schema: &TableSchema,
+    listed: Option<&[String]>,
+    raws: &[String],
+) -> Result<Vec<Cell>, SqlError> {
+    let positions = match listed {
+        None => {
+            if raws.len() != schema.columns.len() {
+                return Err(SqlError::Syntax("column count".into()));
+            }
+            (0..schema.columns.len()).collect()
+        }
+        Some(listed) => {
+            let mut seen = std::collections::HashSet::new();
+            for name in listed {
+                if !seen.insert(name.clone()) {
+                    return Err(SqlError::Syntax("duplicate column".into()));
+                }
+                if !schema.columns.iter().any(|column| &column.name == name) {
+                    return Err(SqlError::Syntax(format!("unknown column {name}")));
+                }
+            }
+            if listed.len() != schema.columns.len() || listed.len() != raws.len() {
+                return Err(SqlError::Syntax("column count".into()));
+            }
+            let mut positions = Vec::with_capacity(schema.columns.len());
+            for column in &schema.columns {
+                let position = listed
+                    .iter()
+                    .position(|name| name == &column.name)
+                    .ok_or_else(|| SqlError::Syntax("column count".into()))?;
+                positions.push(position);
+            }
+            positions
+        }
+    };
+    schema
+        .columns
+        .iter()
+        .zip(positions)
+        .map(|(column, position)| parse_cell(column.ty, &raws[position]))
+        .collect()
 }
 
 fn read_raw_tuple(tokens: &[String], index: &mut usize) -> Result<Vec<String>, SqlError> {
@@ -1730,6 +1786,7 @@ fn exec_delete_tuples(
         .iter()
         .filter(|column| column.primary_key)
         .collect();
+    // 列集合必须正好是主键。值先按写出的列读取，再排成建表时的主键顺序，然后才交给存储层。
     let mut seen = std::collections::HashSet::new();
     if columns.len() != pk.len()
         || columns.iter().any(|name| !seen.insert(name.clone()))
