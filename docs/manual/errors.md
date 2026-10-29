@@ -35,7 +35,7 @@
 |---|---|
 | `syntax: symbol required` | `klines` 或 `snapshots` 的最外层 `AND` 里没有 `symbol = ...` |
 | `syntax: period required` | `klines` 没有 `period = ...` |
-| `syntax: unknown column 名称` | 选择列表、`WHERE`、`ORDER BY`、`INSERT` 列清单或 `UPDATE` 的 `SET` 点了不存在的列 |
+| `syntax: unknown column 名称` | 选择列表、`WHERE`、`ORDER BY`、`INSERT` 列清单、`UPDATE` 的 `SET` 或 `ALTER TABLE ... RENAME COLUMN` 点了不存在的列 |
 | `syntax: column "名称" is ambiguous` | 连接后列名在多张表里出现，又没有表前缀 |
 | `syntax: column "名称" must appear in GROUP BY` | 非聚合表达式不在分组键里 |
 | `syntax: column "名称" does not exist` | 过滤或排序用了结果里没有的列 |
@@ -54,12 +54,12 @@
 | `syntax: table already exists` | `CREATE TABLE` 重名，或 `ALTER TABLE ... RENAME TO` 的新名字已经有表 |
 | `syntax: type mismatch` | `INSERT` 的值对不上列类型 |
 | `syntax: column count` | `INSERT` 的值个数和列数不同，列清单没有写全，或复合主键 `DELETE` 的一行值个数不对 |
-| `syntax: duplicate column` | `INSERT` 的列清单或 `UPDATE` 的 `SET` 里同一个列名出现了两次 |
+| `syntax: duplicate column` | `INSERT` 的列清单或 `UPDATE` 的 `SET` 里同一个列名出现了两次，或 `ALTER TABLE ... RENAME COLUMN` 的新列名已经存在 |
 | `syntax: primary key required` | `DELETE` 或 `UPDATE` 没有写全主键，写了主键以外的条件，或 `SET` 里写了主键列。多列主键不能用单列 `IN` |
 | `syntax: reserved table` | `DELETE`、`UPDATE`、`DROP TABLE`、`TRUNCATE TABLE` 或 `ALTER TABLE` 的对象是 `symbols`、`ticks`、`snapshots` 或 `klines` |
 | `syntax: drop` | `DROP TABLE` 的名字后面还有别的词 |
 | `syntax: truncate` | `TRUNCATE TABLE` 的名字后面还有别的词 |
-| `syntax: alter` | `ALTER TABLE ... RENAME TO` 的新名字后面还有别的词，或名字缺失 |
+| `syntax: alter` | `ALTER TABLE` 改表名或改列名时名字缺失，或新名字后面还有别的词 |
 | `syntax: null` | `UPDATE` 的表达式结果是空值。列不能存空值 |
 | `syntax: key not found` | `DELETE` 或 `UPDATE` 的主键当前没有可见行 |
 | `syntax: seq conflict` | `INSERT ... EXPECT` 的序号不是该主键当前可见序号 |

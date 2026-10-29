@@ -1,6 +1,6 @@
 //! 普通表。类型只有 `INT64`、`STRING`、`BOOL`。主键可以多列，合起来唯一。二级索引用于等值查找。
 //!
-//! 删除不改已经 `fsync` 的字节，只把行标成不可见。改名只换内存里的表名，行槽和可见序号原样跟着走。调用方建成的表在扫描结果最后附带可见 `seq`，这个 `seq` 不是建表时的列。
+//! 删除不改已经 `fsync` 的字节，只把行标成不可见。改表名或列名只换内存里的名字，行槽和可见序号原样留下。调用方建成的表在扫描结果最后附带可见 `seq`，这个 `seq` 不是建表时的列。
 //! 引擎登记的四张表仍由写入路径维护，不走这里的删除和条件覆盖。
 #![forbid(unsafe_code)]
 
@@ -543,6 +543,72 @@ impl TableSet {
         move_name(&mut self.deleted, &from, &to);
         move_name(&mut self.seqs, &from, &to);
         move_name(&mut self.expires, &from, &to);
+        Ok(())
+    }
+
+    /// 把表名和新旧列名编码成改列名载荷。
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - 调用方表名。
+    /// * `from` - 当前列名。
+    /// * `to` - 改名之后的列名。
+    ///
+    /// # Returns
+    ///
+    /// 三个小端长度加名字，顺序是表、旧列、新列。
+    pub fn encode_rename_column(table: &str, from: &str, to: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        push_str(&mut out, table);
+        push_str(&mut out, from);
+        push_str(&mut out, to);
+        out
+    }
+
+    /// 按 [`TableSet::encode_rename_column`] 的载荷改列名。
+    ///
+    /// 不改 WAL 里已经写下的行。单元格按建表时的位置排列，不因改名而挪动。定义里的列名和引用该列的二级索引名字字段改成新名字。二级索引下标的列键也一起换。可见 `seq` 和截止时间不变。
+    ///
+    /// # Arguments
+    ///
+    /// * `bytes` - [`TableSet::encode_rename_column`] 的输出。
+    ///
+    /// # Errors
+    ///
+    /// * [`StoreError::NotFound`] - 表不存在。
+    /// * [`StoreError::Schema`] - 表是引擎登记的四张表之一、旧列不存在、新列名已占用，或载荷被截断。
+    pub fn rename_column_encoded(&mut self, bytes: &[u8]) -> Result<(), StoreError> {
+        let mut cursor = 0;
+        let table = take_str(bytes, &mut cursor)?;
+        let from = take_str(bytes, &mut cursor)?;
+        let to = take_str(bytes, &mut cursor)?;
+        if cursor != bytes.len() {
+            return Err(StoreError::Schema("truncated".into()));
+        }
+        if BUILTIN_TABLES.contains(&table.as_str()) {
+            return Err(StoreError::Schema("reserved table".into()));
+        }
+        let Some(schema) = self.schemas.get_mut(&table) else {
+            return Err(StoreError::NotFound);
+        };
+        if schema.columns.iter().any(|column| column.name == to) {
+            return Err(StoreError::Schema("duplicate column".into()));
+        }
+        let Some(column) = schema.columns.iter_mut().find(|column| column.name == from) else {
+            return Err(StoreError::Schema(format!("unknown column {from}")));
+        };
+        column.name = to.clone();
+        for index in &mut schema.indexes {
+            if index.column == from {
+                index.column = to.clone();
+            }
+        }
+        // 二级索引按列名挂表。列改名后必须换键，否则等值查找仍走旧名字。
+        if let Some(by_column) = self.secondary.get_mut(&table) {
+            if let Some(entries) = by_column.remove(&from) {
+                by_column.insert(to, entries);
+            }
+        }
         Ok(())
     }
 

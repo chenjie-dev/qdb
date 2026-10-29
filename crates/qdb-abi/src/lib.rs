@@ -60,6 +60,8 @@ pub enum MsgType {
     TableTruncate = 13,
     /// 调用方表改名。行、序号和索引留在内存里，已经落盘的记录仍用改名前的名字。
     TableRename = 14,
+    /// 调用方表改列名。行槽按位置不动，已经落盘的行仍按旧列名解释。
+    TableRenameColumn = 15,
 }
 
 impl MsgType {
@@ -67,7 +69,7 @@ impl MsgType {
     ///
     /// # Arguments
     ///
-    /// * `value` - 1 到 14。其余值没有对应类型。
+    /// * `value` - 1 到 15。其余值没有对应类型。
     ///
     /// # Returns
     ///
@@ -88,6 +90,7 @@ impl MsgType {
             12 => Self::TableDrop,
             13 => Self::TableTruncate,
             14 => Self::TableRename,
+            15 => Self::TableRenameColumn,
             _ => return None,
         })
     }

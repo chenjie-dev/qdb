@@ -1136,3 +1136,137 @@ fn rename_moves_rows_seq_and_indexes_to_the_new_name() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn rename_column_keeps_row_slots_and_updates_indexes() {
+    let (dir, mut engine) = open();
+    SqlEngine::execute(
+        &mut engine,
+        "CREATE TABLE note (id INT64 PRIMARY KEY, code STRING, INDEX idx_code (code))",
+    )
+    .unwrap();
+    SqlEngine::execute(&mut engine, "INSERT INTO note VALUES (1, 'old')").unwrap();
+    let before = SqlEngine::new(&engine)
+        .query("SELECT seq FROM note WHERE id = 1")
+        .unwrap();
+    let renamed =
+        SqlEngine::execute(&mut engine, "ALTER TABLE note RENAME COLUMN code TO ticker").unwrap();
+    assert_eq!(renamed.rows, vec![vec!["renamed".to_string()]]);
+    assert_eq!(
+        SqlEngine::new(&engine)
+            .query("SELECT ticker FROM note WHERE id = 1")
+            .unwrap()
+            .rows,
+        vec![vec!["old".to_string()]]
+    );
+    assert_eq!(
+        SqlEngine::new(&engine)
+            .query("SELECT seq FROM note WHERE id = 1")
+            .unwrap()
+            .rows,
+        before.rows
+    );
+    assert_eq!(
+        SqlEngine::new(&engine)
+            .query("SELECT id FROM note WHERE ticker = 'old'")
+            .unwrap()
+            .rows,
+        vec![vec!["1".to_string()]]
+    );
+    assert_eq!(
+        message(
+            SqlEngine::new(&engine)
+                .query("SELECT code FROM note")
+                .unwrap_err()
+        ),
+        "syntax: column \"code\" does not exist"
+    );
+    let described = SqlEngine::new(&engine).query("DESCRIBE note").unwrap();
+    assert!(described
+        .rows
+        .iter()
+        .any(|row| row[0] == "ticker" && row[1].contains("INDEX idx_code")));
+    assert!(described.rows.iter().all(|row| row[0] != "code"));
+    SqlEngine::execute(
+        &mut engine,
+        "INSERT INTO note (id, ticker) VALUES (2, 'later')",
+    )
+    .unwrap();
+    assert_eq!(
+        SqlEngine::new(&engine)
+            .query("SELECT id FROM note WHERE ticker = 'later'")
+            .unwrap()
+            .rows,
+        vec![vec!["2".to_string()]]
+    );
+    assert_eq!(
+        SqlEngine::execute(&mut engine, "ALTER TABLE note RENAME COLUMN id TO key")
+            .unwrap()
+            .rows,
+        vec![vec!["renamed".to_string()]]
+    );
+    assert_eq!(
+        SqlEngine::new(&engine)
+            .query("SELECT key, ticker FROM note WHERE key = 1")
+            .unwrap()
+            .rows,
+        vec![vec!["1".to_string(), "old".to_string()]]
+    );
+    assert_eq!(
+        message(
+            SqlEngine::execute(
+                &mut engine,
+                "ALTER TABLE note RENAME COLUMN ticker TO ticker"
+            )
+            .unwrap_err()
+        ),
+        "syntax: duplicate column"
+    );
+    assert_eq!(
+        message(
+            SqlEngine::execute(&mut engine, "ALTER TABLE note RENAME COLUMN ticker TO key")
+                .unwrap_err()
+        ),
+        "syntax: duplicate column"
+    );
+    assert_eq!(
+        message(
+            SqlEngine::execute(&mut engine, "ALTER TABLE note RENAME COLUMN missing TO x")
+                .unwrap_err()
+        ),
+        "syntax: unknown column missing"
+    );
+    assert_eq!(
+        message(
+            SqlEngine::execute(&mut engine, "ALTER TABLE ticks RENAME COLUMN seq TO n")
+                .unwrap_err()
+        ),
+        "syntax: reserved table"
+    );
+    assert_eq!(
+        message(
+            SqlEngine::execute(&mut engine, "ALTER TABLE missing RENAME COLUMN a TO b")
+                .unwrap_err()
+        ),
+        "symbol not found"
+    );
+    drop(engine);
+    let mut reader = Engine::open_read(&dir).unwrap();
+    assert_eq!(
+        message(
+            SqlEngine::execute(&mut reader, "ALTER TABLE note RENAME COLUMN ticker TO code")
+                .unwrap_err()
+        ),
+        "read-only connection"
+    );
+    drop(reader);
+    let engine = Engine::open(&dir).unwrap();
+    assert_eq!(
+        SqlEngine::new(&engine)
+            .query("SELECT key, ticker FROM note WHERE key = 1")
+            .unwrap()
+            .rows,
+        vec![vec!["1".to_string(), "old".to_string()]]
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

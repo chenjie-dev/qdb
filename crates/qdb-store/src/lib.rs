@@ -563,6 +563,46 @@ impl Engine {
         self.commit(MsgType::TableRename, 0, 0, 0, 0, &payload, 0)
     }
 
+    /// 改一张调用方建成的表里的列名。
+    ///
+    /// 行槽按位置留下，不给每一行分配新序号。引用该列的二级索引改成新名字，等值查找立刻走新列名。这次提交自己有一条 `seq` 并 `fsync`。已经落盘的行仍按旧列名解释。新旧名字相同视为新名字已占用。
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - 调用方建成的表名。不能是 `symbols`、`ticks`、`snapshots`、`klines`。
+    /// * `from` - 当前列名。
+    /// * `to` - 新列名。不能已经是这张表里的列。
+    ///
+    /// # Returns
+    ///
+    /// 这条改列名记录的 `seq`。它不是表里某一行的序号。
+    ///
+    /// # Errors
+    ///
+    /// * [`StoreError::NotFound`] - 表不存在。
+    /// * [`StoreError::Schema`] - 表是引擎登记的四张表之一、旧列不存在，或新列名已占用。
+    /// * [`StoreError::ReadOnly`] - 引擎是只读打开的。
+    /// * [`StoreError::Crc`] - 打开时 WAL 已损坏，拒绝再写。
+    pub fn rename_column(&mut self, table: &str, from: &str, to: &str) -> Result<u64, StoreError> {
+        self.ensure_writable()?;
+        if table::BUILTIN_TABLES.contains(&table) {
+            return Err(StoreError::Schema("reserved table".into()));
+        }
+        let schema = self
+            .tables
+            .schema(table)
+            .cloned()
+            .ok_or(StoreError::NotFound)?;
+        if schema.columns.iter().any(|column| column.name == to) {
+            return Err(StoreError::Schema("duplicate column".into()));
+        }
+        if schema.columns.iter().all(|column| column.name != from) {
+            return Err(StoreError::Schema(format!("unknown column {from}")));
+        }
+        let payload = table::TableSet::encode_rename_column(table, from, to);
+        self.commit(MsgType::TableRenameColumn, 0, 0, 0, 0, &payload, 0)
+    }
+
     /// 按建表时的列顺序插入一行。
     ///
     /// 主键重复时不写入，也不分配 `seq`。成功时这条记录的 `seq` 成为该主键的可见序号。
@@ -2186,6 +2226,11 @@ impl Engine {
             }
             Some(MsgType::TableRename) => {
                 self.tables.rename_encoded(&record.payload)?;
+                self.agg.note_seq(record.seq)?;
+                Ok(Vec::new())
+            }
+            Some(MsgType::TableRenameColumn) => {
+                self.tables.rename_column_encoded(&record.payload)?;
                 self.agg.note_seq(record.seq)?;
                 Ok(Vec::new())
             }

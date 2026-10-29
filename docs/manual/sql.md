@@ -658,30 +658,34 @@ INSERT INTO note VALUES (1, 'again', true);
 
 ## ALTER TABLE
 
-给一张调用方建成的表改名。成功时 `columns` 是 `result`，`rows` 是 `renamed`。语句写入 WAL。行还在，只是换成新名字。
+给一张调用方建成的表改名，或改其中一列的名字。成功时 `columns` 是 `result`，`rows` 是 `renamed`。语句写入 WAL。行还在，单元格按位置留下。
 
 ### 语法
 
 ```text
 ALTER TABLE name RENAME TO name
+ALTER TABLE name RENAME COLUMN name TO name
 ```
 
 ### 说明
 
-已经落盘的建表记录和行留在 WAL 里，那些字节仍写着改名前的名字。内存里的定义、行、主键、二级索引、可见 `seq` 和截止时间一起挪到新名字。每一行的 `seq` 不变。之后 `SELECT`、`DESCRIBE` 和 `SHOW TABLES` 使用新名字。旧名字可以再 `CREATE TABLE`，新表是空的，不带走已经改名的行。
+`RENAME TO` 把整张表换新名字。已经落盘的建表记录和行留在 WAL 里，那些字节仍写着改名前的名字。内存里的定义、行、主键、二级索引、可见 `seq` 和截止时间一起挪到新名字。每一行的 `seq` 不变。之后 `SELECT`、`DESCRIBE` 和 `SHOW TABLES` 使用新名字。旧名字可以再 `CREATE TABLE`，新表是空的，不带走已经改名的行。
 
-内置表不能作为旧名字或新名字，返回 `syntax: reserved table`。旧名字不存在返回 `symbol not found`。新名字已经有一张调用方表，或新旧名字相同，返回 `syntax: table already exists`。`RENAME TO` 后面还有别的词返回 `syntax: alter`。只读打开的引擎拒绝这条语句。重新打开库之后，仍然只有新名字。
+`RENAME COLUMN` 只改列名。单元格仍按建表时的位置排列，不挪动，也不分配新的行 `seq`。引用该列的二级索引改成新名字，等值查找立刻走新列名。主键列也可以改名，键值本身不变。已经落盘的行仍按旧列名解释。
+
+内置表不能作为表名，也不能改它们的列，返回 `syntax: reserved table`。表不存在返回 `symbol not found`。新表名已经有一张调用方表，或新旧表名相同，返回 `syntax: table already exists`。旧列不存在返回 `syntax: unknown column 名称`。新列名已经是这张表里的列，或新旧列名相同，返回 `syntax: duplicate column`。名字后面还有别的词返回 `syntax: alter`。只读打开的引擎拒绝这条语句。重新打开库之后，仍然只有新名字。
 
 ### 示例
 
 ```sql
 ALTER TABLE note RENAME TO memo;
-SELECT code FROM memo WHERE id = 1;
+ALTER TABLE memo RENAME COLUMN code TO ticker;
+SELECT ticker FROM memo WHERE id = 1;
 ```
 
 ### 兼容性
 
-没有 `RENAME COLUMN`、`ADD COLUMN`、`DROP COLUMN`、`IF EXISTS`，也不能一次改多张表。这不是改写每一行。
+没有 `ADD COLUMN`、`DROP COLUMN`、`IF EXISTS`，也不能一次改多张表或一次改多列。这不是改写每一行。
 
 ## EXPIRE AT
 
@@ -873,7 +877,7 @@ WebSocket `GET /v1/ws` 接受同一套 `SELECT`，见 [服务进程](server.md)�
 | 窗口 | `OVER`、`rank`、`lag`、`lead` |
 | 表达式 | 四则以外的函数、正则。`CAST` 只接受 `INT64`、`STRING`、`BOOL` |
 | 谓词 | `SIMILAR TO`、`ANY` / `ALL`、数组 |
-| 写入 | `COPY`。`ALTER TABLE` 只能 `RENAME TO`。`UPDATE` 只按完整主键改非主键列。`DELETE` 只按主键追加墓碑。`DROP TABLE` 去掉调用方建成的表。`TRUNCATE TABLE` 只清掉可见行 |
+| 写入 | `COPY`。`ALTER TABLE` 只能 `RENAME TO` 和 `RENAME COLUMN`。`UPDATE` 只按完整主键改非主键列。`DELETE` 只按主键追加墓碑。`DROP TABLE` 去掉调用方建成的表。`TRUNCATE TABLE` 只清掉可见行 |
 | 目录 | `information_schema`、`pg_catalog` |
 | 协议 | 预编译语句、参数绑定、PostgreSQL 线协议 |
 
