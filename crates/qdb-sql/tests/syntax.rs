@@ -595,3 +595,34 @@ fn intersect_binds_tighter_than_union_and_except_counts_copies() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn parentheses_group_set_ops_and_limit_the_inner_query() {
+    let (dir, mut engine) = open();
+    note(&mut engine);
+    let sql = SqlEngine::new(&engine);
+    assert_eq!(
+        sql.query(
+            "(SELECT id FROM note WHERE id = 1 UNION SELECT id FROM note WHERE id = 2) INTERSECT SELECT id FROM note WHERE id = 2",
+        )
+        .unwrap()
+        .rows,
+        vec![vec!["2".to_string()]]
+    );
+    assert_eq!(
+        sql.query(
+            "(SELECT id FROM note WHERE id = 2 UNION SELECT id FROM note WHERE id = 1 ORDER BY id LIMIT 1)",
+        )
+        .unwrap()
+        .rows,
+        vec![vec!["1".to_string()]]
+    );
+    assert_eq!(
+        sql.query("(SELECT id FROM note ORDER BY id) EXCEPT SELECT id FROM note WHERE id = 1")
+            .unwrap()
+            .rows,
+        vec![vec!["2".to_string()]]
+    );
+    assert!(sql.query("(SELECT id FROM note").is_err());
+    let _ = std::fs::remove_dir_all(dir);
+}

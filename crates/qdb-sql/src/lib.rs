@@ -92,7 +92,7 @@ impl<'a> SqlEngine<'a> {
 
     /// 执行 `SELECT`、`SHOW` 或 `DESCRIBE`。不写 WAL。
     ///
-    /// `WHERE` 在扫描之后过滤，可以写比较、四则运算、`CASE`、`IN` 和 `LIKE`。`GROUP BY` 每个分组一行，`HAVING` 再过滤分组。`DISTINCT` 去重。`UNION`、`INTERSECT` 和 `EXCEPT` 先按优先级合并再排序。`INTERSECT` 只连接相邻的 `SELECT`。`ORDER BY` 在 `LIMIT` 之前排序。`LIMIT` 不能超过 100000。
+    /// `WHERE` 在扫描之后过滤，可以写比较、四则运算、`CASE`、`IN` 和 `LIKE`。`GROUP BY` 每个分组一行，`HAVING` 再过滤分组。`DISTINCT` 去重。`UNION`、`INTERSECT` 和 `EXCEPT` 先按优先级合并再排序。`INTERSECT` 只连接相邻的操作数。括号先算出里面的结果，可以改这个优先级，里面的 `ORDER BY` 和 `LIMIT` 也先生效。`ORDER BY` 在 `LIMIT` 之前排序。`LIMIT` 不能超过 100000。
     /// 不带 `symbol` 的 `ticks` 会多一列 `symbol`。`JOIN` 按 PostgreSQL 的内连接和外连接匹配，多表时列名是 `别名.列名`。
     ///
     /// # Arguments
@@ -137,16 +137,21 @@ impl<'a> SqlEngine<'a> {
         if stmt.limit > 100_000 {
             return Err(SqlError::Limit(stmt.limit));
         }
-        if stmt.set.is_empty() {
+        if stmt.nested.is_none() && stmt.set.is_empty() {
             return self.execute_stmt(stmt);
         }
-        let mut combined = self.execute_stmt(&union_branch(stmt))?;
-        // INTERSECT 比 UNION、EXCEPT 更紧，只连接相邻的 SELECT。先算完这些交，再从左到右做并和差。
-        // ALL 按行的出现次数取较小值或做差；不加 ALL 时，整行文本相同只保留左表里第一次出现的那一行。
+        // 括号先算成自己的结果。里面的 ORDER BY、LIMIT 和集合运算留在内层，外层再按 INTERSECT 更紧的规则合并。
+        let mut combined = if let Some(inner) = &stmt.nested {
+            self.execute_query(inner)?
+        } else {
+            self.execute_stmt(&union_branch(stmt))?
+        };
+        // INTERSECT 比 UNION、EXCEPT 更紧，只连接相邻的操作数。先算完这些交，再从左到右做并和差。
+        // ALL 按行的出现次数取较小值或做差；不加 ALL 时，整行文本相同只保留左边第一次出现的那一行。
         let width = combined.columns.len();
         let mut tail: Vec<(SetOp, bool, Vec<Vec<String>>)> = Vec::new();
         for link in &stmt.set {
-            let next = self.execute_stmt(&union_branch(&link.stmt))?;
+            let next = self.eval_set_operand(&link.stmt)?;
             if next.columns.len() != width {
                 return Err(SqlError::Syntax(
                     "each UNION query must have the same number of columns".into(),
@@ -172,8 +177,20 @@ impl<'a> SqlEngine<'a> {
         if !stmt.order.is_empty() {
             sort_rows(&mut combined, &stmt.order)?;
         }
-        combined.rows.truncate(stmt.limit as usize);
+        // 纯括号外壳没写 LIMIT 时，不再用默认 1000 截断已经算完的内层。
+        if stmt.nested.is_none() || stmt.limit_set {
+            combined.rows.truncate(stmt.limit as usize);
+        }
         Ok(combined)
+    }
+
+    fn eval_set_operand(&self, stmt: &Stmt) -> Result<QueryResult, SqlError> {
+        // 带括号或自带集合运算的一段先按自己的排序和行数算出结果。普通 SELECT 仍放到外层 LIMIT 再截断。
+        if stmt.nested.is_some() || !stmt.set.is_empty() {
+            self.execute_query(stmt)
+        } else {
+            self.execute_stmt(&union_branch(stmt))
+        }
     }
 
     fn execute_stmt(&self, stmt: &Stmt) -> Result<QueryResult, SqlError> {
@@ -284,7 +301,7 @@ pub fn split_subscribe(sql: &str) -> Result<Option<String>, SqlError> {
 
 /// 这条 `SELECT` 的增量是否只由 [`Engine::poll`] 的变更决定。
 ///
-/// 成交、报价和 K 线的列投影返回 `Ok(true)`。`symbols`、用户表、聚合、表达式、`UNION`、`INTERSECT`、`EXCEPT` 和连接要重算整表，返回 `Ok(false)`。
+/// 成交、报价和 K 线的列投影返回 `Ok(true)`。`symbols`、用户表、聚合、表达式、`UNION`、`INTERSECT`、`EXCEPT`、带括号的查询和连接要重算整表，返回 `Ok(false)`。
 ///
 /// # Errors
 ///
@@ -294,7 +311,8 @@ pub fn follows_changes(sql: &str) -> Result<bool, SqlError> {
 }
 
 fn incremental(stmt: &Stmt) -> bool {
-    stmt.joins.is_empty()
+    stmt.nested.is_none()
+        && stmt.joins.is_empty()
         && stmt.aggregates.is_empty()
         && stmt.set.is_empty()
         && stmt.select_values.iter().all(|value| {
@@ -536,6 +554,8 @@ struct Stmt {
     having: Option<Expr>,
     order: Vec<OrderKey>,
     set: Vec<SetLink>,
+    nested: Option<Box<Stmt>>,
+    limit_set: bool,
     symbol: Option<String>,
     period: Option<Period>,
     ts_from: Option<i64>,
@@ -742,29 +762,68 @@ struct OrderKey {
 fn parse(sql: &str) -> Result<Stmt, SqlError> {
     let tokens = tokenize(sql);
     let mut index = 0;
-    let mut stmt = parse_select(&tokens, &mut index)?;
-    while let Some(op) = set_op(tokens.get(index)) {
-        index += 1;
-        let all = if tokens
-            .get(index)
-            .is_some_and(|token| token.eq_ignore_ascii_case("all"))
-        {
-            index += 1;
-            true
-        } else {
-            false
-        };
-        stmt.set.push(SetLink {
-            op,
-            all,
-            stmt: parse_select(&tokens, &mut index)?,
-        });
-    }
-    parse_order_and_limit(&tokens, &mut index, &mut stmt)?;
+    let stmt = parse_query_body(&tokens, &mut index)?;
     if let Some(token) = tokens.get(index) {
         return Err(SqlError::Syntax(format!("unexpected {token}")));
     }
     Ok(stmt)
+}
+
+fn parse_query_body(tokens: &[String], index: &mut usize) -> Result<Stmt, SqlError> {
+    let mut stmt = parse_query_primary(tokens, index)?;
+    let mut extra = Vec::new();
+    while let Some(op) = set_op(tokens.get(*index)) {
+        *index += 1;
+        let all = if tokens
+            .get(*index)
+            .is_some_and(|token| token.eq_ignore_ascii_case("all"))
+        {
+            *index += 1;
+            true
+        } else {
+            false
+        };
+        extra.push(SetLink {
+            op,
+            all,
+            stmt: parse_query_primary(tokens, index)?,
+        });
+    }
+    if extra.is_empty() {
+        parse_order_and_limit(tokens, index, &mut stmt)?;
+        return Ok(stmt);
+    }
+    // 左边已经是括号或另一段集合运算时，外层运算不能写进内层，否则内层的排序会被清掉。
+    if stmt.nested.is_some() || !stmt.set.is_empty() {
+        let mut spine = nest(stmt);
+        spine.set = extra;
+        parse_order_and_limit(tokens, index, &mut spine)?;
+        return Ok(spine);
+    }
+    stmt.set = extra;
+    parse_order_and_limit(tokens, index, &mut stmt)?;
+    Ok(stmt)
+}
+
+fn parse_query_primary(tokens: &[String], index: &mut usize) -> Result<Stmt, SqlError> {
+    if tokens.get(*index).is_some_and(|token| token == "(") {
+        *index += 1;
+        let inner = parse_query_body(tokens, index)?;
+        expect(tokens, index, ")")?;
+        // 括号封住这一层的排序、行数和集合运算，外层只把它当成一个操作数。
+        return Ok(nest(inner));
+    }
+    parse_select(tokens, index)
+}
+
+fn nest(inner: Stmt) -> Stmt {
+    let mut shell = inner.clone();
+    shell.nested = Some(Box::new(inner));
+    shell.set.clear();
+    shell.order.clear();
+    shell.limit = 1000;
+    shell.limit_set = false;
+    shell
 }
 
 fn parse_select(tokens: &[String], index: &mut usize) -> Result<Stmt, SqlError> {
@@ -944,6 +1003,7 @@ fn parse_select(tokens: &[String], index: &mut usize) -> Result<Stmt, SqlError> 
         having,
         order: Vec::new(),
         set: Vec::new(),
+        nested: None,
         symbol,
         period,
         ts_from,
@@ -951,6 +1011,7 @@ fn parse_select(tokens: &[String], index: &mut usize) -> Result<Stmt, SqlError> 
         eq_column,
         eq_value,
         limit: 1000,
+        limit_set: false,
     })
 }
 
@@ -1012,6 +1073,7 @@ fn parse_order_and_limit(
                 .parse()
                 .map_err(|_| SqlError::Syntax("limit".into()))?;
             *index += 1;
+            stmt.limit_set = true;
             saw_limit = true;
         } else {
             break;

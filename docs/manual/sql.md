@@ -290,8 +290,9 @@ WHERE s.symbol IS NULL;
 ### 语法
 
 ```text
-query = select { setop select }
+query = primary { setop primary }
         [ORDER BY ...] [LIMIT integer]
+primary = select | "(" query ")"
 setop = ("UNION" | "INTERSECT" | "EXCEPT") ["ALL"]
 ```
 
@@ -301,9 +302,9 @@ setop = ("UNION" | "INTERSECT" | "EXCEPT") ["ALL"]
 
 每一段的列数必须相同，否则 `syntax: each UNION query must have the same number of columns`。`INTERSECT` 和 `EXCEPT` 列数不对也是这句。结果列名用第一段。后面的段不看列名，只按位置对齐。
 
-`INTERSECT` 比 `UNION` 和 `EXCEPT` 更紧，只连接相邻的 `SELECT`。`A UNION B INTERSECT C` 是 `A UNION (B INTERSECT C)`。`UNION` 和 `EXCEPT` 从左到右。`A UNION ALL B UNION C` 先保留 A 和 B 的重复，再与 C 一起去重。`A UNION B UNION ALL C` 先对 A 和 B 去重，再把 C 全部接上。
+`INTERSECT` 比 `UNION` 和 `EXCEPT` 更紧，只连接相邻的操作数。`A UNION B INTERSECT C` 是 `A UNION (B INTERSECT C)`。括号先算出里面的结果，所以 `(A UNION B) INTERSECT C` 先并再交。`UNION` 和 `EXCEPT` 从左到右。`A UNION ALL B UNION C` 先保留 A 和 B 的重复，再与 C 一起去重。`A UNION B UNION ALL C` 先对 A 和 B 去重，再把 C 全部接上。
 
-`ORDER BY` 和 `LIMIT` 只能写在整段查询的最后，作用在合并之后的结果上。写在中间一段的后面是语法错误。
+`ORDER BY` 和 `LIMIT` 写在整段查询的最后时，作用在合并之后的结果上。写在某一段 `SELECT` 后面、又没有括号时是语法错误。括号里面可以写自己的 `ORDER BY` 和 `LIMIT`，先对这一段生效，再参加外层运算。
 
 ### 示例
 
@@ -316,11 +317,17 @@ ORDER BY id;
 SELECT id FROM note WHERE id IN (1, 2)
 EXCEPT
 SELECT id FROM note WHERE id = 1;
+
+(SELECT id FROM note WHERE id = 1
+ UNION
+ SELECT id FROM note WHERE id = 2)
+INTERSECT
+SELECT id FROM note WHERE id = 2;
 ```
 
 ### 兼容性
 
-不能用括号把一段 `SELECT` 单独排序，也不能用括号改变 `INTERSECT` 的优先级。
+`SUBSCRIBE` 仍要求语句以 `SELECT` 开头。括号不能套在语句最外面再加 `SUBSCRIBE`。
 
 ## 聚合函数
 
@@ -697,7 +704,7 @@ WebSocket `GET /v1/ws` 接受同一套 `SELECT`，见 [服务进程](server.md)�
 | 类别 | 未实现 |
 |---|---|
 | 查询 | 子查询、`WITH`、`LATERAL`、`VALUES` 作为 `FROM`、`TABLE` |
-| 集合 | 带括号的分支排序，以及用括号改变 `INTERSECT` 的优先级 |
+| 集合 | 没有括号时，不能把 `ORDER BY` 写在中间一段的后面 |
 | 窗口 | `OVER`、`rank`、`lag`、`lead` |
 | 表达式 | `CASE 列 WHEN`、`COALESCE`、`NULLIF`、`CAST`、`::`、四则以外的函数、正则 |
 | 谓词 | `ILIKE`、`SIMILAR TO`、`ANY` / `ALL`、数组、`IS TRUE` |
