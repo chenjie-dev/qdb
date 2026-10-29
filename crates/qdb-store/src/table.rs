@@ -112,6 +112,8 @@ pub struct TableSet {
     deleted: HashMap<String, HashSet<usize>>,
     /// 与 `rows` 对齐。可见行的值是写入它的 `seq`。0 表示这份快照没有记下序号。
     seqs: HashMap<String, Vec<u64>>,
+    /// 与 `rows` 对齐。非 0 表示该行在这个 UTC 纳秒及之前可以被 `EXPIRE AT` 收成墓碑。
+    expires: HashMap<String, Vec<i64>>,
 }
 
 impl TableSet {
@@ -164,6 +166,23 @@ impl TableSet {
                 out.extend_from_slice(&seq.to_le_bytes());
             }
         }
+        out.extend_from_slice(b"QEXP");
+        for name in &names {
+            let rows = &self.rows[name];
+            let dead = self.deleted.get(name);
+            for (index, _) in rows.iter().enumerate() {
+                if dead.is_some_and(|set| set.contains(&index)) {
+                    continue;
+                }
+                let expire = self
+                    .expires
+                    .get(name)
+                    .and_then(|expires| expires.get(index))
+                    .copied()
+                    .unwrap_or(0);
+                out.extend_from_slice(&expire.to_le_bytes());
+            }
+        }
         out
     }
 
@@ -198,15 +217,27 @@ impl TableSet {
         }
         if bytes.get(cursor..cursor + 4) == Some(b"QSEQ") {
             cursor += 4;
-            for (name, count) in loaded {
-                for index in 0..count {
+            for (name, count) in &loaded {
+                for index in 0..*count {
                     let seq = take_u64(bytes, &mut cursor)?;
-                    if let Some(slot) = self
-                        .seqs
-                        .get_mut(&name)
-                        .and_then(|seqs| seqs.get_mut(index))
+                    if let Some(slot) = self.seqs.get_mut(name).and_then(|seqs| seqs.get_mut(index))
                     {
                         *slot = seq;
+                    }
+                }
+            }
+        }
+        if bytes.get(cursor..cursor + 4) == Some(b"QEXP") {
+            cursor += 4;
+            for (name, count) in &loaded {
+                for index in 0..*count {
+                    let expire = take_i64(bytes, &mut cursor)?;
+                    if let Some(slot) = self
+                        .expires
+                        .get_mut(name)
+                        .and_then(|expires| expires.get_mut(index))
+                    {
+                        *slot = expire;
                     }
                 }
             }
@@ -466,7 +497,13 @@ impl TableSet {
                 .push(row_index);
         }
         self.rows.entry(table.clone()).or_default().push(values);
-        self.seqs.entry(table).or_default().push(seq);
+        self.seqs.entry(table.clone()).or_default().push(seq);
+        let expire = if cursor < bytes.len() {
+            take_i64(bytes, &mut cursor)?
+        } else {
+            0
+        };
+        self.expires.entry(table).or_default().push(expire);
         Ok(())
     }
 
@@ -547,6 +584,7 @@ impl TableSet {
         table: &str,
         values: &[Cell],
         expected: u64,
+        expire_at: Option<i64>,
     ) -> Result<Vec<u8>, StoreError> {
         if expected == 0 {
             return Err(StoreError::Conflict);
@@ -568,6 +606,9 @@ impl TableSet {
         let row = self.encode_row_at(table, values, true)?;
         let mut out = expected.to_le_bytes().to_vec();
         out.extend(row);
+        if let Some(expire_at) = expire_at {
+            out.extend_from_slice(&expire_at.to_le_bytes());
+        }
         Ok(out)
     }
 
@@ -605,6 +646,11 @@ impl TableSet {
                 ColumnType::String => Cell::String(take_str(bytes, &mut cursor)?),
             });
         }
+        let expire_at = if cursor < bytes.len() {
+            Some(take_i64(bytes, &mut cursor)?)
+        } else {
+            None
+        };
         let key: Vec<Cell> = values
             .iter()
             .zip(&schema.columns)
@@ -628,7 +674,78 @@ impl TableSet {
         {
             *slot = seq;
         }
+        if let Some(expire_at) = expire_at {
+            if let Some(slot) = self
+                .expires
+                .get_mut(&table)
+                .and_then(|expires| expires.get_mut(index))
+            {
+                *slot = expire_at;
+            }
+        }
         Ok(())
+    }
+
+    /// 收集截止时间不晚于 `deadline_ns`、并且仍然可见的主键。
+    ///
+    /// 截止时间为 0 的行不算到期。没有主键的表跳过。顺序是表名，然后是主键字节序。
+    ///
+    /// # Arguments
+    ///
+    /// * `deadline_ns` - UTC 纳秒水位。
+    ///
+    /// # Returns
+    ///
+    /// 表名和主键列的值。没有命中时为空。
+    pub fn keys_expiring_by(&self, deadline_ns: i64) -> Vec<(String, Vec<Cell>)> {
+        let mut names: Vec<String> = self
+            .schemas
+            .keys()
+            .filter(|name| !BUILTIN_TABLES.contains(&name.as_str()))
+            .cloned()
+            .collect();
+        names.sort();
+        let mut out = Vec::new();
+        for name in names {
+            let Some(schema) = self.schemas.get(&name) else {
+                continue;
+            };
+            let pk: Vec<usize> = schema
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(_, column)| column.primary_key)
+                .map(|(index, _)| index)
+                .collect();
+            if pk.is_empty() {
+                continue;
+            }
+            let Some(rows) = self.rows.get(&name) else {
+                continue;
+            };
+            let mut hits = Vec::new();
+            for (index, row) in rows.iter().enumerate() {
+                if self.is_deleted(&name, index) {
+                    continue;
+                }
+                let expire = self
+                    .expires
+                    .get(&name)
+                    .and_then(|expires| expires.get(index))
+                    .copied()
+                    .unwrap_or(0);
+                if expire == 0 || expire > deadline_ns {
+                    continue;
+                }
+                let key: Vec<Cell> = pk.iter().map(|position| row[*position].clone()).collect();
+                hits.push((key_bytes(&key), key));
+            }
+            hits.sort_by(|left, right| left.0.cmp(&right.0));
+            for (_, key) in hits {
+                out.push((name.clone(), key));
+            }
+        }
+        out
     }
 
     /// 扫描一张表里仍然可见的行。
@@ -1053,6 +1170,7 @@ impl TableSet {
         self.index_secondary(table, &schema, row_index, &values);
         self.rows.entry(table.to_string()).or_default().push(values);
         self.seqs.entry(table.to_string()).or_default().push(0);
+        self.expires.entry(table.to_string()).or_default().push(0);
         Ok(())
     }
 

@@ -443,6 +443,8 @@ INSERT INTO name VALUES "(" value { "," value } ")" ["EXPECT" integer]
 
 `EXPECT n` 写在值列表后面。`n` 为 0 时，这个主键必须还不存在。`n` 大于 0 时，必须等于 `SELECT` 里该行的 `seq`，然后用新行覆盖它，并得到新的 `seq`。对不上返回 `syntax: seq conflict`，不写日志。没有主键的表不能带 `EXPECT`。
 
+`EXPIRE AT n` 也可以写在值列表后面，和 `EXPECT` 的顺序不限。`n` 是 UTC 纳秒。`0` 表示这行没有截止时间。非 0 时，之后的 `EXPIRE AT` 水位只要大于或等于它，就把这个主键收成墓碑。
+
 调用方用 `CREATE TABLE` 建成的表，查询结果在列的最后多一列 `seq`。它不是 `DESCRIBE` 里的列。`SELECT *` 也会带上它。
 
 ### 示例
@@ -450,6 +452,7 @@ INSERT INTO name VALUES "(" value { "," value } ")" ["EXPECT" integer]
 ```sql
 INSERT INTO note VALUES (1, 'SSE:600000', true);
 INSERT INTO note VALUES (1, 'SSE:600000', false) EXPECT 4;
+INSERT INTO note VALUES (2, 'kept', true) EXPIRE AT 1700000000000000000;
 ```
 
 ### 兼容性
@@ -489,6 +492,32 @@ DELETE FROM note WHERE id IN (2, 3);
 ### 兼容性
 
 没有 `DELETE` 不带 `WHERE`、`USING`、`RETURNING`，也不能按非主键列删除。这不是擦掉历史，而是按键追加墓碑。`IN` 不是一般的过滤条件，只接受这一列主键的字面量列表。
+
+## EXPIRE AT
+
+按调用方给出的 UTC 纳秒水位，把已经到期的主键收成墓碑。成功时 `columns` 是 `result`，`rows` 是 `expired`。没有命中时也返回这一行，并且不写 WAL。
+
+### 语法
+
+```text
+EXPIRE AT integer
+```
+
+### 说明
+
+水位可以是负数。只处理调用方建成、带主键、并且插入时写过非 0 `EXPIRE AT` 的行。截止时间小于或等于水位的行各追加一条墓碑。截止时间是 0 的行保留。没有主键的表跳过。库不读本机时钟，所以同一条语句重放结果相同。
+
+水位不是整数时返回 `syntax: expire`。
+
+### 示例
+
+```sql
+EXPIRE AT 1700000000000000000;
+```
+
+### 兼容性
+
+没有按表名限制的 `EXPIRE`，也没有把期限写成一段时间。期限在 `INSERT` 里写成绝对的 UTC 纳秒。
 
 ## SHOW
 

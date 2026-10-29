@@ -84,6 +84,9 @@ impl<'a> SqlEngine<'a> {
         if head == "delete" {
             return exec_delete(engine, &tokens);
         }
+        if head == "expire" {
+            return exec_expire(engine, &tokens);
+        }
         SqlEngine::new(engine).query(sql)
     }
 
@@ -1424,21 +1427,22 @@ fn exec_insert(engine: &mut Engine, tokens: &[String]) -> Result<QueryResult, Sq
     }
     expect(tokens, &mut index, ")")?;
     let mut expected = None;
-    if tokens
-        .get(index)
-        .is_some_and(|token| token.eq_ignore_ascii_case("expect"))
-    {
-        index += 1;
-        let raw = tokens
-            .get(index)
-            .ok_or_else(|| SqlError::Syntax("seq".into()))?;
-        let seq = raw
-            .parse::<u64>()
-            .map_err(|_| SqlError::Syntax("seq".into()))?;
-        expected = Some(seq);
-        index += 1;
-    }
-    if index != tokens.len() {
+    let mut expire_at = None;
+    loop {
+        let Some(token) = tokens.get(index) else {
+            break;
+        };
+        if token.eq_ignore_ascii_case("expect") {
+            index += 1;
+            expected = Some(read_u64(tokens, &mut index)?);
+            continue;
+        }
+        if token.eq_ignore_ascii_case("expire") {
+            index += 1;
+            expect(tokens, &mut index, "at")?;
+            expire_at = Some(read_i64(tokens, &mut index)?);
+            continue;
+        }
         return Err(SqlError::Syntax("value".into()));
     }
     if raws.len() != schema.columns.len() {
@@ -1451,7 +1455,11 @@ fn exec_insert(engine: &mut Engine, tokens: &[String]) -> Result<QueryResult, Sq
         .collect::<Result<Vec<_>, _>>()?;
     if let Some(seq) = expected {
         engine
-            .insert_expect(&name, &values, seq)
+            .insert_timed(&name, &values, Some(seq), expire_at)
+            .map_err(map_store)?;
+    } else if expire_at.is_some() {
+        engine
+            .insert_timed(&name, &values, None, expire_at)
             .map_err(map_store)?;
     } else {
         engine.insert_row(&name, &values).map_err(map_store)?;
@@ -1459,6 +1467,50 @@ fn exec_insert(engine: &mut Engine, tokens: &[String]) -> Result<QueryResult, Sq
     Ok(QueryResult {
         columns: vec!["result".into()],
         rows: vec![vec!["inserted".into()]],
+    })
+}
+
+fn read_u64(tokens: &[String], index: &mut usize) -> Result<u64, SqlError> {
+    let raw = tokens
+        .get(*index)
+        .ok_or_else(|| SqlError::Syntax("seq".into()))?;
+    let seq = raw
+        .parse::<u64>()
+        .map_err(|_| SqlError::Syntax("seq".into()))?;
+    *index += 1;
+    Ok(seq)
+}
+
+fn read_i64(tokens: &[String], index: &mut usize) -> Result<i64, SqlError> {
+    let token = tokens
+        .get(*index)
+        .ok_or_else(|| SqlError::Syntax("expire".into()))?;
+    let raw = if token == "-" {
+        *index += 1;
+        let number = tokens
+            .get(*index)
+            .ok_or_else(|| SqlError::Syntax("expire".into()))?;
+        format!("-{}", unquote(number))
+    } else {
+        unquote(token)
+    };
+    *index += 1;
+    raw.parse::<i64>()
+        .map_err(|_| SqlError::Syntax("expire".into()))
+}
+
+fn exec_expire(engine: &mut Engine, tokens: &[String]) -> Result<QueryResult, SqlError> {
+    let mut index = 0;
+    expect(tokens, &mut index, "expire")?;
+    expect(tokens, &mut index, "at")?;
+    let deadline = read_i64(tokens, &mut index)?;
+    if index != tokens.len() {
+        return Err(SqlError::Syntax("expire".into()));
+    }
+    engine.expire_at(deadline).map_err(map_store)?;
+    Ok(QueryResult {
+        columns: vec!["result".into()],
+        rows: vec![vec!["expired".into()]],
     })
 }
 

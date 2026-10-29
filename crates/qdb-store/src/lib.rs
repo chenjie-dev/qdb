@@ -468,9 +468,7 @@ impl Engine {
     /// * [`StoreError::ReadOnly`] - 引擎是只读打开的。
     /// * [`StoreError::Crc`] - 打开时 WAL 已损坏，拒绝再写。
     pub fn insert_row(&mut self, table: &str, values: &[Cell]) -> Result<u64, StoreError> {
-        self.ensure_writable()?;
-        let payload = self.tables.encode_row(table, values)?;
-        self.commit(MsgType::RowInsert, 0, 0, 0, 0, &payload, 0)
+        self.insert_timed(table, values, None, None)
     }
 
     /// 仅当主键当前可见序号等于 `expected` 时写入。
@@ -501,7 +499,39 @@ impl Engine {
         values: &[Cell],
         expected: u64,
     ) -> Result<u64, StoreError> {
+        self.insert_timed(table, values, Some(expected), None)
+    }
+
+    /// 插入或按期望序号覆盖，并可记下截止时间。
+    ///
+    /// `expire_at` 为 `Some(0)` 或 `None` 且这是新行时，表示没有截止时间。非 0 的截止时间是 UTC 纳秒。`EXPIRE AT` 用调用方给出的水位比较，不读本机时钟。默认每次调用都 `fsync`。条件不符时不写 WAL。
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - 调用方建成的表。带 `expected` 或截止时间时必须有主键。
+    /// * `values` - 与列顺序、列数、类型一一对应。
+    /// * `expected` - `None` 表示普通插入。`Some(0)` 表示键必须不存在。`Some(n)` 覆盖可见序号为 `n` 的行。
+    /// * `expire_at` - `None` 表示这次不改已有截止时间。`Some` 写入新的截止时间，`0` 表示取消。
+    ///
+    /// # Returns
+    ///
+    /// 这次提交的 `seq`。
+    ///
+    /// # Errors
+    ///
+    /// 与 [`Engine::insert_row`] 和 [`Engine::insert_expect`] 相同。
+    pub fn insert_timed(
+        &mut self,
+        table: &str,
+        values: &[Cell],
+        expected: Option<u64>,
+        expire_at: Option<i64>,
+    ) -> Result<u64, StoreError> {
         self.ensure_writable()?;
+        if expected.is_none() && expire_at.is_none() {
+            let payload = self.tables.encode_row(table, values)?;
+            return self.commit(MsgType::RowInsert, 0, 0, 0, 0, &payload, 0);
+        }
         if table::BUILTIN_TABLES.contains(&table) {
             return Err(StoreError::Schema("reserved table".into()));
         }
@@ -519,14 +549,59 @@ impl Engine {
         if key.is_empty() {
             return Err(StoreError::Schema("primary key required".into()));
         }
-        // 0 只表示键不存在。先比较再写 WAL，冲突不会留下半条覆盖。
-        match self.tables.visible_seq(table, &key)? {
-            None if expected == 0 => return self.insert_row(table, values),
-            Some(seq) if seq == expected && expected != 0 => {}
-            _ => return Err(StoreError::Conflict),
+        if let Some(expected) = expected {
+            // 0 只表示键不存在。先比较再写 WAL，冲突不会留下半条覆盖。
+            match self.tables.visible_seq(table, &key)? {
+                None if expected == 0 => {}
+                Some(seq) if seq == expected && expected != 0 => {
+                    let payload = self
+                        .tables
+                        .encode_expect(table, values, expected, expire_at)?;
+                    return self.commit(MsgType::RowReplace, 0, 0, 0, 0, &payload, 0);
+                }
+                _ => return Err(StoreError::Conflict),
+            }
         }
-        let payload = self.tables.encode_expect(table, values, expected)?;
-        self.commit(MsgType::RowReplace, 0, 0, 0, 0, &payload, 0)
+        let mut payload = self.tables.encode_row(table, values)?;
+        if let Some(expire_at) = expire_at {
+            if expire_at != 0 {
+                payload.extend_from_slice(&expire_at.to_le_bytes());
+            }
+        }
+        self.commit(MsgType::RowInsert, 0, 0, 0, 0, &payload, 0)
+    }
+
+    /// 把截止时间不晚于 `deadline_ns` 的可见行收成墓碑。
+    ///
+    /// 水位是调用方给出的 UTC 纳秒，不是本机时钟。没有截止时间的行保留。没有主键的表跳过。先收集再提交，没有命中时不写 WAL。每个命中的键一条墓碑。
+    ///
+    /// # Arguments
+    ///
+    /// * `deadline_ns` - 截止时间小于或等于这个值的行会被收掉。
+    ///
+    /// # Returns
+    ///
+    /// 每条墓碑的 `seq`。没有命中时为空。
+    ///
+    /// # Errors
+    ///
+    /// * [`StoreError::ReadOnly`] - 引擎是只读打开的。
+    /// * [`StoreError::Crc`] - 打开时 WAL 已损坏，拒绝再写。
+    pub fn expire_at(&mut self, deadline_ns: i64) -> Result<Vec<u64>, StoreError> {
+        self.ensure_writable()?;
+        let keys = self.tables.keys_expiring_by(deadline_ns);
+        let mut seqs = Vec::new();
+        let mut index = 0;
+        while index < keys.len() {
+            let table = keys[index].0.clone();
+            let mut batch = Vec::new();
+            while index < keys.len() && keys[index].0 == table {
+                batch.push(keys[index].1.clone());
+                index += 1;
+            }
+            seqs.extend(self.delete_rows(&table, &batch)?);
+        }
+        Ok(seqs)
     }
 
     /// 按主键写一条墓碑。

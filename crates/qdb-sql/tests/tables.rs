@@ -366,3 +366,87 @@ fn a_read_only_engine_rejects_delete_and_expect() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn expire_at_hides_due_rows_and_keeps_the_rest() {
+    let (dir, mut engine) = open();
+    SqlEngine::execute(
+        &mut engine,
+        "CREATE TABLE note (id INT64 PRIMARY KEY, code STRING)",
+    )
+    .unwrap();
+    SqlEngine::execute(&mut engine, "CREATE TABLE log (id INT64, code STRING)").unwrap();
+    SqlEngine::execute(
+        &mut engine,
+        "INSERT INTO note VALUES (1, 'due') EXPIRE AT 100",
+    )
+    .unwrap();
+    SqlEngine::execute(
+        &mut engine,
+        "INSERT INTO note VALUES (2, 'later') EXPIRE AT 101",
+    )
+    .unwrap();
+    SqlEngine::execute(&mut engine, "INSERT INTO note VALUES (3, 'forever')").unwrap();
+    SqlEngine::execute(&mut engine, "INSERT INTO log VALUES (1, 'append')").unwrap();
+    let expired = SqlEngine::execute(&mut engine, "EXPIRE AT 100").unwrap();
+    assert_eq!(expired.rows, vec![vec!["expired".to_string()]]);
+    let rows = SqlEngine::new(&engine)
+        .query("SELECT id FROM note ORDER BY id")
+        .unwrap();
+    assert_eq!(
+        rows.rows,
+        vec![vec!["2".to_string()], vec!["3".to_string()]]
+    );
+    drop(engine);
+    let mut engine = Engine::open(&dir).unwrap();
+    assert!(SqlEngine::new(&engine)
+        .query("SELECT code FROM note WHERE id = 1")
+        .unwrap()
+        .rows
+        .is_empty());
+    assert_eq!(
+        message(SqlEngine::execute(&mut engine, "EXPIRE AT no").unwrap_err()),
+        "syntax: expire"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn expect_can_replace_the_deadline() {
+    let (dir, mut engine) = open();
+    SqlEngine::execute(
+        &mut engine,
+        "CREATE TABLE note (id INT64 PRIMARY KEY, code STRING)",
+    )
+    .unwrap();
+    SqlEngine::execute(
+        &mut engine,
+        "INSERT INTO note VALUES (1, 'due') EXPIRE AT 50",
+    )
+    .unwrap();
+    let seq = SqlEngine::new(&engine)
+        .query("SELECT seq FROM note WHERE id = 1")
+        .unwrap()
+        .rows[0][0]
+        .clone();
+    SqlEngine::execute(
+        &mut engine,
+        &format!("INSERT INTO note VALUES (1, 'later') EXPECT {seq} EXPIRE AT 80"),
+    )
+    .unwrap();
+    SqlEngine::execute(&mut engine, "EXPIRE AT 50").unwrap();
+    assert_eq!(
+        SqlEngine::new(&engine)
+            .query("SELECT code FROM note WHERE id = 1")
+            .unwrap()
+            .rows,
+        vec![vec!["later".to_string()]]
+    );
+    SqlEngine::execute(&mut engine, "EXPIRE AT 80").unwrap();
+    assert!(SqlEngine::new(&engine)
+        .query("SELECT code FROM note WHERE id = 1")
+        .unwrap()
+        .rows
+        .is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}
