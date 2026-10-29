@@ -96,6 +96,29 @@ NULLIF "(" value "," value ")"
 
 不写括号时，`coalesce` 和 `nullif` 仍是普通列名。
 
+### CAST
+
+```text
+CAST "(" expr AS type ")"
+expr "::" type
+type = INT64 | STRING | BOOL
+```
+
+`CAST` 和 `::` 是同一种转换。类型名不区分大小写，只接受这三种。空值转换后仍是空值。
+
+转到 `INT64` 时，整数文本和 `true` / `false` 可以转。`true` 是 `1`，`false` 是 `0`。超出 `i64` 返回 `syntax: overflow`。不能表示成整数返回 `syntax: cast`。
+
+转到 `BOOL` 时，整数 `0` 是假，其余整数是真。文本 `true`、`false` 以及能写成整数的文本同样适用。空字符串和其他文本返回 `syntax: cast`。
+
+转到 `STRING` 时，整数写成十进制文本，布尔写成 `true` 或 `false`。
+
+未知类型返回 `syntax: unknown type 名称`。
+
+```sql
+SELECT CAST(id AS STRING) FROM note WHERE id = 1;
+SELECT id::BOOL FROM note WHERE id = 1;
+```
+
 ```sql
 SELECT coalesce(null, id) FROM note WHERE id = 1;
 SELECT nullif(id, 1) FROM note WHERE id = 1;
@@ -718,7 +741,7 @@ WebSocket `GET /v1/ws` 接受同一套 `SELECT`，见 [服务进程](server.md)�
 
 ## 与 PostgreSQL 的差异
 
-已经按 PostgreSQL 的规则实现的是：内连接和外连接、`CROSS JOIN`、`ON` 等值、`WHERE` 的与或和非、整数比较、`BETWEEN`、`IN`、`LIKE`、搜索形式的 `CASE`、`COALESCE`、`NULLIF`、`GROUP BY`、`HAVING`、`DISTINCT`、`UNION` / `INTERSECT` / `EXCEPT` 及各自的 `ALL`、先 `ORDER BY` 再 `LIMIT`、列别名，以及空值不参与等值。
+已经按 PostgreSQL 的规则实现的是：内连接和外连接、`CROSS JOIN`、`ON` 等值、`WHERE` 的与或和非、整数比较、`BETWEEN`、`IN`、`LIKE`、搜索形式的 `CASE`、`COALESCE`、`NULLIF`、`CAST` / `::`、`GROUP BY`、`HAVING`、`DISTINCT`、`UNION` / `INTERSECT` / `EXCEPT` 及各自的 `ALL`、先 `ORDER BY` 再 `LIMIT`、列别名，以及空值不参与等值。
 
 还没有，写出来就是语法错误：
 
@@ -727,7 +750,7 @@ WebSocket `GET /v1/ws` 接受同一套 `SELECT`，见 [服务进程](server.md)�
 | 查询 | 子查询、`WITH`、`LATERAL`、`VALUES` 作为 `FROM`、`TABLE` |
 | 集合 | 没有括号时，不能把 `ORDER BY` 写在中间一段的后面 |
 | 窗口 | `OVER`、`rank`、`lag`、`lead` |
-| 表达式 | `CAST`、`::`、四则以外的函数、正则 |
+| 表达式 | 四则以外的函数、正则。`CAST` 只接受 `INT64`、`STRING`、`BOOL` |
 | 谓词 | `ILIKE`、`SIMILAR TO`、`ANY` / `ALL`、数组、`IS TRUE` |
 | 写入 | `UPDATE`、`TRUNCATE`、`ALTER`、`DROP`、`COPY`。`DELETE` 只按主键追加墓碑 |
 | 目录 | `information_schema`、`pg_catalog` |

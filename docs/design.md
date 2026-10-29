@@ -467,12 +467,14 @@ cmp         = value [comp value | "BETWEEN" value "AND" value
 value       = add
 add         = mul { ("+" | "-") mul }
 mul         = unary { ("*" | "/") unary }
-unary       = ["-"] primary
+unary       = ["-"] postfix
+postfix     = primary { "::" type }
 primary     = ident | literal | "(" expr ")"
             | "CASE" when { when } ["ELSE" value] "END"
             | "CASE" value simple { simple } ["ELSE" value] "END"
             | "COALESCE" "(" value { "," value } ")"
             | "NULLIF" "(" value "," value ")"
+            | "CAST" "(" expr "AS" type ")"
 when        = "WHEN" expr "THEN" value
 simple      = "WHEN" value "THEN" value
 comp        = "=" | "<>" | "!=" | "<" | "<=" | ">" | ">="
@@ -555,7 +557,7 @@ WHERE symbol = 'SZSE:000001';
 2. 解析 `symbol`，得到 `symbol_id`。scale 不同的符号不能出现在同一个 `SUM` / `AVG` 里，除非按 `symbol` 分组。
 3. `klines` 对 `(symbol_id, period_id, bucket_start_ns)` 二分。`ticks` 对时间二分。`snapshots` 直接读 seqlock 槽。
 4. 查询开始时 Acquire 读取 `applied_seq`。扫描跳过 `seq` 更大的行。未闭合 K 线和快照若 `seq` 更大，或 seqlock 失败，重试最多 3 次，仍失败则返回 `Busy`。
-5. `WHERE` 支持 `AND` / `OR` / `NOT`、比较、四则运算、`CASE`、`COALESCE`、`NULLIF`、`IN`、`LIKE`、`BETWEEN` 和 `IS NULL`。`COALESCE` 从左到右取第一个非空值，空字符串不算空值。`NULLIF` 只在两边按比较规则相等时得到空值。`symbol` 与 `period` 写在最外层 `AND` 上，供扫描使用。
+5. `WHERE` 支持 `AND` / `OR` / `NOT`、比较、四则运算、`CASE`、`COALESCE`、`NULLIF`、`CAST`、`IN`、`LIKE`、`BETWEEN` 和 `IS NULL`。`COALESCE` 从左到右取第一个非空值，空字符串不算空值。`NULLIF` 只在两边按比较规则相等时得到空值。`CAST` 与 `::` 只接受 `INT64`、`STRING`、`BOOL`。空值转换后仍是空值。整数 0 是假，其余整数是真。`true` / `false` 与 `1` / `0` 互转。`symbol` 与 `period` 写在最外层 `AND` 上，供扫描使用。
 6. 有 `GROUP BY` 时按分组键各出一行。分组键可以是表达式。没有分组的聚合仍是一行。选择列表里的非聚合表达式必须出现在分组键中。`HAVING` 过滤分组结果。
 7. `DISTINCT` 去掉重复行。`UNION` 去掉整行重复，`UNION ALL` 保留。`INTERSECT` 只留两边都有的行，`EXCEPT` 从左边去掉右边有的行。带 `ALL` 时按出现次数，否则整行文本相同只留一次。`INTERSECT` 比 `UNION` 和 `EXCEPT` 更紧，只连接相邻的操作数。括号先算出里面的结果，里面的 `ORDER BY` 和 `LIMIT` 也先生效。`ORDER BY` 和 `LIMIT` 作用在整段结果上。整数按数值比，其余按文本比。`FIRST` / `LAST` 按组内存储顺序。
 8. `SUM` 用 `i128` 累加，溢出返回错误。`AVG` 返回十进制文本，不使用二进制浮点。

@@ -732,3 +732,47 @@ fn simple_case_matches_by_equality_and_null_does_not_match_null() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn cast_converts_int_string_and_bool_and_keeps_null() {
+    let (dir, mut engine) = open();
+    note(&mut engine);
+    let sql = SqlEngine::new(&engine);
+    assert_eq!(
+        sql.query("SELECT CAST(id AS STRING) FROM note WHERE id = 1")
+            .unwrap()
+            .rows,
+        vec![vec!["1".to_string()]]
+    );
+    assert_eq!(
+        sql.query("SELECT id::BOOL FROM note WHERE id = 1")
+            .unwrap()
+            .rows,
+        vec![vec!["true".to_string()]]
+    );
+    assert_eq!(
+        sql.query("SELECT CAST('false' AS INT64) FROM note WHERE id = 1")
+            .unwrap()
+            .rows,
+        vec![vec!["0".to_string()]]
+    );
+    assert_eq!(
+        sql.query("SELECT id FROM note WHERE CAST(null AS INT64) IS NULL AND id = 1")
+            .unwrap()
+            .rows,
+        vec![vec!["1".to_string()]]
+    );
+    assert_eq!(
+        sql.query("SELECT CAST('nope' AS INT64) FROM note")
+            .unwrap_err()
+            .to_string(),
+        "syntax: cast"
+    );
+    assert_eq!(
+        sql.query("SELECT id::float FROM note")
+            .unwrap_err()
+            .to_string(),
+        "syntax: unknown type float"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

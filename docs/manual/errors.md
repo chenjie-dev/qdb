@@ -46,6 +46,8 @@
 | `syntax: numeric` | 四则运算的操作数不是整数 |
 | `syntax: boolean` | `WHERE` 里单独写了一个不能当布尔值的表达式 |
 | `syntax: coalesce` | `COALESCE` 没有参数 |
+| `syntax: cast` | 值不能转换成目标类型 |
+| `syntax: unknown type 名称` | `CREATE TABLE` 或 `CAST` 用了 `INT64`、`STRING`、`BOOL` 以外的类型 |
 | `syntax: nullif` | `NULLIF` 的参数不是两个 |
 | `syntax: duplicate key` | `INSERT` 的主键已经可见，或同一句里出现了两次。多行时整句不写 |
 | `syntax: table already exists` | `CREATE TABLE` 重名 |

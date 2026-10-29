@@ -92,7 +92,7 @@ impl<'a> SqlEngine<'a> {
 
     /// 执行 `SELECT`、`SHOW` 或 `DESCRIBE`。不写 WAL。
     ///
-    /// `WHERE` 在扫描之后过滤，可以写比较、四则运算、`CASE`、`COALESCE`、`NULLIF`、`IN` 和 `LIKE`。`CASE 列 WHEN 值` 按相等比较，空值不会命中另一个空值。`COALESCE` 取第一个非空值，空字符串不算空值。`NULLIF` 只在两边相等时变成空值。`GROUP BY` 每个分组一行，`HAVING` 再过滤分组。`DISTINCT` 去重。`UNION`、`INTERSECT` 和 `EXCEPT` 先按优先级合并再排序。`INTERSECT` 只连接相邻的操作数。括号先算出里面的结果，可以改这个优先级，里面的 `ORDER BY` 和 `LIMIT` 也先生效。`ORDER BY` 在 `LIMIT` 之前排序。`LIMIT` 不能超过 100000。
+    /// `WHERE` 在扫描之后过滤，可以写比较、四则运算、`CASE`、`COALESCE`、`NULLIF`、`CAST`、`IN` 和 `LIKE`。`CASE 列 WHEN 值` 按相等比较，空值不会命中另一个空值。`COALESCE` 取第一个非空值，空字符串不算空值。`NULLIF` 只在两边相等时变成空值。`CAST` 和 `::` 只在 `INT64`、`STRING`、`BOOL` 之间转换，空值保持空值。`GROUP BY` 每个分组一行，`HAVING` 再过滤分组。`DISTINCT` 去重。`UNION`、`INTERSECT` 和 `EXCEPT` 先按优先级合并再排序。`INTERSECT` 只连接相邻的操作数。括号先算出里面的结果，可以改这个优先级，里面的 `ORDER BY` 和 `LIMIT` 也先生效。`ORDER BY` 在 `LIMIT` 之前排序。`LIMIT` 不能超过 100000。
     /// 不带 `symbol` 的 `ticks` 会多一列 `symbol`。`JOIN` 按 PostgreSQL 的内连接和外连接匹配，多表时列名是 `别名.列名`。
     ///
     /// # Arguments
@@ -719,6 +719,10 @@ enum ValExpr {
         else_arm: Option<Box<ValExpr>>,
     },
     Pred(Box<Expr>),
+    Cast {
+        inner: Box<ValExpr>,
+        ty: ColumnType,
+    },
     Coalesce(Vec<ValExpr>),
     NullIf {
         left: Box<ValExpr>,
@@ -2640,6 +2644,19 @@ fn parse_unary(tokens: &[String], index: &mut usize) -> Result<ValExpr, SqlError
 }
 
 fn parse_primary(tokens: &[String], index: &mut usize) -> Result<ValExpr, SqlError> {
+    let mut expr = parse_cast_atom(tokens, index)?;
+    while tokens.get(*index).map(String::as_str) == Some("::") {
+        *index += 1;
+        let ty = cast_type(tokens, index)?;
+        expr = ValExpr::Cast {
+            inner: Box::new(expr),
+            ty,
+        };
+    }
+    Ok(expr)
+}
+
+fn parse_cast_atom(tokens: &[String], index: &mut usize) -> Result<ValExpr, SqlError> {
     let token = tokens
         .get(*index)
         .ok_or_else(|| SqlError::Syntax("value".into()))?
@@ -2655,6 +2672,10 @@ fn parse_primary(tokens: &[String], index: &mut usize) -> Result<ValExpr, SqlErr
     }
     if token.eq_ignore_ascii_case("case") {
         return parse_case(tokens, index);
+    }
+    if token.eq_ignore_ascii_case("cast") && tokens.get(*index + 1).map(String::as_str) == Some("(")
+    {
+        return parse_cast(tokens, index);
     }
     if (token.eq_ignore_ascii_case("coalesce") || token.eq_ignore_ascii_case("nullif"))
         && tokens.get(*index + 1).map(String::as_str) == Some("(")
@@ -2681,6 +2702,33 @@ fn parse_primary(tokens: &[String], index: &mut usize) -> Result<ValExpr, SqlErr
         return Ok(ValExpr::Column(token.to_ascii_lowercase()));
     }
     Err(SqlError::Syntax(format!("value {token}")))
+}
+
+fn parse_cast(tokens: &[String], index: &mut usize) -> Result<ValExpr, SqlError> {
+    expect(tokens, index, "cast")?;
+    expect(tokens, index, "(")?;
+    let expr = parse_expr(tokens, index)?;
+    let inner = match expr {
+        Expr::Value(value) => value,
+        other => ValExpr::Pred(Box::new(other)),
+    };
+    expect(tokens, index, "as")?;
+    let ty = cast_type(tokens, index)?;
+    expect(tokens, index, ")")?;
+    Ok(ValExpr::Cast {
+        inner: Box::new(inner),
+        ty,
+    })
+}
+
+fn cast_type(tokens: &[String], index: &mut usize) -> Result<ColumnType, SqlError> {
+    let name = tokens
+        .get(*index)
+        .ok_or_else(|| SqlError::Syntax("type".into()))?;
+    let ty = ColumnType::parse(&name.to_ascii_uppercase())
+        .ok_or_else(|| SqlError::Syntax(format!("unknown type {name}")))?;
+    *index += 1;
+    Ok(ty)
 }
 
 fn parse_case(tokens: &[String], index: &mut usize) -> Result<ValExpr, SqlError> {
@@ -2999,6 +3047,7 @@ fn eval_val(expr: &ValExpr, columns: &[String], row: &[String]) -> Result<Scalar
             Truth::False => Scalar::Text("false".into()),
             Truth::Unknown => Scalar::Null,
         }),
+        ValExpr::Cast { inner, ty } => cast_scalar(eval_val(inner, columns, row)?, *ty),
         ValExpr::Coalesce(args) => {
             // 从左到右取第一个非空值。空字符串不是空值，不会被跳过。
             for arg in args {
@@ -3018,6 +3067,61 @@ fn eval_val(expr: &ValExpr, columns: &[String], row: &[String]) -> Result<Scalar
                 _ => Ok(left),
             }
         }
+    }
+}
+
+fn cast_scalar(value: Scalar, ty: ColumnType) -> Result<Scalar, SqlError> {
+    if matches!(value, Scalar::Null) {
+        return Ok(Scalar::Null);
+    }
+    // 空值保持空值。整数 0 是假，其余整数是真。true/false 与 1/0 互转。不能表示成目标类型就失败。
+    match ty {
+        ColumnType::Int64 => match value {
+            Scalar::Int(number) => i64::try_from(number)
+                .map(|number| Scalar::Int(i128::from(number)))
+                .map_err(|_| SqlError::Syntax("overflow".into())),
+            Scalar::Text(text) => {
+                if let Ok(number) = text.parse::<i128>() {
+                    return i64::try_from(number)
+                        .map(|number| Scalar::Int(i128::from(number)))
+                        .map_err(|_| SqlError::Syntax("overflow".into()));
+                }
+                match text.to_ascii_lowercase().as_str() {
+                    "true" => Ok(Scalar::Int(1)),
+                    "false" => Ok(Scalar::Int(0)),
+                    _ => Err(SqlError::Syntax("cast".into())),
+                }
+            }
+            Scalar::Null => Ok(Scalar::Null),
+        },
+        ColumnType::Bool => {
+            let flag = match &value {
+                Scalar::Int(number) => *number != 0,
+                Scalar::Text(text) => match text.to_ascii_lowercase().as_str() {
+                    "true" => true,
+                    "false" => false,
+                    _ => match text.parse::<i128>() {
+                        Ok(number) => number != 0,
+                        Err(_) => return Err(SqlError::Syntax("cast".into())),
+                    },
+                },
+                Scalar::Null => return Ok(Scalar::Null),
+            };
+            Ok(Scalar::Text(if flag { "true" } else { "false" }.into()))
+        }
+        ColumnType::String => Ok(match value {
+            Scalar::Int(number) => Scalar::Text(number.to_string()),
+            Scalar::Text(text) => Scalar::Text(text),
+            Scalar::Null => Scalar::Null,
+        }),
+    }
+}
+
+fn cast_name(ty: ColumnType) -> &'static str {
+    match ty {
+        ColumnType::Int64 => "int64",
+        ColumnType::String => "string",
+        ColumnType::Bool => "bool",
     }
 }
 
@@ -3108,6 +3212,7 @@ fn render_val(expr: &ValExpr) -> String {
             text
         }
         ValExpr::Pred(inner) => format!("({})", render_expr(inner)),
+        ValExpr::Cast { inner, ty } => format!("cast({} as {})", render_val(inner), cast_name(*ty)),
         ValExpr::Coalesce(args) => format!(
             "coalesce({})",
             args.iter().map(render_val).collect::<Vec<_>>().join(", ")
@@ -3441,6 +3546,15 @@ fn tokenize(sql: &str) -> Vec<String> {
             tokens.push(ch.to_string());
             continue;
         }
+        if ch == ':' {
+            if chars.peek() == Some(&':') {
+                chars.next();
+                tokens.push("::".to_string());
+            } else {
+                tokens.push(":".to_string());
+            }
+            continue;
+        }
         if ch == '<' || ch == '>' || ch == '!' {
             let mut op = String::from(ch);
             if let Some(next) = chars.peek() {
@@ -3458,7 +3572,7 @@ fn tokenize(sql: &str) -> Vec<String> {
             if next.is_whitespace()
                 || matches!(
                     *next,
-                    ',' | '(' | ')' | '=' | '+' | '-' | '*' | '/' | '<' | '>' | '!'
+                    ',' | '(' | ')' | '=' | '+' | '-' | '*' | '/' | '<' | '>' | '!' | ':'
                 )
             {
                 break;
