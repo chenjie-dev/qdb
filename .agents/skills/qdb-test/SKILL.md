@@ -87,7 +87,7 @@ cargo test --workspace -- --test-threads=1
 
 ## 当前 SQL
 
-只测 [`docs/manual/sql.md`](../../../docs/manual/sql.md) 里已经写明的语法。新语法先按 [`docs/manual/index.md`](../../../docs/manual/index.md)「后续增补」写进那一章，再改下面的表并补测试。下面每一条都要有测试名。子查询、`UPDATE`、`DELETE`、窗口函数、连接上的聚合，断言为失败，不能当成已支持。
+只测 [`docs/manual/sql.md`](../../../docs/manual/sql.md) 里已经写明的语法。新语法先按 [`docs/manual/index.md`](../../../docs/manual/index.md)「后续增补」写进那一章，再改下面的表并补测试。下面每一条都要有测试名。子查询、`UPDATE`、窗口函数、连接上的聚合，断言为失败，不能当成已支持。`DELETE` 只覆盖有主键的用户表。
 
 | 写法 | 必须碰到的边界 |
 |---|---|
@@ -100,6 +100,7 @@ cargo test --workspace -- --test-threads=1
 | `SUBSCRIBE` | 只从 `SELECT` 末尾剥掉；`query` 遇到它失败；`SHOW` 末尾失败 |
 | `SHOW` / `DESCRIBE` / `DESC` | 四张行情表和用户表；未知表失败 |
 | `CREATE TABLE` / `INSERT` | 三种类型；空定义、列数不对、类型不对、保留表名、主键冲突失败 |
+| `DELETE` | 主键等值删掉可见行，重启后仍不可见，同一键可以再插入；缺主键、内置表、不存在的键失败 |
 | `JOIN` | `INNER`、`LEFT`、`RIGHT`、`FULL`、`CROSS`；`OUTER` 和 `AS`；`ON` 的 `AND`；缺 `ON`、重复别名、`CROSS` 带 `ON`、重名列、连接上的聚合都失败；连接后引用不存在的列失败，存在的列可以 `BETWEEN`；补出来的空列不再匹配空字符串 |
 
 ## 写法

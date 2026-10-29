@@ -1,4 +1,4 @@
-//! 只读 SQL 子集，以及 `CREATE TABLE` 和 `INSERT`。
+//! 只读 SQL 子集，以及 `CREATE TABLE`、`INSERT` 和按主键的 `DELETE`。
 //!
 //! 语法边界见 `docs/manual/sql.md`。`WHERE`、表达式、`CASE`、`GROUP BY`、`HAVING`、`DISTINCT`、`UNION` 和 `ORDER BY` 都会生效。
 #![forbid(unsafe_code)]
@@ -23,7 +23,7 @@ pub enum SqlError {
 
 /// 在一个 [`Engine`] 上跑 SQL。
 ///
-/// [`SqlEngine::query`] 只读。`CREATE TABLE` 和 `INSERT` 走 [`SqlEngine::execute`]，需要可写引擎。
+/// [`SqlEngine::query`] 只读。`CREATE TABLE`、`INSERT` 和 `DELETE` 走 [`SqlEngine::execute`]，需要可写引擎。
 /// 语法以 `docs/manual/sql.md` 为准。
 pub struct SqlEngine<'a> {
     engine: &'a Engine,
@@ -50,23 +50,24 @@ impl<'a> SqlEngine<'a> {
         Self { engine }
     }
 
-    /// 执行一条语句。`CREATE` 和 `INSERT` 写入 WAL，其余交给 [`SqlEngine::query`]。
+    /// 执行一条语句。`CREATE`、`INSERT` 和 `DELETE` 写入 WAL，其余交给 [`SqlEngine::query`]。
     ///
-    /// 末尾分号会被去掉。`CREATE`/`INSERT` 在默认组提交下会 `fsync`。
+    /// 末尾分号会被去掉。写入语句在默认组提交下会 `fsync`。
     ///
     /// # Arguments
     ///
-    /// * `engine` - 可写引擎。只读引擎上的建表和插入会失败。
+    /// * `engine` - 可写引擎。只读引擎上的建表、插入和删除会失败。
     /// * `sql` - 一条语句。
     ///
     /// # Returns
     ///
-    /// 查询返回行。建表和插入成功时 `rows` 为空。
+    /// 查询返回行。建表成功时 `rows` 是 `created`，插入是 `inserted`，删除是 `deleted`。
     ///
     /// # Errors
     ///
-    /// * [`SqlError::Syntax`] - 语句无法解析。
+    /// * [`SqlError::Syntax`] - 语句无法解析，主键没写全，或删的是内置表。
     /// * [`SqlError::Store`] - 表已存在、主键冲突、类型不对，或引擎只读。
+    /// * [`SqlError::NotFound`] - 表不存在，或主键当前没有可见行。`Display` 仍是 `symbol not found` 或存储层原文，见手册。
     pub fn execute(engine: &mut Engine, sql: &str) -> Result<QueryResult, SqlError> {
         let sql = sql.trim().trim_end_matches(';').trim();
         let tokens = tokenize(sql);
@@ -79,6 +80,9 @@ impl<'a> SqlEngine<'a> {
         }
         if head == "insert" {
             return exec_insert(engine, &tokens);
+        }
+        if head == "delete" {
+            return exec_delete(engine, &tokens);
         }
         SqlEngine::new(engine).query(sql)
     }
@@ -1434,6 +1438,89 @@ fn exec_insert(engine: &mut Engine, tokens: &[String]) -> Result<QueryResult, Sq
     })
 }
 
+fn exec_delete(engine: &mut Engine, tokens: &[String]) -> Result<QueryResult, SqlError> {
+    let mut index = 0;
+    expect(tokens, &mut index, "delete")?;
+    expect(tokens, &mut index, "from")?;
+    let name = tokens
+        .get(index)
+        .ok_or_else(|| SqlError::Syntax("table".into()))?
+        .to_ascii_lowercase();
+    index += 1;
+    expect(tokens, &mut index, "where")?;
+    let schema = engine
+        .table_schema(&name)
+        .cloned()
+        .ok_or(SqlError::NotFound)?;
+    let mut pairs = Vec::new();
+    loop {
+        let column = tokens
+            .get(index)
+            .ok_or_else(|| SqlError::Syntax("column".into()))?
+            .to_ascii_lowercase();
+        index += 1;
+        expect(tokens, &mut index, "=")?;
+        let token = tokens
+            .get(index)
+            .ok_or_else(|| SqlError::Syntax("value".into()))?;
+        let raw = if token == "-" {
+            index += 1;
+            let number = tokens
+                .get(index)
+                .ok_or_else(|| SqlError::Syntax("value".into()))?;
+            index += 1;
+            format!("-{}", unquote(number))
+        } else {
+            index += 1;
+            unquote(token)
+        };
+        pairs.push((column, raw));
+        if tokens
+            .get(index)
+            .is_some_and(|token| token.eq_ignore_ascii_case("and"))
+        {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+    if index != tokens.len() {
+        return Err(SqlError::Syntax("primary key required".into()));
+    }
+    let mut seen = std::collections::HashSet::new();
+    if pairs.iter().any(|(name, _)| !seen.insert(name.clone())) {
+        return Err(SqlError::Syntax("primary key required".into()));
+    }
+    let pk: Vec<&ColumnDef> = schema
+        .columns
+        .iter()
+        .filter(|column| column.primary_key)
+        .collect();
+    if pk.is_empty() || pairs.len() != pk.len() {
+        return Err(SqlError::Syntax("primary key required".into()));
+    }
+    let mut key = Vec::with_capacity(pk.len());
+    for column in &pk {
+        let raw = pairs
+            .iter()
+            .find(|(name, _)| name == &column.name)
+            .map(|(_, raw)| raw.as_str())
+            .ok_or_else(|| SqlError::Syntax("primary key required".into()))?;
+        key.push(parse_cell(column.ty, raw)?);
+    }
+    if pairs
+        .iter()
+        .any(|(name, _)| pk.iter().all(|column| column.name != *name))
+    {
+        return Err(SqlError::Syntax("primary key required".into()));
+    }
+    engine.delete_row(&name, &key).map_err(map_store)?;
+    Ok(QueryResult {
+        columns: vec!["result".into()],
+        rows: vec![vec!["deleted".into()]],
+    })
+}
+
 fn parse_cell(ty: ColumnType, raw: &str) -> Result<Cell, SqlError> {
     match ty {
         ColumnType::Int64 => raw
@@ -1454,6 +1541,7 @@ fn map_store(err: StoreError) -> SqlError {
         StoreError::NotFound => SqlError::NotFound,
         StoreError::TableExists => SqlError::Syntax("table already exists".into()),
         StoreError::DuplicateKey => SqlError::Syntax("duplicate key".into()),
+        StoreError::KeyNotFound => SqlError::Syntax("key not found".into()),
         StoreError::TypeMismatch => SqlError::Syntax("type mismatch".into()),
         StoreError::Schema(message) => SqlError::Syntax(message),
         other => SqlError::Store(other.to_string()),

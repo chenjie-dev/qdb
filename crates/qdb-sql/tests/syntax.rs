@@ -431,3 +431,50 @@ fn expressions_case_like_in_and_union_follow_integer_rules() {
     assert!(sql.query("SELECT id / 0 FROM note").is_err());
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn delete_hides_the_primary_key_until_it_is_inserted_again() {
+    let (dir, mut engine) = open();
+    note(&mut engine);
+    let deleted = SqlEngine::execute(&mut engine, "DELETE FROM note WHERE id = 1").unwrap();
+    assert_eq!(deleted.rows, vec![vec!["deleted".to_string()]]);
+    let sql = SqlEngine::new(&engine);
+    assert!(sql
+        .query("SELECT code FROM note WHERE id = 1")
+        .unwrap()
+        .rows
+        .is_empty());
+    assert_eq!(
+        sql.query("SELECT id FROM note ORDER BY id").unwrap().rows,
+        vec![vec!["2".to_string()]]
+    );
+    assert!(sql.query("DELETE FROM note WHERE id = 2").is_err());
+    drop(sql);
+    assert!(SqlEngine::execute(&mut engine, "DELETE FROM note WHERE id = 1").is_err());
+    assert!(SqlEngine::execute(&mut engine, "DELETE FROM note WHERE code = 'x'").is_err());
+    assert!(SqlEngine::execute(&mut engine, "DELETE FROM ticks WHERE seq = 1").is_err());
+    SqlEngine::execute(&mut engine, "INSERT INTO note VALUES (1, 'again', false)").unwrap();
+    drop(engine);
+    let mut engine = Engine::open(&dir).unwrap();
+    let sql = SqlEngine::new(&engine);
+    assert_eq!(
+        sql.query("SELECT code FROM note WHERE id = 1")
+            .unwrap()
+            .rows,
+        vec![vec!["again".to_string()]]
+    );
+    SqlEngine::execute(
+        &mut engine,
+        "CREATE TABLE pair (a INT64 PRIMARY KEY, b INT64 PRIMARY KEY, name STRING)",
+    )
+    .unwrap();
+    SqlEngine::execute(&mut engine, "INSERT INTO pair VALUES (1, 2, 'x')").unwrap();
+    assert!(SqlEngine::execute(&mut engine, "DELETE FROM pair WHERE a = 1").is_err());
+    SqlEngine::execute(&mut engine, "DELETE FROM pair WHERE b = 2 AND a = 1").unwrap();
+    assert!(SqlEngine::new(&engine)
+        .query("SELECT name FROM pair")
+        .unwrap()
+        .rows
+        .is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}

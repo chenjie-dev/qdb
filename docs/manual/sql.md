@@ -9,7 +9,7 @@ let sql = qdb_sql::SqlEngine::new(&engine);
 let result = sql.query("SELECT close FROM klines WHERE symbol = 'SSE:600000' AND period = '1m' LIMIT 10")?;
 ```
 
-`query` 只读。`CREATE TABLE` 和 `INSERT` 用 `SqlEngine::execute`，需要可写引擎。
+`query` 只读。`CREATE TABLE`、`INSERT` 和 `DELETE` 用 `SqlEngine::execute`，需要可写引擎。
 
 ## 词法
 
@@ -451,6 +451,34 @@ INSERT INTO note VALUES (1, 'SSE:600000', true);
 
 没有 `INSERT INTO t (列) VALUES ...`、`RETURNING` 和 `ON CONFLICT`。
 
+## DELETE
+
+按完整主键删掉用户表里当前可见的一行。成功时 `columns` 是 `result`，`rows` 是 `deleted`。语句写入 WAL，分配新的 `seq`。已经落盘的旧行留在日志里，查询不再返回这个键。同一个键可以再 `INSERT`。
+
+### 语法
+
+```text
+DELETE FROM name WHERE column = value { "AND" column = value }
+```
+
+### 说明
+
+`WHERE` 只能是主键列的等值，用 `AND` 连起来。每一列恰好出现一次，顺序不限。复合主键必须写全。没有主键、只写了部分主键、多写了别的列、或使用 `OR`，都返回 `syntax: primary key required`。
+
+内置表 `symbols`、`ticks`、`snapshots`、`klines` 返回 `syntax: reserved table`。当前没有这个键返回 `syntax: key not found`。表不存在返回 `symbol not found`。
+
+`SELECT` 和订阅都看不到墓碑之后的这行。重新打开库之后仍然看不到，直到再次插入。
+
+### 示例
+
+```sql
+DELETE FROM note WHERE id = 1;
+```
+
+### 兼容性
+
+没有 `DELETE` 不带 `WHERE`、`USING`、`RETURNING`，也不能按非主键列删除。这不是擦掉历史，而是追加一条墓碑。
+
 ## SHOW
 
 列出可以查询的表。
@@ -594,7 +622,7 @@ pub struct QueryResult {
 | 函数 | 作用 |
 |---|---|
 | `SqlEngine::query` | `SELECT`、`SHOW`、`DESCRIBE`。不写 WAL |
-| `SqlEngine::execute` | 另外接受 `CREATE TABLE` 和 `INSERT`。需要可写引擎 |
+| `SqlEngine::execute` | 另外接受 `CREATE TABLE`、`INSERT` 和按主键的 `DELETE`。需要可写引擎 |
 | `split_subscribe` | 若语句以 `SUBSCRIBE` 结尾，返回去掉它之后的 `SELECT` |
 | `captured_rows` | 当前结果，最多 100000 行，给订阅记住已经看过的行 |
 | `live_rows` | 把一批新变更投影成与 `SELECT` 相同的列 |

@@ -50,6 +50,8 @@ pub enum MsgType {
     GapAck = 7,
     TableSchema = 8,
     RowInsert = 9,
+    /// 用户表按主键写一条墓碑。已落盘的旧行还在 WAL 里，查询不再返回这个键。
+    RowDelete = 10,
 }
 
 impl MsgType {
@@ -57,7 +59,7 @@ impl MsgType {
     ///
     /// # Arguments
     ///
-    /// * `value` - 1 到 9。其余值没有对应类型。
+    /// * `value` - 1 到 10。其余值没有对应类型。
     ///
     /// # Returns
     ///
@@ -73,6 +75,7 @@ impl MsgType {
             7 => Self::GapAck,
             8 => Self::TableSchema,
             9 => Self::RowInsert,
+            10 => Self::RowDelete,
             _ => return None,
         })
     }

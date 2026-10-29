@@ -3,7 +3,7 @@
 //! `symbols`、`ticks`、`snapshots`、`klines` 由引擎登记成这种表。行仍由行情写入路径维护。
 #![forbid(unsafe_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use crate::StoreError;
@@ -107,6 +107,8 @@ pub struct TableSet {
     rows: HashMap<String, Vec<Vec<Cell>>>,
     primary: HashMap<String, HashMap<Vec<u8>, usize>>,
     secondary: HashMap<String, HashMap<String, HashMap<Vec<u8>, Vec<usize>>>>,
+    /// 墓碑行的下标。快照只写出仍然可见的行。
+    deleted: HashMap<String, HashSet<usize>>,
 }
 
 impl TableSet {
@@ -124,8 +126,15 @@ impl TableSet {
             out.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
             out.extend_from_slice(&encoded);
             let rows = &self.rows[&name];
-            out.extend_from_slice(&(rows.len() as u32).to_le_bytes());
-            for row in rows {
+            let dead = self.deleted.get(&name);
+            let live: Vec<&Vec<Cell>> = rows
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !dead.is_some_and(|set| set.contains(index)))
+                .map(|(_, row)| row)
+                .collect();
+            out.extend_from_slice(&(live.len() as u32).to_le_bytes());
+            for row in live {
                 for cell in row {
                     match cell {
                         Cell::Int64(value) => out.extend_from_slice(&value.to_le_bytes()),
@@ -439,12 +448,21 @@ impl TableSet {
                 if out.len() >= limit {
                     break;
                 }
+                if self.is_deleted(table, index) {
+                    continue;
+                }
                 if let Some(row) = rows.get(index) {
                     out.push(row.iter().map(Cell::display).collect());
                 }
             }
         } else {
-            for row in rows.iter().take(limit) {
+            for (index, row) in rows.iter().enumerate() {
+                if out.len() >= limit {
+                    break;
+                }
+                if self.is_deleted(table, index) {
+                    continue;
+                }
                 if let Some(expected) = expected {
                     let position = schema
                         .columns
@@ -499,7 +517,10 @@ impl TableSet {
                 .and_then(|indexes| indexes.get(column))
                 .and_then(|index| index.get(&key))
                 .cloned()
-                .unwrap_or_default());
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|index| !self.is_deleted(table, *index))
+                .collect());
         }
         let position = schema
             .columns
@@ -510,9 +531,119 @@ impl TableSet {
         Ok(rows
             .iter()
             .enumerate()
-            .filter(|(_, row)| row[position] == *expected)
+            .filter(|(index, row)| !self.is_deleted(table, *index) && row[position] == *expected)
             .map(|(index, _)| index)
             .collect())
+    }
+
+    /// 把主键编码成墓碑载荷。键必须已经存在。
+    ///
+    /// # Errors
+    ///
+    /// * [`StoreError::NotFound`] - 表不存在。
+    /// * [`StoreError::Schema`] - 没有主键，或给出的值个数不对。
+    /// * [`StoreError::TypeMismatch`] - 值的类型和主键列不一致。
+    /// * [`StoreError::KeyNotFound`] - 这个主键当前没有可见行。
+    pub fn encode_delete(&self, table: &str, key: &[Cell]) -> Result<Vec<u8>, StoreError> {
+        let schema = self.schemas.get(table).ok_or(StoreError::NotFound)?;
+        let pk: Vec<&ColumnDef> = schema
+            .columns
+            .iter()
+            .filter(|column| column.primary_key)
+            .collect();
+        if pk.is_empty() {
+            return Err(StoreError::Schema("primary key required".into()));
+        }
+        if key.len() != pk.len() {
+            return Err(StoreError::Schema("column count".into()));
+        }
+        for (value, column) in key.iter().zip(&pk) {
+            if !value.matches(column.ty) {
+                return Err(StoreError::TypeMismatch);
+            }
+        }
+        let bytes = key_bytes(key);
+        if !self
+            .primary
+            .get(table)
+            .is_some_and(|index| index.contains_key(&bytes))
+        {
+            return Err(StoreError::KeyNotFound);
+        }
+        let mut out = Vec::new();
+        push_str(&mut out, table);
+        for value in key {
+            push_cell(&mut out, value);
+        }
+        Ok(out)
+    }
+
+    /// 应用一条墓碑。主键当前不可见时失败，避免把没写过的删除重放进去。
+    ///
+    /// # Errors
+    ///
+    /// * [`StoreError::NotFound`] - 表不存在。
+    /// * [`StoreError::KeyNotFound`] - 主键没有可见行。
+    /// * [`StoreError::Schema`] - 载荷截断或类型对不上。
+    pub fn delete_encoded(&mut self, bytes: &[u8]) -> Result<(), StoreError> {
+        let mut cursor = 0;
+        let table = take_str(bytes, &mut cursor)?;
+        let schema = self
+            .schemas
+            .get(&table)
+            .cloned()
+            .ok_or(StoreError::NotFound)?;
+        let pk: Vec<ColumnDef> = schema
+            .columns
+            .iter()
+            .filter(|column| column.primary_key)
+            .cloned()
+            .collect();
+        let mut key = Vec::with_capacity(pk.len());
+        for column in &pk {
+            key.push(match column.ty {
+                ColumnType::Int64 => Cell::Int64(take_i64(bytes, &mut cursor)?),
+                ColumnType::Bool => Cell::Bool(take_u8(bytes, &mut cursor)? == 1),
+                ColumnType::String => Cell::String(take_str(bytes, &mut cursor)?),
+            });
+        }
+        let bytes = key_bytes(&key);
+        let row_index = self
+            .primary
+            .get(&table)
+            .and_then(|index| index.get(&bytes).copied())
+            .ok_or(StoreError::KeyNotFound)?;
+        let values = self
+            .rows
+            .get(&table)
+            .and_then(|rows| rows.get(row_index))
+            .cloned()
+            .ok_or(StoreError::KeyNotFound)?;
+        self.primary.get_mut(&table).unwrap().remove(&bytes);
+        for index in &schema.indexes {
+            let position = schema
+                .columns
+                .iter()
+                .position(|column| column.name == index.column)
+                .unwrap();
+            let secondary_key = values[position].key_bytes();
+            if let Some(list) = self
+                .secondary
+                .get_mut(&table)
+                .and_then(|indexes| indexes.get_mut(&index.column))
+                .and_then(|index| index.get_mut(&secondary_key))
+            {
+                list.retain(|item| *item != row_index);
+            }
+        }
+        self.deleted.entry(table).or_default().insert(row_index);
+        Ok(())
+    }
+
+    fn is_deleted(&self, table: &str, index: usize) -> bool {
+        self.deleted
+            .get(table)
+            .is_some_and(|set| set.contains(&index))
     }
 }
 
@@ -750,26 +881,38 @@ fn check_cells(schema: &TableSchema, values: &[Cell]) -> Result<(), StoreError> 
     Ok(())
 }
 
-fn primary_key(schema: &TableSchema, values: &[Cell]) -> Option<Vec<u8>> {
-    let marked: Vec<&Cell> = values
-        .iter()
-        .zip(&schema.columns)
-        .filter(|(_, column)| column.primary_key)
-        .map(|(value, _)| value)
-        .collect();
-    if marked.is_empty() {
-        return None;
-    }
-    if marked.len() == 1 {
-        return Some(marked[0].key_bytes());
+fn key_bytes(values: &[Cell]) -> Vec<u8> {
+    if values.len() == 1 {
+        return values[0].key_bytes();
     }
     let mut key = Vec::new();
-    for value in marked {
+    for value in values {
         let bytes = value.key_bytes();
         key.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
         key.extend_from_slice(&bytes);
     }
-    Some(key)
+    key
+}
+
+fn push_cell(out: &mut Vec<u8>, value: &Cell) {
+    match value {
+        Cell::Int64(value) => out.extend_from_slice(&value.to_le_bytes()),
+        Cell::Bool(value) => out.push(u8::from(*value)),
+        Cell::String(value) => push_str(out, value),
+    }
+}
+
+fn primary_key(schema: &TableSchema, values: &[Cell]) -> Option<Vec<u8>> {
+    let marked: Vec<Cell> = values
+        .iter()
+        .zip(&schema.columns)
+        .filter(|(_, column)| column.primary_key)
+        .map(|(value, _)| value.clone())
+        .collect();
+    if marked.is_empty() {
+        return None;
+    }
+    Some(key_bytes(&marked))
 }
 
 fn push_u16(out: &mut Vec<u8>, value: u16) {

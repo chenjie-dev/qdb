@@ -43,6 +43,8 @@ pub enum StoreError {
     TableExists,
     #[error("duplicate key")]
     DuplicateKey,
+    #[error("key not found")]
+    KeyNotFound,
     #[error("type mismatch")]
     TypeMismatch,
     #[error("schema: {0}")]
@@ -465,6 +467,37 @@ impl Engine {
         self.ensure_writable()?;
         let payload = self.tables.encode_row(table, values)?;
         self.commit(MsgType::RowInsert, 0, 0, 0, 0, &payload, 0)
+    }
+
+    /// 按主键为用户表写一条墓碑。
+    ///
+    /// 已经 `fsync` 的旧行留在 WAL 里。这次提交分配新的 `seq` 之后，查询不再返回这个键。
+    /// 同一个键可以再 `INSERT`。内置表和没有主键的表不能删。
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - 用户表名。
+    /// * `key` - 主键列的值，顺序与建表时主键列的顺序一致。
+    ///
+    /// # Returns
+    ///
+    /// 墓碑记录的 `seq`。
+    ///
+    /// # Errors
+    ///
+    /// * [`StoreError::NotFound`] - 表不存在。
+    /// * [`StoreError::Schema`] - 表是内置表、没有主键，或值的个数不对。
+    /// * [`StoreError::TypeMismatch`] - 值的类型和主键列不一致。
+    /// * [`StoreError::KeyNotFound`] - 这个主键当前没有可见行。
+    /// * [`StoreError::ReadOnly`] - 只读引擎。
+    /// * [`StoreError::Crc`] - WAL 已损坏。
+    pub fn delete_row(&mut self, table: &str, key: &[Cell]) -> Result<u64, StoreError> {
+        self.ensure_writable()?;
+        if table::BUILTIN_TABLES.contains(&table) {
+            return Err(StoreError::Schema("reserved table".into()));
+        }
+        let payload = self.tables.encode_delete(table, key)?;
+        self.commit(MsgType::RowDelete, 0, 0, 0, 0, &payload, 0)
     }
 
     /// 扫描一张用户表。
@@ -1703,6 +1736,11 @@ impl Engine {
             }
             Some(MsgType::RowInsert) => {
                 self.tables.insert_encoded(&record.payload)?;
+                self.agg.note_seq(record.seq)?;
+                Ok(Vec::new())
+            }
+            Some(MsgType::RowDelete) => {
+                self.tables.delete_encoded(&record.payload)?;
                 self.agg.note_seq(record.seq)?;
                 Ok(Vec::new())
             }
