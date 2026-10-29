@@ -92,7 +92,7 @@ impl<'a> SqlEngine<'a> {
 
     /// 执行 `SELECT`、`SHOW` 或 `DESCRIBE`。不写 WAL。
     ///
-    /// `WHERE` 在扫描之后过滤，可以写比较、四则运算、`CASE`、`COALESCE`、`NULLIF`、`CAST`、`IN` 和 `LIKE`。`CASE 列 WHEN 值` 按相等比较，空值不会命中另一个空值。`COALESCE` 取第一个非空值，空字符串不算空值。`NULLIF` 只在两边相等时变成空值。`CAST` 和 `::` 只在 `INT64`、`STRING`、`BOOL` 之间转换，空值保持空值。`IS TRUE`、`IS FALSE` 和 `IS UNKNOWN` 的结果只有真或假。`GROUP BY` 每个分组一行，`HAVING` 再过滤分组。`DISTINCT` 去重。`UNION`、`INTERSECT` 和 `EXCEPT` 先按优先级合并再排序。`INTERSECT` 只连接相邻的操作数。括号先算出里面的结果，可以改这个优先级，里面的 `ORDER BY` 和 `LIMIT` 也先生效。`ORDER BY` 在 `LIMIT` 之前排序。`LIMIT` 不能超过 100000。
+    /// `WHERE` 在扫描之后过滤，可以写比较、四则运算、`CASE`、`COALESCE`、`NULLIF`、`CAST`、`IN`、`LIKE` 和 `ILIKE`。`ILIKE` 与 `LIKE` 的通配符相同，比较前把普通字符折成小写。`CASE 列 WHEN 值` 按相等比较，空值不会命中另一个空值。`COALESCE` 取第一个非空值，空字符串不算空值。`NULLIF` 只在两边相等时变成空值。`CAST` 和 `::` 只在 `INT64`、`STRING`、`BOOL` 之间转换，空值保持空值。`IS TRUE`、`IS FALSE` 和 `IS UNKNOWN` 的结果只有真或假。`GROUP BY` 每个分组一行，`HAVING` 再过滤分组。`DISTINCT` 去重。`UNION`、`INTERSECT` 和 `EXCEPT` 先按优先级合并再排序。`INTERSECT` 只连接相邻的操作数。括号先算出里面的结果，可以改这个优先级，里面的 `ORDER BY` 和 `LIMIT` 也先生效。`ORDER BY` 在 `LIMIT` 之前排序。`LIMIT` 不能超过 100000。
     /// 不带 `symbol` 的 `ticks` 会多一列 `symbol`。`JOIN` 按 PostgreSQL 的内连接和外连接匹配，多表时列名是 `别名.列名`。
     ///
     /// # Arguments
@@ -771,6 +771,7 @@ enum Expr {
         value: Box<ValExpr>,
         pattern: Box<ValExpr>,
         negated: bool,
+        insensitive: bool,
     },
 }
 
@@ -2546,7 +2547,9 @@ fn parse_comparison(tokens: &[String], index: &mut usize) -> Result<Expr, SqlErr
         .get(*index)
         .is_some_and(|token| token.eq_ignore_ascii_case("not"))
         && tokens.get(*index + 1).is_some_and(|token| {
-            token.eq_ignore_ascii_case("in") || token.eq_ignore_ascii_case("like")
+            token.eq_ignore_ascii_case("in")
+                || token.eq_ignore_ascii_case("like")
+                || token.eq_ignore_ascii_case("ilike")
         }) {
         *index += 1;
         true
@@ -2592,16 +2595,19 @@ fn parse_comparison(tokens: &[String], index: &mut usize) -> Result<Expr, SqlErr
             negated,
         });
     }
-    if tokens
-        .get(*index)
-        .is_some_and(|token| token.eq_ignore_ascii_case("like"))
-    {
+    if tokens.get(*index).is_some_and(|token| {
+        token.eq_ignore_ascii_case("like") || token.eq_ignore_ascii_case("ilike")
+    }) {
+        let insensitive = tokens
+            .get(*index)
+            .is_some_and(|token| token.eq_ignore_ascii_case("ilike"));
         *index += 1;
         let pattern = parse_add(tokens, index)?;
         return Ok(Expr::Like {
             value: Box::new(left),
             pattern: Box::new(pattern),
             negated,
+            insensitive,
         });
     }
     if negated {
@@ -2980,13 +2986,14 @@ fn eval_expr(expr: &Expr, columns: &[String], row: &[String]) -> Result<Truth, S
             value,
             pattern,
             negated,
+            insensitive,
         } => {
             let value = eval_val(value, columns, row)?;
             let pattern = eval_val(pattern, columns, row)?;
             if matches!(value, Scalar::Null) || matches!(pattern, Scalar::Null) {
                 return Ok(Truth::Unknown);
             }
-            let matched = like_match(&scalar_text(&value), &scalar_text(&pattern));
+            let matched = like_match(&scalar_text(&value), &scalar_text(&pattern), *insensitive);
             Ok(if matched == *negated {
                 Truth::False
             } else {
@@ -3345,10 +3352,12 @@ fn render_expr(expr: &Expr) -> String {
             value,
             pattern,
             negated,
+            insensitive,
         } => format!(
-            "{} {}like {}",
+            "{} {}{} {}",
             render_val(value),
             if *negated { "not " } else { "" },
+            if *insensitive { "ilike" } else { "like" },
             render_val(pattern)
         ),
     }
@@ -3380,7 +3389,17 @@ enum LikeTok {
     Char(char),
 }
 
-fn like_match(text: &str, pattern: &str) -> bool {
+fn like_match(text: &str, pattern: &str, insensitive: bool) -> bool {
+    // ILIKE 先把普通字符折成小写。% 和 _ 仍是通配符，转义后的字符也折成小写再比较。
+    let folded_text;
+    let folded_pattern;
+    let (text, pattern) = if insensitive {
+        folded_text = text.to_lowercase();
+        folded_pattern = fold_like_pattern(pattern);
+        (folded_text.as_str(), folded_pattern.as_str())
+    } else {
+        (text, pattern)
+    };
     let text: Vec<char> = text.chars().collect();
     let pattern = like_tokens(pattern);
     let mut dp = vec![vec![false; pattern.len() + 1]; text.len() + 1];
@@ -3402,6 +3421,26 @@ fn like_match(text: &str, pattern: &str) -> bool {
         }
     }
     dp[text.len()][pattern.len()]
+}
+
+fn fold_like_pattern(pattern: &str) -> String {
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut out = String::new();
+    let mut index = 0;
+    while index < chars.len() {
+        if chars[index] == '\\' && index + 1 < chars.len() {
+            out.push('\\');
+            out.extend(chars[index + 1].to_lowercase());
+            index += 2;
+        } else if chars[index] == '%' || chars[index] == '_' {
+            out.push(chars[index]);
+            index += 1;
+        } else {
+            out.extend(chars[index].to_lowercase());
+            index += 1;
+        }
+    }
+    out
 }
 
 fn like_tokens(pattern: &str) -> Vec<LikeTok> {

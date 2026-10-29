@@ -831,3 +831,33 @@ fn is_true_false_and_unknown_are_never_unknown() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn ilike_folds_letters_and_keeps_wildcards() {
+    let (dir, mut engine) = open();
+    note(&mut engine);
+    let sql = SqlEngine::new(&engine);
+    assert_eq!(
+        sql.query("SELECT id FROM note WHERE code ILIKE 'szse:%'")
+            .unwrap()
+            .rows,
+        vec![vec!["1".to_string()]]
+    );
+    assert!(sql
+        .query("SELECT id FROM note WHERE code LIKE 'szse:%'")
+        .unwrap()
+        .rows
+        .is_empty());
+    assert_eq!(
+        sql.query("SELECT id FROM note WHERE code NOT ILIKE 'szse:%' ORDER BY id")
+            .unwrap()
+            .rows,
+        vec![vec!["2".to_string()]]
+    );
+    assert!(sql
+        .query("SELECT id FROM note WHERE null ILIKE '%'")
+        .unwrap()
+        .rows
+        .is_empty());
+    let _ = std::fs::remove_dir_all(dir);
+}

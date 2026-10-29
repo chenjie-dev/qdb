@@ -138,7 +138,7 @@ not  = ["NOT"] predicate
 predicate = value [ comparison value
                   | "BETWEEN" value "AND" value
                   | ["NOT"] "IN" "(" value { "," value } ")"
-                  | ["NOT"] "LIKE" value
+                  | ["NOT"] ("LIKE" | "ILIKE") value
                   | "IS" ["NOT"] ("NULL" | "TRUE" | "FALSE" | "UNKNOWN") ]
           | "(" expr ")"
 ```
@@ -149,7 +149,9 @@ predicate = value [ comparison value
 | `value BETWEEN low AND high` | `value` 能解析成整数，且 `low <= value <= high`。两端都包含 |
 | `value IN (a, b, ...)` | 列表里有一项与 `value` 相等。列表不能空 |
 | `value NOT IN (a, b, ...)` | 列表里没有相等项，且比较里没有未知 |
-| `value LIKE pattern` | 按下面的通配规则匹配 |
+| `value LIKE pattern` | 按下面的通配规则匹配，区分大小写 |
+| `value ILIKE pattern` | 与 `LIKE` 相同，比较前把普通字符折成小写 |
+| `value NOT ILIKE pattern` | 不匹配，且两边都不是空值 |
 | `value NOT LIKE pattern` | 不匹配，且两边都不是空值 |
 | `value IS NULL` | `value` 是空值 |
 | `value IS NOT NULL` | `value` 不是空值 |
@@ -181,7 +183,7 @@ predicate = value [ comparison value
 
 `IN` 的列表里若有空值，又没有任何一项相等，结果是未知，行被丢掉。`id IN (3, null)` 在没有 `id = 3` 时得不到行。已经相等则仍为真，后面的空值不再影响。
 
-`LIKE` 区分大小写。`%` 匹配任意长度，包括空。`_` 匹配一个字符。`\` 转义下一个字符，因此 `\%` 匹配百分号本身。任一端是空值时结果是未知。
+`LIKE` 区分大小写。`ILIKE` 用同一套通配符，比较前把文本和模式里的普通字符折成小写。`%` 和 `_` 仍是通配符，`\` 后面的字符也折成小写再比较。`%` 匹配任意长度，包括空。`_` 匹配一个字符。`\` 转义下一个字符，因此 `\%` 匹配百分号本身。任一端是空值时结果是未知。
 
 `symbol = '...'` 和 `period = '...'` 若写在 `WHERE` 最外层的 `AND` 上，会下推到扫描。放进 `OR` 里不会下推。`klines` 因此仍要求最外层能看到这两项，否则返回 `syntax: symbol required` 或 `syntax: period required`。`ts BETWEEN 整数 AND 整数` 同样下推，区间是闭的，单位是 UTC 纳秒。
 
@@ -757,7 +759,7 @@ WebSocket `GET /v1/ws` 接受同一套 `SELECT`，见 [服务进程](server.md)�
 | 集合 | 没有括号时，不能把 `ORDER BY` 写在中间一段的后面 |
 | 窗口 | `OVER`、`rank`、`lag`、`lead` |
 | 表达式 | 四则以外的函数、正则。`CAST` 只接受 `INT64`、`STRING`、`BOOL` |
-| 谓词 | `ILIKE`、`SIMILAR TO`、`ANY` / `ALL`、数组 |
+| 谓词 | `SIMILAR TO`、`ANY` / `ALL`、数组 |
 | 写入 | `UPDATE`、`TRUNCATE`、`ALTER`、`DROP`、`COPY`。`DELETE` 只按主键追加墓碑 |
 | 目录 | `information_schema`、`pg_catalog` |
 | 协议 | 预编译语句、参数绑定、PostgreSQL 线协议 |
