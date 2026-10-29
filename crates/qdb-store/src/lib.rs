@@ -500,6 +500,46 @@ impl Engine {
         self.commit(MsgType::RowDelete, 0, 0, 0, 0, &payload, 0)
     }
 
+    /// 按多个主键各写一条墓碑。
+    ///
+    /// 先检查每个键当前都可见，并且列表里没有重复键，然后才按顺序提交。任何一个键不可见时，已有的行都不改。
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - 调用方建成的表。
+    /// * `keys` - 每个元素是一个主键，列顺序与建表时的主键列一致。至少有一个。
+    ///
+    /// # Returns
+    ///
+    /// 每条墓碑的 `seq`，顺序与 `keys` 相同。
+    ///
+    /// # Errors
+    ///
+    /// 与 [`Engine::delete_row`] 相同。列表为空或键重复时返回 [`StoreError::Schema`]。
+    pub fn delete_rows(&mut self, table: &str, keys: &[Vec<Cell>]) -> Result<Vec<u64>, StoreError> {
+        self.ensure_writable()?;
+        if table::BUILTIN_TABLES.contains(&table) {
+            return Err(StoreError::Schema("reserved table".into()));
+        }
+        if keys.is_empty() {
+            return Err(StoreError::Schema("primary key required".into()));
+        }
+        for (pos, key) in keys.iter().enumerate() {
+            if keys[..pos].iter().any(|earlier| earlier == key) {
+                return Err(StoreError::Schema("duplicate key".into()));
+            }
+        }
+        let mut payloads = Vec::with_capacity(keys.len());
+        for key in keys {
+            payloads.push(self.tables.encode_delete(table, key)?);
+        }
+        let mut seqs = Vec::with_capacity(payloads.len());
+        for payload in &payloads {
+            seqs.push(self.commit(MsgType::RowDelete, 0, 0, 0, 0, payload, 0)?);
+        }
+        Ok(seqs)
+    }
+
     /// 扫描一张用户表。
     ///
     /// 给出列名和期望值时，主键或二级索引走等值查找；没有索引则扫全表。

@@ -476,5 +476,25 @@ fn delete_hides_the_primary_key_until_it_is_inserted_again() {
         .unwrap()
         .rows
         .is_empty());
+    SqlEngine::execute(&mut engine, "INSERT INTO note VALUES (3, 'c', true)").unwrap();
+    SqlEngine::execute(&mut engine, "DELETE FROM note WHERE id IN (2, 3)").unwrap();
+    assert_eq!(
+        SqlEngine::new(&engine)
+            .query("SELECT id FROM note ORDER BY id")
+            .unwrap()
+            .rows,
+        vec![vec!["1".to_string()]]
+    );
+    SqlEngine::execute(&mut engine, "INSERT INTO note VALUES (4, 'd', true)").unwrap();
+    assert!(SqlEngine::execute(&mut engine, "DELETE FROM note WHERE id IN (4, 9)").is_err());
+    assert_eq!(
+        SqlEngine::new(&engine)
+            .query("SELECT id FROM note ORDER BY id")
+            .unwrap()
+            .rows,
+        vec![vec!["1".to_string()], vec!["4".to_string()]]
+    );
+    assert!(SqlEngine::execute(&mut engine, "DELETE FROM note WHERE id IN (4, 4)").is_err());
+    assert!(SqlEngine::execute(&mut engine, "DELETE FROM pair WHERE a IN (1)").is_err());
     let _ = std::fs::remove_dir_all(dir);
 }

@@ -453,31 +453,37 @@ INSERT INTO note VALUES (1, 'SSE:600000', true);
 
 ## DELETE
 
-按完整主键删掉用户表里当前可见的一行。成功时 `columns` 是 `result`，`rows` 是 `deleted`。语句写入 WAL，分配新的 `seq`。已经落盘的旧行留在日志里，查询不再返回这个键。同一个键可以再 `INSERT`。
+按完整主键删掉调用方建成的表里当前可见的行。成功时 `columns` 是 `result`，`rows` 是 `deleted`。每个键写入自己的 WAL 记录，分配新的 `seq`。已经落盘的旧行留在日志里，查询不再返回这些键。同一个键可以再 `INSERT`。
 
 ### 语法
 
 ```text
 DELETE FROM name WHERE column = value { "AND" column = value }
+DELETE FROM name WHERE column IN "(" value { "," value } ")"
 ```
+
+第二种只用于恰好一列主键的表，`column` 必须是那一列。
 
 ### 说明
 
-`WHERE` 只能是主键列的等值，用 `AND` 连起来。每一列恰好出现一次，顺序不限。复合主键必须写全。没有主键、只写了部分主键、多写了别的列、或使用 `OR`，都返回 `syntax: primary key required`。
+等值形式里，每一列主键恰好出现一次，用 `AND` 连接，顺序不限。复合主键必须写全。`IN` 里的值按写出的顺序各成一条墓碑。列表为空、有重复值，或其中任何一个键当前不可见，整句不写，已经可见的行保持原样。重复值返回 `syntax: duplicate key`。缺键返回 `syntax: key not found`。
 
-内置表 `symbols`、`ticks`、`snapshots`、`klines` 返回 `syntax: reserved table`。当前没有这个键返回 `syntax: key not found`。表不存在返回 `symbol not found`。
+没有主键、只写了部分主键、多写了别的列、使用 `OR`，或在多列主键上使用 `IN`，都返回 `syntax: primary key required`。
 
-`SELECT` 和订阅都看不到墓碑之后的这行。重新打开库之后仍然看不到，直到再次插入。
+不是 `CREATE TABLE` 建成的表返回 `syntax: reserved table`。表不存在返回 `symbol not found`。
+
+`SELECT` 看不到墓碑之后的这些行。重新打开库之后仍然看不到，直到再次插入。
 
 ### 示例
 
 ```sql
 DELETE FROM note WHERE id = 1;
+DELETE FROM note WHERE id IN (2, 3);
 ```
 
 ### 兼容性
 
-没有 `DELETE` 不带 `WHERE`、`USING`、`RETURNING`，也不能按非主键列删除。这不是擦掉历史，而是追加一条墓碑。
+没有 `DELETE` 不带 `WHERE`、`USING`、`RETURNING`，也不能按非主键列删除。这不是擦掉历史，而是按键追加墓碑。`IN` 不是一般的过滤条件，只接受这一列主键的字面量列表。
 
 ## SHOW
 

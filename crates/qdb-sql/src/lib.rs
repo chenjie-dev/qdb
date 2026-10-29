@@ -1452,6 +1452,12 @@ fn exec_delete(engine: &mut Engine, tokens: &[String]) -> Result<QueryResult, Sq
         .table_schema(&name)
         .cloned()
         .ok_or(SqlError::NotFound)?;
+    if tokens
+        .get(index + 1)
+        .is_some_and(|token| token.eq_ignore_ascii_case("in"))
+    {
+        return exec_delete_in(engine, tokens, &name, &schema, index);
+    }
     let mut pairs = Vec::new();
     loop {
         let column = tokens
@@ -1515,6 +1521,64 @@ fn exec_delete(engine: &mut Engine, tokens: &[String]) -> Result<QueryResult, Sq
         return Err(SqlError::Syntax("primary key required".into()));
     }
     engine.delete_row(&name, &key).map_err(map_store)?;
+    Ok(QueryResult {
+        columns: vec!["result".into()],
+        rows: vec![vec!["deleted".into()]],
+    })
+}
+
+fn exec_delete_in(
+    engine: &mut Engine,
+    tokens: &[String],
+    name: &str,
+    schema: &TableSchema,
+    mut index: usize,
+) -> Result<QueryResult, SqlError> {
+    let column = tokens
+        .get(index)
+        .ok_or_else(|| SqlError::Syntax("column".into()))?
+        .to_ascii_lowercase();
+    index += 1;
+    expect(tokens, &mut index, "in")?;
+    expect(tokens, &mut index, "(")?;
+    let pk: Vec<&ColumnDef> = schema
+        .columns
+        .iter()
+        .filter(|column| column.primary_key)
+        .collect();
+    if pk.len() != 1 || pk[0].name != column {
+        return Err(SqlError::Syntax("primary key required".into()));
+    }
+    let mut raws = Vec::new();
+    while tokens.get(index).is_some_and(|token| token != ")") {
+        let token = tokens
+            .get(index)
+            .ok_or_else(|| SqlError::Syntax("value".into()))?;
+        let raw = if token == "-" {
+            index += 1;
+            let number = tokens
+                .get(index)
+                .ok_or_else(|| SqlError::Syntax("value".into()))?;
+            index += 1;
+            format!("-{}", unquote(number))
+        } else {
+            index += 1;
+            unquote(token)
+        };
+        raws.push(raw);
+        if tokens.get(index).is_some_and(|token| token == ",") {
+            index += 1;
+        }
+    }
+    expect(tokens, &mut index, ")")?;
+    if index != tokens.len() || raws.is_empty() {
+        return Err(SqlError::Syntax("primary key required".into()));
+    }
+    let keys = raws
+        .iter()
+        .map(|raw| parse_cell(pk[0].ty, raw).map(|cell| vec![cell]))
+        .collect::<Result<Vec<_>, _>>()?;
+    engine.delete_rows(name, &keys).map_err(map_store)?;
     Ok(QueryResult {
         columns: vec!["result".into()],
         rows: vec![vec!["deleted".into()]],

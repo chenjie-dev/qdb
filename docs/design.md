@@ -474,12 +474,15 @@ group       = value { "," value }
 order       = ident ["ASC" | "DESC"] { "," ident ["ASC" | "DESC"] }
 ```
 
-不支持子查询、窗口函数、`WITH` 和 `UPDATE`。`DELETE` 只对调用方建成、并且带主键的表生效：`WHERE` 必须用 `AND` 写全主键列的等值，成功时追加一条墓碑 `seq`，不擦掉已落盘的旧行。没有主键的表，以及不是调用方用 `CREATE TABLE` 建成的表，拒绝删除。`FROM` 可以是任何已登记的表。`JOIN` 见下一节。写入来自调用方提交、恢复和这种墓碑。四则运算只用整数，除法向零截断，不用浮点。`LIKE` 里 `%` 匹配任意长度，`_` 匹配一个字符，`\` 转义。`CASE` 只接受 `WHEN` 条件这种写法。
+不支持子查询、窗口函数、`WITH` 和 `UPDATE`。`DELETE` 只对调用方建成、并且带主键的表生效。单个键写成各主键列的等值，用 `AND` 连起来。单列主键还可以写成 `IN`，一次删多个值。每个值追加自己的墓碑 `seq`，不擦掉已落盘的旧行。列表里有重复值，或其中某个键当前不可见，整句不写。没有主键的表，以及不是调用方用 `CREATE TABLE` 建成的表，拒绝删除。
 
 ```text
 delete      = "DELETE" "FROM" table "WHERE" ident "=" literal
               { "AND" ident "=" literal }
+            | "DELETE" "FROM" table "WHERE" ident "IN" "(" literal { "," literal } ")"
 ```
+
+`FROM` 可以是任何已登记的表。`JOIN` 见下一节。写入来自调用方提交、恢复和这种墓碑。四则运算只用整数，除法向零截断，不用浮点。`LIKE` 里 `%` 匹配任意长度，`_` 匹配一个字符，`\` 转义。`CASE` 只接受 `WHEN` 条件这种写法。
 
 `FROM` 之后可以接 PostgreSQL 风格的连接。`JOIN` 与 `INNER JOIN` 相同，只保留两边都匹配的行。`LEFT JOIN` 保留左表全部行，右边没有匹配时那些列为空文本。`RIGHT JOIN` 相反。`FULL JOIN` 两边都保留。`ON` 是等值条件，多个条件用 `AND`。`NULL` 不等于 `NULL`，空文本对空文本仍然相等。结果先按左表顺序，再补上没有配上的右表行。多表时 `*` 的列名是 `别名.列名`。不支持连接上的聚合。
 
