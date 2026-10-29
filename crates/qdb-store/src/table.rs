@@ -386,6 +386,55 @@ impl TableSet {
         self.insert_values(table, values)
     }
 
+    /// 把表名编码成删除载荷。
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - 要去掉的调用方表名。
+    ///
+    /// # Returns
+    ///
+    /// 小端长度加表名字节。
+    pub fn encode_drop(table: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        push_str(&mut out, table);
+        out
+    }
+
+    /// 按 [`TableSet::encode_drop`] 的载荷去掉表。
+    ///
+    /// 定义、行、主键、二级索引和截止时间都从内存里去掉。WAL 字节不变。表已经不在时失败，避免同一条记录被应用两次。
+    ///
+    /// # Arguments
+    ///
+    /// * `bytes` - [`TableSet::encode_drop`] 的输出。
+    ///
+    /// # Errors
+    ///
+    /// * [`StoreError::NotFound`] - 表不存在。
+    /// * [`StoreError::Schema`] - 表名是引擎登记的四张表之一，或载荷被截断。
+    pub fn drop_encoded(&mut self, bytes: &[u8]) -> Result<(), StoreError> {
+        let mut cursor = 0;
+        let name = take_str(bytes, &mut cursor)?;
+        if cursor != bytes.len() {
+            return Err(StoreError::Schema("truncated".into()));
+        }
+        if BUILTIN_TABLES.contains(&name.as_str()) {
+            return Err(StoreError::Schema("reserved table".into()));
+        }
+        if self.schemas.remove(&name).is_none() {
+            return Err(StoreError::NotFound);
+        }
+        // 行和索引必须一起去掉，否则同名再建时会撞上旧下标。
+        self.rows.remove(&name);
+        self.primary.remove(&name);
+        self.secondary.remove(&name);
+        self.deleted.remove(&name);
+        self.seqs.remove(&name);
+        self.expires.remove(&name);
+        Ok(())
+    }
+
     pub fn insert_schema(&mut self, schema: TableSchema) -> Result<(), StoreError> {
         if self.schemas.contains_key(&schema.name) {
             return Err(StoreError::TableExists);

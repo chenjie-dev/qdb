@@ -54,6 +54,8 @@ pub enum MsgType {
     RowDelete = 10,
     /// 调用方表按期望 `seq` 覆盖当前主键。期望不符时不写入。
     RowReplace = 11,
+    /// 调用方表从内存里去掉。WAL 里的建表记录还在，同名可以再建。
+    TableDrop = 12,
 }
 
 impl MsgType {
@@ -61,7 +63,7 @@ impl MsgType {
     ///
     /// # Arguments
     ///
-    /// * `value` - 1 到 11。其余值没有对应类型。
+    /// * `value` - 1 到 12。其余值没有对应类型。
     ///
     /// # Returns
     ///
@@ -79,6 +81,7 @@ impl MsgType {
             9 => Self::RowInsert,
             10 => Self::RowDelete,
             11 => Self::RowReplace,
+            12 => Self::TableDrop,
             _ => return None,
         })
     }

@@ -56,7 +56,8 @@
 | `syntax: column count` | `INSERT` 的值个数和列数不同，列清单没有写全，或复合主键 `DELETE` 的一行值个数不对 |
 | `syntax: duplicate column` | `INSERT` 的列清单里同一个列名出现了两次 |
 | `syntax: primary key required` | `DELETE` 没有写全主键，或写了主键以外的条件。多列主键不能用单列 `IN` |
-| `syntax: reserved table` | `DELETE` 的对象是 `symbols`、`ticks`、`snapshots` 或 `klines` |
+| `syntax: reserved table` | `DELETE` 或 `DROP TABLE` 的对象是 `symbols`、`ticks`、`snapshots` 或 `klines` |
+| `syntax: drop` | `DROP TABLE` 的名字后面还有别的词 |
 | `syntax: key not found` | `DELETE` 的主键当前没有可见行 |
 | `syntax: seq conflict` | `INSERT ... EXPECT` 的序号不是该主键当前可见序号 |
 | `syntax: seq` | `EXPECT` 后面不是非负整数 |

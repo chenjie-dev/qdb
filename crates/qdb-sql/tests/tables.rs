@@ -704,3 +704,56 @@ fn insert_by_column_list_reorders_values_and_rejects_a_partial_list() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn drop_table_hides_the_name_until_it_is_created_again() {
+    let (dir, mut engine) = open();
+    SqlEngine::execute(
+        &mut engine,
+        "CREATE TABLE note (id INT64 PRIMARY KEY, code STRING)",
+    )
+    .unwrap();
+    SqlEngine::execute(&mut engine, "INSERT INTO note VALUES (1, 'old')").unwrap();
+    let dropped = SqlEngine::execute(&mut engine, "DROP TABLE note").unwrap();
+    assert_eq!(dropped.rows, vec![vec!["dropped".to_string()]]);
+    assert_eq!(
+        message(SqlEngine::execute(&mut engine, "DROP TABLE note").unwrap_err()),
+        "symbol not found"
+    );
+    assert_eq!(
+        message(SqlEngine::execute(&mut engine, "DROP TABLE ticks").unwrap_err()),
+        "syntax: reserved table"
+    );
+    assert!(SqlEngine::new(&engine)
+        .query("SHOW TABLES")
+        .unwrap()
+        .rows
+        .iter()
+        .all(|row| row[0] != "note"));
+    SqlEngine::execute(
+        &mut engine,
+        "CREATE TABLE note (id INT64 PRIMARY KEY, code STRING)",
+    )
+    .unwrap();
+    assert!(SqlEngine::new(&engine)
+        .query("SELECT code FROM note")
+        .unwrap()
+        .rows
+        .is_empty());
+    drop(engine);
+    let mut engine = Engine::open(&dir).unwrap();
+    assert!(SqlEngine::new(&engine)
+        .query("SELECT code FROM note")
+        .unwrap()
+        .rows
+        .is_empty());
+    SqlEngine::execute(&mut engine, "INSERT INTO note VALUES (2, 'new')").unwrap();
+    assert_eq!(
+        SqlEngine::new(&engine)
+            .query("SELECT code FROM note")
+            .unwrap()
+            .rows,
+        vec![vec!["new".to_string()]]
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

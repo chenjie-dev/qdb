@@ -445,6 +445,36 @@ impl Engine {
         self.commit(MsgType::TableSchema, 0, 0, 0, 0, &payload, 0)
     }
 
+    /// 从内存里去掉一张调用方建成的表。
+    ///
+    /// 已经 `fsync` 的建表记录和行留在 WAL 里。这次提交之后，查询、`SHOW TABLES` 和 `DESCRIBE` 都看不到它。同名可以再 `CREATE TABLE`。默认每次调用都 `fsync`。
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - 调用方建成的表名。不能是 `symbols`、`ticks`、`snapshots`、`klines`。
+    ///
+    /// # Returns
+    ///
+    /// 这条删除记录的 `seq`。它不是表里某一行的序号。
+    ///
+    /// # Errors
+    ///
+    /// * [`StoreError::NotFound`] - 表不存在。
+    /// * [`StoreError::Schema`] - 表名是引擎登记的四张表之一。
+    /// * [`StoreError::ReadOnly`] - 引擎是只读打开的。
+    /// * [`StoreError::Crc`] - 打开时 WAL 已损坏，拒绝再写。
+    pub fn drop_table(&mut self, table: &str) -> Result<u64, StoreError> {
+        self.ensure_writable()?;
+        if table::BUILTIN_TABLES.contains(&table) {
+            return Err(StoreError::Schema("reserved table".into()));
+        }
+        if self.tables.schema(table).is_none() {
+            return Err(StoreError::NotFound);
+        }
+        let payload = table::TableSet::encode_drop(table);
+        self.commit(MsgType::TableDrop, 0, 0, 0, 0, &payload, 0)
+    }
+
     /// 按建表时的列顺序插入一行。
     ///
     /// 主键重复时不写入，也不分配 `seq`。成功时这条记录的 `seq` 成为该主键的可见序号。
@@ -1974,6 +2004,11 @@ impl Engine {
             }
             Some(MsgType::RowDelete) => {
                 self.tables.delete_encoded(&record.payload)?;
+                self.agg.note_seq(record.seq)?;
+                Ok(Vec::new())
+            }
+            Some(MsgType::TableDrop) => {
+                self.tables.drop_encoded(&record.payload)?;
                 self.agg.note_seq(record.seq)?;
                 Ok(Vec::new())
             }

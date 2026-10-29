@@ -570,6 +570,33 @@ DELETE FROM pair WHERE (b, a) IN (('y', 2), ('x', 1));
 
 没有 `DELETE` 不带 `WHERE`、`USING`、`RETURNING`，也不能按非主键列删除。这不是擦掉历史，而是按键追加墓碑。单列 `IN` 只接受那一列主键的字面量。多列 `IN` 只接受完整主键的行，不能混进其他列。
 
+## DROP TABLE
+
+从查询里去掉一张调用方建成的表。成功时 `columns` 是 `result`，`rows` 是 `dropped`。语句写入 WAL。
+
+### 语法
+
+```text
+DROP TABLE name
+```
+
+### 说明
+
+已经落盘的建表记录和行留在 WAL 里，不改那些字节。内存里的定义、行、主键和二级索引一起去掉。之后 `SELECT`、`DESCRIBE` 和 `SHOW TABLES` 都看不到这张表。同名可以再 `CREATE TABLE`，新表是空的。
+
+内置表 `symbols`、`ticks`、`snapshots`、`klines` 返回 `syntax: reserved table`。表不存在返回 `symbol not found`。名字后面还有别的词返回 `syntax: drop`。重新打开库之后，表仍然不在。
+
+### 示例
+
+```sql
+DROP TABLE note;
+CREATE TABLE note (id INT64 PRIMARY KEY, code STRING);
+```
+
+### 兼容性
+
+没有 `IF EXISTS`、`CASCADE`，也不能一次删多张表。这不是擦掉历史。
+
 ## EXPIRE AT
 
 按调用方给出的 UTC 纳秒水位，把已经到期的主键收成墓碑。成功时 `columns` 是 `result`，`rows` 是 `expired`。没有命中时也返回这一行，并且不写 WAL。
@@ -760,7 +787,7 @@ WebSocket `GET /v1/ws` 接受同一套 `SELECT`，见 [服务进程](server.md)�
 | 窗口 | `OVER`、`rank`、`lag`、`lead` |
 | 表达式 | 四则以外的函数、正则。`CAST` 只接受 `INT64`、`STRING`、`BOOL` |
 | 谓词 | `SIMILAR TO`、`ANY` / `ALL`、数组 |
-| 写入 | `UPDATE`、`TRUNCATE`、`ALTER`、`DROP`、`COPY`。`DELETE` 只按主键追加墓碑 |
+| 写入 | `UPDATE`、`TRUNCATE`、`ALTER`、`COPY`。`DELETE` 只按主键追加墓碑。`DROP TABLE` 只去掉调用方建成的表 |
 | 目录 | `information_schema`、`pg_catalog` |
 | 协议 | 预编译语句、参数绑定、PostgreSQL 线协议 |
 

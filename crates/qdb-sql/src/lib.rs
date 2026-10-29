@@ -50,18 +50,18 @@ impl<'a> SqlEngine<'a> {
         Self { engine }
     }
 
-    /// 执行一条语句。`CREATE`、`INSERT` 和 `DELETE` 写入 WAL，其余交给 [`SqlEngine::query`]。
+    /// 执行一条语句。`CREATE`、`INSERT`、`DELETE` 和 `DROP TABLE` 写入 WAL，其余交给 [`SqlEngine::query`]。
     ///
     /// 末尾分号会被去掉。写入语句在默认组提交下会 `fsync`。`INSERT ... EXPECT n` 在序号不符时不写 WAL。一条 `INSERT` 写多行时，后一行失败则整句不写。`INSERT INTO t (列, ...)` 的列必须是建表列的一个排列，缺列、重复列或未知列不写 WAL。`DELETE ... IN` 在任一键不可见或列表有重复时也不写。复合主键的 `IN` 用 `(列, ...) IN ((值, ...), ...)`，值按写出的列对齐后再排成建表时的主键顺序。
     ///
     /// # Arguments
     ///
-    /// * `engine` - 可写引擎。只读打开时建表、插入、条件覆盖和删除都会失败。
+    /// * `engine` - 可写引擎。只读打开时建表、插入、条件覆盖、删除和删表都会失败。
     /// * `sql` - 一条语句。
     ///
     /// # Returns
     ///
-    /// 查询返回行。建表成功时 `rows` 是 `created`，插入和条件覆盖是 `inserted`，删除是 `deleted`。
+    /// 查询返回行。建表成功时 `rows` 是 `created`，插入和条件覆盖是 `inserted`，删除是 `deleted`，删表是 `dropped`。删表不擦 WAL 里已经落盘的定义和行。
     ///
     /// # Errors
     ///
@@ -83,6 +83,9 @@ impl<'a> SqlEngine<'a> {
         }
         if head == "delete" {
             return exec_delete(engine, &tokens);
+        }
+        if head == "drop" {
+            return exec_drop(engine, &tokens);
         }
         if head == "expire" {
             return exec_expire(engine, &tokens);
@@ -1566,6 +1569,25 @@ fn exec_create(engine: &mut Engine, tokens: &[String]) -> Result<QueryResult, Sq
     Ok(QueryResult {
         columns: vec!["result".into()],
         rows: vec![vec!["created".into()]],
+    })
+}
+
+fn exec_drop(engine: &mut Engine, tokens: &[String]) -> Result<QueryResult, SqlError> {
+    let mut index = 0;
+    expect(tokens, &mut index, "drop")?;
+    expect(tokens, &mut index, "table")?;
+    let name = tokens
+        .get(index)
+        .ok_or_else(|| SqlError::Syntax("table".into()))?
+        .to_ascii_lowercase();
+    index += 1;
+    if index != tokens.len() {
+        return Err(SqlError::Syntax("drop".into()));
+    }
+    engine.drop_table(&name).map_err(map_store)?;
+    Ok(QueryResult {
+        columns: vec!["result".into()],
+        rows: vec![vec!["dropped".into()]],
     })
 }
 
