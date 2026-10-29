@@ -475,6 +475,36 @@ impl Engine {
         self.commit(MsgType::TableDrop, 0, 0, 0, 0, &payload, 0)
     }
 
+    /// 清掉一张调用方建成的表里当前可见的行。
+    ///
+    /// 表定义还在。已经 `fsync` 的行留在 WAL 里，查询不再返回它们。之后可以再 `INSERT`。默认每次调用都 `fsync`。空表也写一条记录。
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - 调用方建成的表名。不能是 `symbols`、`ticks`、`snapshots`、`klines`。
+    ///
+    /// # Returns
+    ///
+    /// 这条清空记录的 `seq`。它不是某一行原来的序号。
+    ///
+    /// # Errors
+    ///
+    /// * [`StoreError::NotFound`] - 表不存在。
+    /// * [`StoreError::Schema`] - 表名是引擎登记的四张表之一。
+    /// * [`StoreError::ReadOnly`] - 引擎是只读打开的。
+    /// * [`StoreError::Crc`] - 打开时 WAL 已损坏，拒绝再写。
+    pub fn truncate_table(&mut self, table: &str) -> Result<u64, StoreError> {
+        self.ensure_writable()?;
+        if table::BUILTIN_TABLES.contains(&table) {
+            return Err(StoreError::Schema("reserved table".into()));
+        }
+        if self.tables.schema(table).is_none() {
+            return Err(StoreError::NotFound);
+        }
+        let payload = table::TableSet::encode_truncate(table);
+        self.commit(MsgType::TableTruncate, 0, 0, 0, 0, &payload, 0)
+    }
+
     /// 按建表时的列顺序插入一行。
     ///
     /// 主键重复时不写入，也不分配 `seq`。成功时这条记录的 `seq` 成为该主键的可见序号。
@@ -2009,6 +2039,11 @@ impl Engine {
             }
             Some(MsgType::TableDrop) => {
                 self.tables.drop_encoded(&record.payload)?;
+                self.agg.note_seq(record.seq)?;
+                Ok(Vec::new())
+            }
+            Some(MsgType::TableTruncate) => {
+                self.tables.truncate_encoded(&record.payload)?;
                 self.agg.note_seq(record.seq)?;
                 Ok(Vec::new())
             }

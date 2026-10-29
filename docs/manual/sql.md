@@ -597,6 +597,33 @@ CREATE TABLE note (id INT64 PRIMARY KEY, code STRING);
 
 没有 `IF EXISTS`、`CASCADE`，也不能一次删多张表。这不是擦掉历史。
 
+## TRUNCATE TABLE
+
+清掉一张调用方建成的表里当前可见的行。成功时 `columns` 是 `result`，`rows` 是 `truncated`。语句写入 WAL。表定义还在。
+
+### 语法
+
+```text
+TRUNCATE TABLE name
+```
+
+### 说明
+
+已经落盘的行留在 WAL 里，不改那些字节。内存里的行、主键下标和二级索引清空，列定义保留。之后 `SELECT` 得到零行，`DESCRIBE` 和 `SHOW TABLES` 仍能看到这张表，可以再 `INSERT`。没有主键的表同样被清空。空表也会写一条记录。
+
+内置表返回 `syntax: reserved table`。表不存在返回 `symbol not found`。名字后面还有别的词返回 `syntax: truncate`。重新打开库之后，清空前的行仍然不可见。
+
+### 示例
+
+```sql
+TRUNCATE TABLE note;
+INSERT INTO note VALUES (1, 'again', true);
+```
+
+### 兼容性
+
+没有 `RESTART IDENTITY`、`CASCADE`，也不能一次清空多张表。这不是擦掉历史。
+
 ## EXPIRE AT
 
 按调用方给出的 UTC 纳秒水位，把已经到期的主键收成墓碑。成功时 `columns` 是 `result`，`rows` 是 `expired`。没有命中时也返回这一行，并且不写 WAL。
@@ -787,7 +814,7 @@ WebSocket `GET /v1/ws` 接受同一套 `SELECT`，见 [服务进程](server.md)�
 | 窗口 | `OVER`、`rank`、`lag`、`lead` |
 | 表达式 | 四则以外的函数、正则。`CAST` 只接受 `INT64`、`STRING`、`BOOL` |
 | 谓词 | `SIMILAR TO`、`ANY` / `ALL`、数组 |
-| 写入 | `UPDATE`、`TRUNCATE`、`ALTER`、`COPY`。`DELETE` 只按主键追加墓碑。`DROP TABLE` 只去掉调用方建成的表 |
+| 写入 | `UPDATE`、`ALTER`、`COPY`。`DELETE` 只按主键追加墓碑。`DROP TABLE` 去掉调用方建成的表。`TRUNCATE TABLE` 只清掉可见行 |
 | 目录 | `information_schema`、`pg_catalog` |
 | 协议 | 预编译语句、参数绑定、PostgreSQL 线协议 |
 

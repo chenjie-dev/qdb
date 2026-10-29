@@ -56,6 +56,8 @@ pub enum MsgType {
     RowReplace = 11,
     /// 调用方表从内存里去掉。WAL 里的建表记录还在，同名可以再建。
     TableDrop = 12,
+    /// 调用方表的可见行从内存里去掉。表定义还在，已经落盘的行留在 WAL 里。
+    TableTruncate = 13,
 }
 
 impl MsgType {
@@ -63,7 +65,7 @@ impl MsgType {
     ///
     /// # Arguments
     ///
-    /// * `value` - 1 到 12。其余值没有对应类型。
+    /// * `value` - 1 到 13。其余值没有对应类型。
     ///
     /// # Returns
     ///
@@ -82,6 +84,7 @@ impl MsgType {
             10 => Self::RowDelete,
             11 => Self::RowReplace,
             12 => Self::TableDrop,
+            13 => Self::TableTruncate,
             _ => return None,
         })
     }

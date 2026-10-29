@@ -757,3 +757,64 @@ fn drop_table_hides_the_name_until_it_is_created_again() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn truncate_keeps_the_table_and_drops_visible_rows() {
+    let (dir, mut engine) = open();
+    SqlEngine::execute(
+        &mut engine,
+        "CREATE TABLE note (id INT64 PRIMARY KEY, code STRING, INDEX idx_code (code))",
+    )
+    .unwrap();
+    SqlEngine::execute(&mut engine, "CREATE TABLE log (id INT64, code STRING)").unwrap();
+    SqlEngine::execute(&mut engine, "INSERT INTO note VALUES (1, 'old')").unwrap();
+    SqlEngine::execute(&mut engine, "INSERT INTO log VALUES (1, 'old'), (2, 'old')").unwrap();
+    let truncated = SqlEngine::execute(&mut engine, "TRUNCATE TABLE note").unwrap();
+    assert_eq!(truncated.rows, vec![vec!["truncated".to_string()]]);
+    SqlEngine::execute(&mut engine, "TRUNCATE TABLE log").unwrap();
+    assert!(SqlEngine::new(&engine)
+        .query("SELECT code FROM note")
+        .unwrap()
+        .rows
+        .is_empty());
+    assert!(SqlEngine::new(&engine)
+        .query("SELECT code FROM log")
+        .unwrap()
+        .rows
+        .is_empty());
+    assert_eq!(
+        SqlEngine::new(&engine)
+            .query("DESCRIBE note")
+            .unwrap()
+            .rows
+            .first()
+            .map(|row| row[0].clone()),
+        Some("id".to_string())
+    );
+    assert_eq!(
+        message(SqlEngine::execute(&mut engine, "TRUNCATE TABLE ticks").unwrap_err()),
+        "syntax: reserved table"
+    );
+    assert_eq!(
+        message(SqlEngine::execute(&mut engine, "TRUNCATE TABLE missing").unwrap_err()),
+        "symbol not found"
+    );
+    SqlEngine::execute(&mut engine, "INSERT INTO note VALUES (3, 'new')").unwrap();
+    assert_eq!(
+        SqlEngine::new(&engine)
+            .query("SELECT id FROM note WHERE code = 'new'")
+            .unwrap()
+            .rows,
+        vec![vec!["3".to_string()]]
+    );
+    drop(engine);
+    let engine = Engine::open(&dir).unwrap();
+    assert_eq!(
+        SqlEngine::new(&engine)
+            .query("SELECT code FROM note")
+            .unwrap()
+            .rows,
+        vec![vec!["new".to_string()]]
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

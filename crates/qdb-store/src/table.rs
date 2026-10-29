@@ -435,6 +435,59 @@ impl TableSet {
         Ok(())
     }
 
+    /// 把表名编码成清空载荷。
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - 要清空的调用方表名。
+    ///
+    /// # Returns
+    ///
+    /// 小端长度加表名字节。格式与 [`TableSet::encode_drop`] 相同，消息类型不同。
+    pub fn encode_truncate(table: &str) -> Vec<u8> {
+        Self::encode_drop(table)
+    }
+
+    /// 按 [`TableSet::encode_truncate`] 的载荷清掉可见行。
+    ///
+    /// 表定义留下。行、主键下标、截止时间和墓碑下标清掉，二级索引按原列重建成空表。WAL 字节不变。表不在时失败。
+    ///
+    /// # Arguments
+    ///
+    /// * `bytes` - [`TableSet::encode_truncate`] 的输出。
+    ///
+    /// # Errors
+    ///
+    /// * [`StoreError::NotFound`] - 表不存在。
+    /// * [`StoreError::Schema`] - 表名是引擎登记的四张表之一，或载荷被截断。
+    pub fn truncate_encoded(&mut self, bytes: &[u8]) -> Result<(), StoreError> {
+        let mut cursor = 0;
+        let name = take_str(bytes, &mut cursor)?;
+        if cursor != bytes.len() {
+            return Err(StoreError::Schema("truncated".into()));
+        }
+        if BUILTIN_TABLES.contains(&name.as_str()) {
+            return Err(StoreError::Schema("reserved table".into()));
+        }
+        let schema = self
+            .schemas
+            .get(&name)
+            .cloned()
+            .ok_or(StoreError::NotFound)?;
+        self.rows.insert(name.clone(), Vec::new());
+        self.primary.insert(name.clone(), HashMap::new());
+        self.deleted.remove(&name);
+        self.seqs.remove(&name);
+        self.expires.remove(&name);
+        // 二级索引按原列重建成空表，下次插入不会用到清空前的下标。
+        let mut secondary = HashMap::new();
+        for index in &schema.indexes {
+            secondary.insert(index.column.clone(), HashMap::new());
+        }
+        self.secondary.insert(name, secondary);
+        Ok(())
+    }
+
     pub fn insert_schema(&mut self, schema: TableSchema) -> Result<(), StoreError> {
         if self.schemas.contains_key(&schema.name) {
             return Err(StoreError::TableExists);

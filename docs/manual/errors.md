@@ -58,6 +58,7 @@
 | `syntax: primary key required` | `DELETE` 没有写全主键，或写了主键以外的条件。多列主键不能用单列 `IN` |
 | `syntax: reserved table` | `DELETE` 或 `DROP TABLE` 的对象是 `symbols`、`ticks`、`snapshots` 或 `klines` |
 | `syntax: drop` | `DROP TABLE` 的名字后面还有别的词 |
+| `syntax: truncate` | `TRUNCATE TABLE` 的名字后面还有别的词 |
 | `syntax: key not found` | `DELETE` 的主键当前没有可见行 |
 | `syntax: seq conflict` | `INSERT ... EXPECT` 的序号不是该主键当前可见序号 |
 | `syntax: seq` | `EXPECT` 后面不是非负整数 |
