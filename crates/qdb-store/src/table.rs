@@ -704,6 +704,40 @@ impl TableSet {
         ))
     }
 
+    /// 读取这个主键当前可见的整行。
+    ///
+    /// 只查内存里的主键索引，不读 WAL，也不分配新序号。墓碑之后返回 `None`。单元格按建表时的列顺序排列，不含查询结果末尾的 `seq`。
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - 已登记的表名。
+    /// * `key` - 主键列的值，顺序和个数都要与建表时的主键列一致。
+    ///
+    /// # Returns
+    ///
+    /// `Some` 是当前可见行。`None` 表示这个键现在没有可见行。
+    ///
+    /// # Errors
+    ///
+    /// 与 [`TableSet::visible_seq`] 相同。主键索引和行槽不一致时返回 [`StoreError::KeyNotFound`]。
+    pub fn visible_row(&self, table: &str, key: &[Cell]) -> Result<Option<Vec<Cell>>, StoreError> {
+        if self.visible_seq(table, key)?.is_none() {
+            return Ok(None);
+        }
+        let index = self
+            .primary
+            .get(table)
+            .and_then(|index| index.get(&key_bytes(key)).copied())
+            .ok_or(StoreError::KeyNotFound)?;
+        let row = self
+            .rows
+            .get(table)
+            .and_then(|rows| rows.get(index))
+            .cloned()
+            .ok_or(StoreError::KeyNotFound)?;
+        Ok(Some(row))
+    }
+
     /// 把一次条件覆盖编码成 WAL 载荷。
     ///
     /// 不写盘。载荷前 8 字节是期望序号，后面是与 [`TableSet::encode_row`] 相同的行。`expected` 必须大于 0，并且等于这个主键的可见序号。

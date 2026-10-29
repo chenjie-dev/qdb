@@ -1,4 +1,4 @@
-//! 调用方建成的表。期望来自手册里的建表、插入、删除和 `seq`，不从实现再推一遍。
+//! 调用方建成的表。期望来自手册里的建表、插入、更新、删除和 `seq`，不从实现再推一遍。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -815,6 +815,189 @@ fn truncate_keeps_the_table_and_drops_visible_rows() {
             .unwrap()
             .rows,
         vec![vec!["new".to_string()]]
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn update_replaces_non_key_columns_and_keeps_the_deadline() {
+    let (dir, mut engine) = open();
+    SqlEngine::execute(
+        &mut engine,
+        "CREATE TABLE note (id INT64 PRIMARY KEY, code STRING, n INT64, active BOOL, INDEX idx_code (code))",
+    )
+    .unwrap();
+    SqlEngine::execute(&mut engine, "CREATE TABLE log (id INT64, code STRING)").unwrap();
+    SqlEngine::execute(
+        &mut engine,
+        "CREATE TABLE swap (id INT64 PRIMARY KEY, left_n INT64, right_n INT64)",
+    )
+    .unwrap();
+    SqlEngine::execute(
+        &mut engine,
+        "CREATE TABLE pair (a INT64 PRIMARY KEY, b INT64 PRIMARY KEY, name STRING)",
+    )
+    .unwrap();
+    SqlEngine::execute(
+        &mut engine,
+        "INSERT INTO note VALUES (1, 'old', 1, true) EXPIRE AT 100",
+    )
+    .unwrap();
+    SqlEngine::execute(&mut engine, "INSERT INTO note VALUES (2, 'b', 5, true)").unwrap();
+    let before = SqlEngine::new(&engine)
+        .query("SELECT seq FROM note WHERE id = 1")
+        .unwrap();
+    let updated = SqlEngine::execute(
+        &mut engine,
+        "UPDATE note SET code = 'new', n = n + 1, active = false WHERE id = 1",
+    )
+    .unwrap();
+    assert_eq!(updated.rows, vec![vec!["updated".to_string()]]);
+    assert_eq!(
+        SqlEngine::new(&engine)
+            .query("SELECT code, n, active FROM note WHERE id = 1")
+            .unwrap()
+            .rows,
+        vec![vec![
+            "new".to_string(),
+            "2".to_string(),
+            "false".to_string()
+        ]]
+    );
+    assert!(SqlEngine::new(&engine)
+        .query("SELECT id FROM note WHERE code = 'old'")
+        .unwrap()
+        .rows
+        .is_empty());
+    assert_eq!(
+        SqlEngine::new(&engine)
+            .query("SELECT id FROM note WHERE code = 'new'")
+            .unwrap()
+            .rows,
+        vec![vec!["1".to_string()]]
+    );
+    let after = SqlEngine::new(&engine)
+        .query("SELECT seq FROM note WHERE id = 1")
+        .unwrap();
+    assert_ne!(before.rows, after.rows);
+    assert_eq!(
+        message(
+            SqlEngine::execute(&mut engine, "UPDATE note SET n = 0 WHERE id IN (1, 9)")
+                .unwrap_err()
+        ),
+        "syntax: key not found"
+    );
+    assert_eq!(
+        SqlEngine::new(&engine)
+            .query("SELECT n FROM note WHERE id = 1")
+            .unwrap()
+            .rows,
+        vec![vec!["2".to_string()]]
+    );
+    assert_eq!(
+        message(
+            SqlEngine::execute(&mut engine, "UPDATE note SET id = 9 WHERE id = 1").unwrap_err()
+        ),
+        "syntax: primary key required"
+    );
+    assert_eq!(
+        message(
+            SqlEngine::execute(&mut engine, "UPDATE note SET code = null WHERE id = 1")
+                .unwrap_err()
+        ),
+        "syntax: null"
+    );
+    assert_eq!(
+        message(
+            SqlEngine::execute(
+                &mut engine,
+                "UPDATE note SET code = 'a', code = 'b' WHERE id = 1"
+            )
+            .unwrap_err()
+        ),
+        "syntax: duplicate column"
+    );
+    assert_eq!(
+        message(
+            SqlEngine::execute(&mut engine, "UPDATE log SET code = 'x' WHERE id = 1").unwrap_err()
+        ),
+        "syntax: primary key required"
+    );
+    assert_eq!(
+        message(
+            SqlEngine::execute(&mut engine, "UPDATE ticks SET price = 1 WHERE seq = 1")
+                .unwrap_err()
+        ),
+        "syntax: reserved table"
+    );
+    assert_eq!(
+        message(
+            SqlEngine::execute(&mut engine, "UPDATE missing SET code = 'x' WHERE id = 1")
+                .unwrap_err()
+        ),
+        "symbol not found"
+    );
+    assert_eq!(
+        message(
+            SqlEngine::execute(&mut engine, "UPDATE note SET nope = 1 WHERE id = 1").unwrap_err()
+        ),
+        "syntax: unknown column nope"
+    );
+    SqlEngine::execute(&mut engine, "INSERT INTO swap VALUES (1, 1, 2)").unwrap();
+    SqlEngine::execute(
+        &mut engine,
+        "UPDATE swap SET left_n = right_n, right_n = left_n WHERE id = 1",
+    )
+    .unwrap();
+    assert_eq!(
+        SqlEngine::new(&engine)
+            .query("SELECT left_n, right_n FROM swap")
+            .unwrap()
+            .rows,
+        vec![vec!["2".to_string(), "1".to_string()]]
+    );
+    SqlEngine::execute(&mut engine, "INSERT INTO pair VALUES (1, 2, 'old')").unwrap();
+    SqlEngine::execute(
+        &mut engine,
+        "UPDATE pair SET name = 'renamed' WHERE (b, a) IN ((2, 1))",
+    )
+    .unwrap();
+    assert_eq!(
+        SqlEngine::new(&engine)
+            .query("SELECT name FROM pair")
+            .unwrap()
+            .rows,
+        vec![vec!["renamed".to_string()]]
+    );
+    SqlEngine::execute(&mut engine, "EXPIRE AT 100").unwrap();
+    assert!(SqlEngine::new(&engine)
+        .query("SELECT id FROM note WHERE id = 1")
+        .unwrap()
+        .rows
+        .is_empty());
+    assert_eq!(
+        SqlEngine::new(&engine)
+            .query("SELECT code FROM note WHERE id = 2")
+            .unwrap()
+            .rows,
+        vec![vec!["b".to_string()]]
+    );
+    drop(engine);
+    let mut reader = Engine::open_read(&dir).unwrap();
+    assert_eq!(
+        message(
+            SqlEngine::execute(&mut reader, "UPDATE swap SET left_n = 0 WHERE id = 1").unwrap_err()
+        ),
+        "read-only connection"
+    );
+    drop(reader);
+    let engine = Engine::open(&dir).unwrap();
+    assert_eq!(
+        SqlEngine::new(&engine)
+            .query("SELECT left_n FROM swap")
+            .unwrap()
+            .rows,
+        vec![vec!["2".to_string()]]
     );
     let _ = std::fs::remove_dir_all(dir);
 }

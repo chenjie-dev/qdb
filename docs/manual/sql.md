@@ -570,6 +570,38 @@ DELETE FROM pair WHERE (b, a) IN (('y', 2), ('x', 1));
 
 没有 `DELETE` 不带 `WHERE`、`USING`、`RETURNING`，也不能按非主键列删除。这不是擦掉历史，而是按键追加墓碑。单列 `IN` 只接受那一列主键的字面量。多列 `IN` 只接受完整主键的行，不能混进其他列。
 
+## UPDATE
+
+按完整主键覆盖调用方建成的表里当前可见行的非主键列。成功时 `columns` 是 `result`，`rows` 是 `updated`。每个键写入自己的 WAL 记录，分配新的 `seq`。已经落盘的旧行留在日志里。查询返回覆盖后的单元格，以及新的 `seq`。
+
+### 语法
+
+```text
+UPDATE name SET column = expr { "," column = expr } WHERE key
+```
+
+`WHERE` 的三种写法和 [`DELETE`](#delete) 相同：各主键列的等值、单列主键的 `IN`、复合主键的行 `IN`。`expr` 与 `SELECT` 里的值表达式相同，可以引用本行的列。
+
+### 说明
+
+`SET` 至少写一列，而且不能写主键列。同一个列名不能出现两次。右边先按覆盖前的整行求值，再一起写回，所以 `SET left_n = right_n, right_n = left_n` 会交换两列。没被赋值的列保持原值。截止时间也不变。二级索引改用新值。
+
+列表为空、有重复键，或其中任何一个键当前不可见，整句不写，已经可见的行保持原样。重复键返回 `syntax: duplicate key`。缺键返回 `syntax: key not found`。表达式结果是空值时返回 `syntax: null`，空字符串仍可写入 `STRING` 列。结果对不上列类型时返回 `syntax: cast` 或 `syntax: type mismatch`。主键列出现在 `SET` 里、`WHERE` 不是完整主键，或表没有主键，都返回 `syntax: primary key required`。未知列返回 `syntax: unknown column 名称`。
+
+内置表返回 `syntax: reserved table`。表不存在返回 `symbol not found`。只读打开的引擎拒绝这条语句。重新打开库之后，看到的是覆盖后的行。
+
+### 示例
+
+```sql
+UPDATE note SET code = 'new', active = false WHERE id = 1;
+UPDATE note SET n = n + 1 WHERE id IN (1, 2);
+UPDATE pair SET name = 'renamed' WHERE (b, a) IN ((2, 1));
+```
+
+### 兼容性
+
+没有不带 `WHERE` 的 `UPDATE`，没有 `FROM`、`RETURNING`，也不能改主键列，也不能按非主键列选择要覆盖的行。这不是改 WAL 里的旧字节，而是再写一条覆盖。
+
 ## DROP TABLE
 
 从查询里去掉一张调用方建成的表。成功时 `columns` 是 `result`，`rows` 是 `dropped`。语句写入 WAL。
@@ -814,7 +846,7 @@ WebSocket `GET /v1/ws` 接受同一套 `SELECT`，见 [服务进程](server.md)�
 | 窗口 | `OVER`、`rank`、`lag`、`lead` |
 | 表达式 | 四则以外的函数、正则。`CAST` 只接受 `INT64`、`STRING`、`BOOL` |
 | 谓词 | `SIMILAR TO`、`ANY` / `ALL`、数组 |
-| 写入 | `UPDATE`、`ALTER`、`COPY`。`DELETE` 只按主键追加墓碑。`DROP TABLE` 去掉调用方建成的表。`TRUNCATE TABLE` 只清掉可见行 |
+| 写入 | `ALTER`、`COPY`。`UPDATE` 只按完整主键改非主键列。`DELETE` 只按主键追加墓碑。`DROP TABLE` 去掉调用方建成的表。`TRUNCATE TABLE` 只清掉可见行 |
 | 目录 | `information_schema`、`pg_catalog` |
 | 协议 | 预编译语句、参数绑定、PostgreSQL 线协议 |
 

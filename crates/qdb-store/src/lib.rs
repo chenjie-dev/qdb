@@ -402,6 +402,29 @@ impl Engine {
             .collect()
     }
 
+    /// 读取调用方表里这个主键当前可见的整行。
+    ///
+    /// 不写 WAL，不分配 `seq`。墓碑之后的键与从未插入过一样，返回 `None`。
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - 调用方建成的表。
+    /// * `key` - 主键列的值，顺序与建表时的主键列一致。
+    ///
+    /// # Returns
+    ///
+    /// 当前可见行，列顺序与建表时一致。没有可见行时为 `None`。
+    ///
+    /// # Errors
+    ///
+    /// * [`StoreError::NotFound`] - 表不存在。
+    /// * [`StoreError::Schema`] - 没有主键，或值的个数不对。
+    /// * [`StoreError::TypeMismatch`] - 值的类型和主键列不一致。
+    /// * [`StoreError::KeyNotFound`] - 主键索引指向的行槽不存在。
+    pub fn visible_row(&self, table: &str, key: &[Cell]) -> Result<Option<Vec<Cell>>, StoreError> {
+        self.tables.visible_row(table, key)
+    }
+
     /// 读取一张表的列和索引定义。
     ///
     /// `symbols`、`ticks`、`snapshots`、`klines` 是引擎登记的普通表。其余名字来自 `CREATE TABLE`。
@@ -784,6 +807,85 @@ impl Engine {
         let mut seqs = Vec::with_capacity(payloads.len());
         for payload in &payloads {
             seqs.push(self.commit(MsgType::RowDelete, 0, 0, 0, 0, payload, 0)?);
+        }
+        Ok(seqs)
+    }
+
+    /// 按主键覆盖多行已经可见的数据。
+    ///
+    /// 每一行必须带齐列，主键列仍指向当前那一行。先按各自的可见序号把覆盖编码完，再逐条提交。后一行类型不对、键不可见或主键重复时，前面的行也不写 WAL。每条覆盖分配新的 `seq`，行留在原来的槽位。载荷里不带截止时间，已经记下的期限保持不变。已经落盘的旧字节留在 WAL 里。默认每一条都会 `fsync`，除非组提交还没凑满。可见序号为 0 的旧快照行不能覆盖。
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - 调用方建成、并且带主键的表。
+    /// * `rows` - 覆盖后的整行，列顺序与建表时一致。至少一行。
+    ///
+    /// # Returns
+    ///
+    /// 每条覆盖记录的 `seq`，顺序与 `rows` 相同。这是该主键下一次的可见序号。
+    ///
+    /// # Errors
+    ///
+    /// * [`StoreError::NotFound`] - 表不存在。
+    /// * [`StoreError::Schema`] - 表是引擎登记的四张表之一、没有主键、列数不对、字符串超过 1024 字节，或列表里主键重复。
+    /// * [`StoreError::TypeMismatch`] - 某个值的类型和列定义不一致。
+    /// * [`StoreError::KeyNotFound`] - 某个主键当前没有可见行。
+    /// * [`StoreError::Conflict`] - 可见序号是 0，或编码之后序号已经对不上。
+    /// * [`StoreError::ReadOnly`] - 引擎是只读打开的。
+    /// * [`StoreError::Crc`] - 打开时 WAL 已损坏，拒绝再写。
+    pub fn replace_rows(
+        &mut self,
+        table: &str,
+        rows: &[Vec<Cell>],
+    ) -> Result<Vec<u64>, StoreError> {
+        self.ensure_writable()?;
+        if table::BUILTIN_TABLES.contains(&table) {
+            return Err(StoreError::Schema("reserved table".into()));
+        }
+        if rows.is_empty() {
+            return Err(StoreError::Schema("primary key required".into()));
+        }
+        let schema = self
+            .tables
+            .schema(table)
+            .cloned()
+            .ok_or(StoreError::NotFound)?;
+        let pk_at: Vec<usize> = schema
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| column.primary_key)
+            .map(|(index, _)| index)
+            .collect();
+        if pk_at.is_empty() {
+            return Err(StoreError::Schema("primary key required".into()));
+        }
+        let mut keys = Vec::with_capacity(rows.len());
+        for row in rows {
+            if row.len() != schema.columns.len() {
+                return Err(StoreError::Schema("column count".into()));
+            }
+            let key: Vec<Cell> = pk_at.iter().map(|index| row[*index].clone()).collect();
+            if keys.iter().any(|earlier| earlier == &key) {
+                return Err(StoreError::Schema("duplicate key".into()));
+            }
+            if self.tables.visible_seq(table, &key)?.is_none() {
+                return Err(StoreError::KeyNotFound);
+            }
+            keys.push(key);
+        }
+        // 编码只核对可见序号和类型。通过之后再逐条提交，避免后一行失败时前一行已经覆盖。
+        let mut payloads = Vec::with_capacity(rows.len());
+        for (row, key) in rows.iter().zip(&keys) {
+            let expected = self
+                .tables
+                .visible_seq(table, key)?
+                .ok_or(StoreError::KeyNotFound)?;
+            payloads.push(self.tables.encode_expect(table, row, expected, None)?);
+        }
+        let mut seqs = Vec::with_capacity(payloads.len());
+        for payload in &payloads {
+            seqs.push(self.commit(MsgType::RowReplace, 0, 0, 0, 0, payload, 0)?);
         }
         Ok(seqs)
     }

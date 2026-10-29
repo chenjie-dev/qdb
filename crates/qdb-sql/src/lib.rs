@@ -1,4 +1,4 @@
-//! 只读 SQL 子集，以及 `CREATE TABLE`、`INSERT`（含 `EXPECT`）和按主键的 `DELETE`。
+//! 只读 SQL 子集，以及 `CREATE TABLE`、`INSERT`（含 `EXPECT`）、按主键的 `UPDATE` 和 `DELETE`。
 //!
 //! 语法边界见 `docs/manual/sql.md`。`WHERE`、表达式、`CASE`、`COALESCE`、`NULLIF`、`GROUP BY`、`HAVING`、`DISTINCT`、`UNION`、`INTERSECT`、`EXCEPT` 和 `ORDER BY` 都会生效。
 #![forbid(unsafe_code)]
@@ -23,7 +23,7 @@ pub enum SqlError {
 
 /// 在一个 [`Engine`] 上跑 SQL。
 ///
-/// [`SqlEngine::query`] 只读。`CREATE TABLE`、`INSERT` 和 `DELETE` 走 [`SqlEngine::execute`]，需要可写引擎。
+/// [`SqlEngine::query`] 只读。`CREATE TABLE`、`INSERT`、`UPDATE` 和 `DELETE` 走 [`SqlEngine::execute`]，需要可写引擎。
 /// 语法以 `docs/manual/sql.md` 为准。
 pub struct SqlEngine<'a> {
     engine: &'a Engine,
@@ -61,7 +61,7 @@ impl<'a> SqlEngine<'a> {
     ///
     /// # Returns
     ///
-    /// 查询返回行。建表成功时 `rows` 是 `created`，插入和条件覆盖是 `inserted`，删除是 `deleted`，删表是 `dropped`，清空表是 `truncated`。删表和清空都不擦 WAL 里已经落盘的行。清空后表定义还在。
+    /// 查询返回行。建表成功时 `rows` 是 `created`，插入和条件覆盖是 `inserted`，更新是 `updated`，删除是 `deleted`，删表是 `dropped`，清空表是 `truncated`。更新只改非主键列，并分配新的 `seq`。删表和清空都不擦 WAL 里已经落盘的行。清空后表定义还在。
     ///
     /// # Errors
     ///
@@ -80,6 +80,9 @@ impl<'a> SqlEngine<'a> {
         }
         if head == "insert" {
             return exec_insert(engine, &tokens);
+        }
+        if head == "update" {
+            return exec_update(engine, &tokens);
         }
         if head == "delete" {
             return exec_delete(engine, &tokens);
@@ -1817,6 +1820,89 @@ fn exec_expire(engine: &mut Engine, tokens: &[String]) -> Result<QueryResult, Sq
     })
 }
 
+fn exec_update(engine: &mut Engine, tokens: &[String]) -> Result<QueryResult, SqlError> {
+    let mut index = 0;
+    expect(tokens, &mut index, "update")?;
+    let name = tokens
+        .get(index)
+        .ok_or_else(|| SqlError::Syntax("update".into()))?
+        .to_ascii_lowercase();
+    index += 1;
+    // 内置表的列定义能被 DESCRIBE 看见，但行不在调用方表里。先拒绝，避免把「没有这行」说成缺键。
+    if matches!(name.as_str(), "symbols" | "ticks" | "snapshots" | "klines") {
+        return Err(SqlError::Syntax("reserved table".into()));
+    }
+    expect(tokens, &mut index, "set")?;
+    let schema = engine
+        .table_schema(&name)
+        .cloned()
+        .ok_or(SqlError::NotFound)?;
+    let mut assignments = Vec::new();
+    loop {
+        let column = tokens
+            .get(index)
+            .ok_or_else(|| SqlError::Syntax("column".into()))?
+            .to_ascii_lowercase();
+        index += 1;
+        expect(tokens, &mut index, "=")?;
+        assignments.push((column, parse_add(tokens, &mut index)?));
+        if tokens.get(index).is_some_and(|token| token == ",") {
+            index += 1;
+            continue;
+        }
+        break;
+    }
+    expect(tokens, &mut index, "where")?;
+    let mut seen = std::collections::HashSet::new();
+    for (column, _) in &assignments {
+        if !seen.insert(column.clone()) {
+            return Err(SqlError::Syntax("duplicate column".into()));
+        }
+        let definition = schema
+            .columns
+            .iter()
+            .find(|item| item.name == *column)
+            .ok_or_else(|| SqlError::Syntax(format!("unknown column {column}")))?;
+        if definition.primary_key {
+            return Err(SqlError::Syntax("primary key required".into()));
+        }
+    }
+    let keys = read_primary_keys(tokens, &schema, index)?;
+    let columns: Vec<String> = schema
+        .columns
+        .iter()
+        .map(|column| column.name.clone())
+        .collect();
+    let mut next_rows = Vec::with_capacity(keys.len());
+    for key in &keys {
+        let current = engine
+            .visible_row(&name, key)
+            .map_err(map_store)?
+            .ok_or_else(|| SqlError::Syntax("key not found".into()))?;
+        let texts: Vec<String> = current.iter().map(Cell::display).collect();
+        // 右边全部按覆盖前的行求值，再一起写回。SET a = b, b = a 会交换，而不是两列变成同一个值。
+        let mut computed = Vec::with_capacity(assignments.len());
+        for (column, expr) in &assignments {
+            computed.push((column.clone(), eval_val(expr, &columns, &texts)?));
+        }
+        let mut next = current;
+        for (column, scalar) in computed {
+            let position = schema
+                .columns
+                .iter()
+                .position(|item| item.name == column)
+                .ok_or_else(|| SqlError::Syntax(format!("unknown column {column}")))?;
+            next[position] = assign_cell(schema.columns[position].ty, scalar)?;
+        }
+        next_rows.push(next);
+    }
+    engine.replace_rows(&name, &next_rows).map_err(map_store)?;
+    Ok(QueryResult {
+        columns: vec!["result".into()],
+        rows: vec![vec!["updated".into()]],
+    })
+}
+
 fn exec_delete(engine: &mut Engine, tokens: &[String]) -> Result<QueryResult, SqlError> {
     let mut index = 0;
     expect(tokens, &mut index, "delete")?;
@@ -1831,14 +1917,24 @@ fn exec_delete(engine: &mut Engine, tokens: &[String]) -> Result<QueryResult, Sq
         .table_schema(&name)
         .cloned()
         .ok_or(SqlError::NotFound)?;
+    let keys = read_primary_keys(tokens, &schema, index)?;
+    engine.delete_rows(&name, &keys).map_err(map_store)?;
+    Ok(deleted_result())
+}
+
+fn read_primary_keys(
+    tokens: &[String],
+    schema: &TableSchema,
+    mut index: usize,
+) -> Result<Vec<Vec<Cell>>, SqlError> {
     if tokens.get(index).is_some_and(|token| token == "(") {
-        return exec_delete_tuples(engine, tokens, &name, &schema, index);
+        return read_primary_tuples(tokens, schema, index);
     }
     if tokens
         .get(index + 1)
         .is_some_and(|token| token.eq_ignore_ascii_case("in"))
     {
-        return exec_delete_in(engine, tokens, &name, &schema, index);
+        return read_primary_in(tokens, schema, index);
     }
     let mut pairs = Vec::new();
     loop {
@@ -1848,21 +1944,7 @@ fn exec_delete(engine: &mut Engine, tokens: &[String]) -> Result<QueryResult, Sq
             .to_ascii_lowercase();
         index += 1;
         expect(tokens, &mut index, "=")?;
-        let token = tokens
-            .get(index)
-            .ok_or_else(|| SqlError::Syntax("value".into()))?;
-        let raw = if token == "-" {
-            index += 1;
-            let number = tokens
-                .get(index)
-                .ok_or_else(|| SqlError::Syntax("value".into()))?;
-            index += 1;
-            format!("-{}", unquote(number))
-        } else {
-            index += 1;
-            unquote(token)
-        };
-        pairs.push((column, raw));
+        pairs.push((column, read_signed_literal(tokens, &mut index)?));
         if tokens
             .get(index)
             .is_some_and(|token| token.eq_ignore_ascii_case("and"))
@@ -1902,20 +1984,14 @@ fn exec_delete(engine: &mut Engine, tokens: &[String]) -> Result<QueryResult, Sq
     {
         return Err(SqlError::Syntax("primary key required".into()));
     }
-    engine.delete_row(&name, &key).map_err(map_store)?;
-    Ok(QueryResult {
-        columns: vec!["result".into()],
-        rows: vec![vec!["deleted".into()]],
-    })
+    Ok(vec![key])
 }
 
-fn exec_delete_in(
-    engine: &mut Engine,
+fn read_primary_in(
     tokens: &[String],
-    name: &str,
     schema: &TableSchema,
     mut index: usize,
-) -> Result<QueryResult, SqlError> {
+) -> Result<Vec<Vec<Cell>>, SqlError> {
     let column = tokens
         .get(index)
         .ok_or_else(|| SqlError::Syntax("column".into()))?
@@ -1933,21 +2009,7 @@ fn exec_delete_in(
     }
     let mut raws = Vec::new();
     while tokens.get(index).is_some_and(|token| token != ")") {
-        let token = tokens
-            .get(index)
-            .ok_or_else(|| SqlError::Syntax("value".into()))?;
-        let raw = if token == "-" {
-            index += 1;
-            let number = tokens
-                .get(index)
-                .ok_or_else(|| SqlError::Syntax("value".into()))?;
-            index += 1;
-            format!("-{}", unquote(number))
-        } else {
-            index += 1;
-            unquote(token)
-        };
-        raws.push(raw);
+        raws.push(read_signed_literal(tokens, &mut index)?);
         if tokens.get(index).is_some_and(|token| token == ",") {
             index += 1;
         }
@@ -1956,24 +2018,16 @@ fn exec_delete_in(
     if index != tokens.len() || raws.is_empty() {
         return Err(SqlError::Syntax("primary key required".into()));
     }
-    let keys = raws
-        .iter()
+    raws.iter()
         .map(|raw| parse_cell(pk[0].ty, raw).map(|cell| vec![cell]))
-        .collect::<Result<Vec<_>, _>>()?;
-    engine.delete_rows(name, &keys).map_err(map_store)?;
-    Ok(QueryResult {
-        columns: vec!["result".into()],
-        rows: vec![vec!["deleted".into()]],
-    })
+        .collect()
 }
 
-fn exec_delete_tuples(
-    engine: &mut Engine,
+fn read_primary_tuples(
     tokens: &[String],
-    name: &str,
     schema: &TableSchema,
     mut index: usize,
-) -> Result<QueryResult, SqlError> {
+) -> Result<Vec<Vec<Cell>>, SqlError> {
     expect(tokens, &mut index, "(")?;
     let mut columns = Vec::new();
     while tokens.get(index).is_some_and(|token| token != ")") {
@@ -2034,8 +2088,23 @@ fn exec_delete_tuples(
         }
         keys.push(key);
     }
-    engine.delete_rows(name, &keys).map_err(map_store)?;
-    Ok(deleted_result())
+    Ok(keys)
+}
+
+fn read_signed_literal(tokens: &[String], index: &mut usize) -> Result<String, SqlError> {
+    let token = tokens
+        .get(*index)
+        .ok_or_else(|| SqlError::Syntax("value".into()))?;
+    if token == "-" {
+        *index += 1;
+        let number = tokens
+            .get(*index)
+            .ok_or_else(|| SqlError::Syntax("value".into()))?;
+        *index += 1;
+        return Ok(format!("-{}", unquote(number)));
+    }
+    *index += 1;
+    Ok(unquote(token))
 }
 
 fn deleted_result() -> QueryResult {
@@ -2043,6 +2112,15 @@ fn deleted_result() -> QueryResult {
         columns: vec!["result".into()],
         rows: vec![vec!["deleted".into()]],
     }
+}
+
+fn assign_cell(ty: ColumnType, value: Scalar) -> Result<Cell, SqlError> {
+    let casted = cast_scalar(value, ty)?;
+    // 列不能存空值。空字符串仍是字符串，只有表达式结果真是空值才拒绝。
+    if matches!(casted, Scalar::Null) {
+        return Err(SqlError::Syntax("null".into()));
+    }
+    parse_cell(ty, &scalar_text(&casted))
 }
 
 fn parse_cell(ty: ColumnType, raw: &str) -> Result<Cell, SqlError> {
