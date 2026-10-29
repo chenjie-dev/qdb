@@ -1,4 +1,4 @@
-//! 只读 SQL 子集，以及 `CREATE TABLE`、`INSERT` 和按主键的 `DELETE`。
+//! 只读 SQL 子集，以及 `CREATE TABLE`、`INSERT`（含 `EXPECT`）和按主键的 `DELETE`。
 //!
 //! 语法边界见 `docs/manual/sql.md`。`WHERE`、表达式、`CASE`、`GROUP BY`、`HAVING`、`DISTINCT`、`UNION` 和 `ORDER BY` 都会生效。
 #![forbid(unsafe_code)]
@@ -52,22 +52,22 @@ impl<'a> SqlEngine<'a> {
 
     /// 执行一条语句。`CREATE`、`INSERT` 和 `DELETE` 写入 WAL，其余交给 [`SqlEngine::query`]。
     ///
-    /// 末尾分号会被去掉。写入语句在默认组提交下会 `fsync`。
+    /// 末尾分号会被去掉。写入语句在默认组提交下会 `fsync`。`INSERT ... EXPECT n` 在序号不符时不写 WAL。`DELETE ... IN` 在任一键不可见或列表有重复时也不写。
     ///
     /// # Arguments
     ///
-    /// * `engine` - 可写引擎。只读引擎上的建表、插入和删除会失败。
+    /// * `engine` - 可写引擎。只读打开时建表、插入、条件覆盖和删除都会失败。
     /// * `sql` - 一条语句。
     ///
     /// # Returns
     ///
-    /// 查询返回行。建表成功时 `rows` 是 `created`，插入是 `inserted`，删除是 `deleted`。
+    /// 查询返回行。建表成功时 `rows` 是 `created`，插入和条件覆盖是 `inserted`，删除是 `deleted`。
     ///
     /// # Errors
     ///
-    /// * [`SqlError::Syntax`] - 语句无法解析，主键没写全，或删的是内置表。
-    /// * [`SqlError::Store`] - 表已存在、主键冲突、类型不对，或引擎只读。
-    /// * [`SqlError::NotFound`] - 表不存在，或主键当前没有可见行。`Display` 仍是 `symbol not found` 或存储层原文，见手册。
+    /// * [`SqlError::Syntax`] - 语句无法解析，主键没写全，删的是引擎登记的表，或 `EXPECT` 的序号对不上（`syntax: seq conflict`）。
+    /// * [`SqlError::Store`] - 引擎只读，或存储层返回了没有单独映射的错误。
+    /// * [`SqlError::NotFound`] - 表不存在。主键当前没有可见行是 `syntax: key not found`，不是这个错误。
     pub fn execute(engine: &mut Engine, sql: &str) -> Result<QueryResult, SqlError> {
         let sql = sql.trim().trim_end_matches(';').trim();
         let tokens = tokenize(sql);

@@ -447,24 +447,26 @@ impl Engine {
 
     /// 按建表时的列顺序插入一行。
     ///
-    /// 主键重复时不写入。二级索引不要求唯一。
+    /// 主键重复时不写入，也不分配 `seq`。成功时这条记录的 `seq` 成为该主键的可见序号。
+    /// 默认每次调用都 `fsync`；组提交打开后要再调用 [`Engine::flush`]。
     ///
     /// # Arguments
     ///
-    /// * `table` - 已存在的用户表名。
-    /// * `values` - 与列数、类型一一对应。
+    /// * `table` - 已经存在的调用方表名。不能是引擎登记的四张表。
+    /// * `values` - 与列顺序、列数、类型一一对应。`STRING` 最长 1024 字节。
     ///
     /// # Returns
     ///
-    /// 这条插入记录的 `seq`。
+    /// 这条插入记录的 `seq`。序号从 1 起，在本分区内严格加一。
     ///
     /// # Errors
     ///
     /// * [`StoreError::NotFound`] - 表不存在。
     /// * [`StoreError::TypeMismatch`] - 某个值的类型和列定义不一致。
-    /// * [`StoreError::DuplicateKey`] - 主键已经有相同的值。
+    /// * [`StoreError::DuplicateKey`] - 主键已经有可见行。
     /// * [`StoreError::Schema`] - 列数不对，或字符串超过 1024 字节。
-    /// * [`StoreError::ReadOnly`] - 只读引擎。
+    /// * [`StoreError::ReadOnly`] - 引擎是只读打开的。
+    /// * [`StoreError::Crc`] - 打开时 WAL 已损坏，拒绝再写。
     pub fn insert_row(&mut self, table: &str, values: &[Cell]) -> Result<u64, StoreError> {
         self.ensure_writable()?;
         let payload = self.tables.encode_row(table, values)?;
@@ -473,23 +475,26 @@ impl Engine {
 
     /// 仅当主键当前可见序号等于 `expected` 时写入。
     ///
-    /// `expected` 为 0 表示这个键必须还不存在，成功时是普通插入。大于 0 时覆盖该行，并让新的 `seq` 成为下次期望值。不符则不写 WAL。
+    /// 比较发生在写 WAL 之前。对不上就返回，磁盘上的记录不变。`expected` 为 0 只表示这个键还必须不存在，不能用来覆盖序号恰好是 0 的旧快照行。大于 0 时在原槽位覆盖这一行，新的 `seq` 成为下次要带上的期望值。默认每次调用都 `fsync`。
     ///
     /// # Arguments
     ///
-    /// * `table` - 调用方建成、带主键的表。
-    /// * `values` - 与列数、类型一一对应。主键列决定被比较的行。
-    /// * `expected` - 调用方看到的可见 `seq`。0 表示键应当不存在。
+    /// * `table` - 调用方用 `CREATE TABLE` 建成、并且至少有一列主键的表。
+    /// * `values` - 与列顺序、列数、类型一一对应。主键列指出要比较的那一行。
+    /// * `expected` - 调用方上次读到的可见 `seq`。0 表示键应当还不存在。
     ///
     /// # Returns
     ///
-    /// 这次提交的 `seq`。
+    /// 这次提交的 `seq`。覆盖成功时它大于 `expected`。
     ///
     /// # Errors
     ///
-    /// * [`StoreError::Conflict`] - 可见序号不是 `expected`。
-    /// * [`StoreError::Schema`] - 没有主键，或表不是调用方建成的。
-    /// * [`StoreError::ReadOnly`] - 只读引擎。
+    /// * [`StoreError::Conflict`] - 可见序号不是 `expected`，或 `expected` 为 0 但键已经存在。
+    /// * [`StoreError::NotFound`] - 表不存在。
+    /// * [`StoreError::Schema`] - 没有主键、表是引擎登记的四张表之一，或字符串超过 1024 字节。
+    /// * [`StoreError::TypeMismatch`] - 某个值的类型和列定义不一致。
+    /// * [`StoreError::ReadOnly`] - 引擎是只读打开的。
+    /// * [`StoreError::Crc`] - 打开时 WAL 已损坏，拒绝再写。
     pub fn insert_expect(
         &mut self,
         table: &str,
@@ -514,6 +519,7 @@ impl Engine {
         if key.is_empty() {
             return Err(StoreError::Schema("primary key required".into()));
         }
+        // 0 只表示键不存在。先比较再写 WAL，冲突不会留下半条覆盖。
         match self.tables.visible_seq(table, &key)? {
             None if expected == 0 => return self.insert_row(table, values),
             Some(seq) if seq == expected && expected != 0 => {}
@@ -523,28 +529,27 @@ impl Engine {
         self.commit(MsgType::RowReplace, 0, 0, 0, 0, &payload, 0)
     }
 
-    /// 按主键为用户表写一条墓碑。
+    /// 按主键写一条墓碑。
     ///
-    /// 已经 `fsync` 的旧行留在 WAL 里。这次提交分配新的 `seq` 之后，查询不再返回这个键。
-    /// 同一个键可以再 `INSERT`。内置表和没有主键的表不能删。
+    /// 已经 `fsync` 的旧行留在 WAL 里，不改那些字节。这次提交分配新的 `seq` 之后，查询和二级索引都不再返回这个键。同一个键可以再插入。默认每次调用都 `fsync`。
     ///
     /// # Arguments
     ///
-    /// * `table` - 用户表名。
-    /// * `key` - 主键列的值，顺序与建表时主键列的顺序一致。
+    /// * `table` - 调用方建成的表。引擎登记的四张表会失败。
+    /// * `key` - 主键列的值，顺序与建表时主键列的顺序一致，个数必须等于主键列数。
     ///
     /// # Returns
     ///
-    /// 墓碑记录的 `seq`。
+    /// 墓碑记录的 `seq`。它不是被删掉的那一行原来的序号。
     ///
     /// # Errors
     ///
     /// * [`StoreError::NotFound`] - 表不存在。
-    /// * [`StoreError::Schema`] - 表是内置表、没有主键，或值的个数不对。
+    /// * [`StoreError::Schema`] - 表是引擎登记的四张表之一、没有主键，或值的个数不对。
     /// * [`StoreError::TypeMismatch`] - 值的类型和主键列不一致。
     /// * [`StoreError::KeyNotFound`] - 这个主键当前没有可见行。
-    /// * [`StoreError::ReadOnly`] - 只读引擎。
-    /// * [`StoreError::Crc`] - WAL 已损坏。
+    /// * [`StoreError::ReadOnly`] - 引擎是只读打开的。
+    /// * [`StoreError::Crc`] - 打开时 WAL 已损坏，拒绝再写。
     pub fn delete_row(&mut self, table: &str, key: &[Cell]) -> Result<u64, StoreError> {
         self.ensure_writable()?;
         if table::BUILTIN_TABLES.contains(&table) {
@@ -556,7 +561,7 @@ impl Engine {
 
     /// 按多个主键各写一条墓碑。
     ///
-    /// 先检查每个键当前都可见，并且列表里没有重复键，然后才按顺序提交。任何一个键不可见时，已有的行都不改。
+    /// 先检查全部键都可见，并且列表里没有重复键，然后才按顺序提交。任何一个键不可见或重复时，不写 WAL，已经可见的行保持原样。每个键得到自己的 `seq`。默认每次调用里的每一条都会 `fsync`，除非组提交还没凑满。
     ///
     /// # Arguments
     ///
@@ -569,7 +574,7 @@ impl Engine {
     ///
     /// # Errors
     ///
-    /// 与 [`Engine::delete_row`] 相同。列表为空或键重复时返回 [`StoreError::Schema`]。
+    /// 与 [`Engine::delete_row`] 相同。列表为空返回 [`StoreError::Schema`]，键重复也返回 [`StoreError::Schema`]。
     pub fn delete_rows(&mut self, table: &str, keys: &[Vec<Cell>]) -> Result<Vec<u64>, StoreError> {
         self.ensure_writable()?;
         if table::BUILTIN_TABLES.contains(&table) {
@@ -583,6 +588,7 @@ impl Engine {
                 return Err(StoreError::Schema("duplicate key".into()));
             }
         }
+        // 编码只检查可见性，不写 WAL。通过之后再逐条提交，避免列表后半段失败时前半段已经删掉。
         let mut payloads = Vec::with_capacity(keys.len());
         for key in keys {
             payloads.push(self.tables.encode_delete(table, key)?);
@@ -594,16 +600,16 @@ impl Engine {
         Ok(seqs)
     }
 
-    /// 扫描一张用户表。
+    /// 扫描一张调用方建成的表。
     ///
-    /// 给出列名和期望值时，主键或二级索引走等值查找；没有索引则扫全表。
+    /// 给出列名和期望值时，主键或二级索引走等值查找；没有索引则扫全表。墓碑行不出现在结果里。调用方建成的表在列尾多一列文本 `seq`，值是该行当前可见序号；这不是建表时声明的列。引擎登记的四张表不加这一列。
     ///
     /// # Arguments
     ///
-    /// * `table` - 用户表名。
+    /// * `table` - 表名。
     /// * `column` - 过滤列。`None` 表示不过滤。
     /// * `expected` - 与 `column` 一起使用的等值。类型必须和列一致。
-    /// * `limit` - 最多返回的行数。
+    /// * `limit` - 最多返回的可见行数。墓碑不占这个名额。
     ///
     /// # Returns
     ///

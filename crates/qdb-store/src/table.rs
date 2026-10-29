@@ -1,6 +1,7 @@
-//! 普通表。类型只有 INT64、STRING、BOOL。主键可以多列，合起来唯一。二级索引用于等值查找。
+//! 普通表。类型只有 `INT64`、`STRING`、`BOOL`。主键可以多列，合起来唯一。二级索引用于等值查找。
 //!
-//! `symbols`、`ticks`、`snapshots`、`klines` 由引擎登记成这种表。行仍由行情写入路径维护。
+//! 删除不改已经 `fsync` 的字节，只把行标成不可见。调用方建成的表在扫描结果最后附带可见 `seq`，这个 `seq` 不是建表时的列。
+//! 引擎登记的四张表仍由写入路径维护，不走这里的删除和条件覆盖。
 #![forbid(unsafe_code)]
 
 use std::collections::{HashMap, HashSet};
@@ -469,11 +470,24 @@ impl TableSet {
         Ok(())
     }
 
-    /// 当前可见行的 `seq`。没有这行时返回 `None`。
+    /// 读取这个主键当前可见行的提交序号。
+    ///
+    /// 只查内存里的主键索引，不读 WAL，也不分配新序号。墓碑之后的键返回 `None`，和从来没插入过一样。旧快照若没记下序号，可见行的值可以是 0；0 不是「键不存在」。
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - 已登记的表名。
+    /// * `key` - 主键列的值，顺序和个数都要与建表时的主键列一致。
+    ///
+    /// # Returns
+    ///
+    /// `Some(seq)` 是当前可见行的序号。`None` 表示这个键现在没有可见行。
     ///
     /// # Errors
     ///
-    /// 表不存在、没有主键或键的形状不对时返回错误。
+    /// * [`StoreError::NotFound`] - 表不存在。
+    /// * [`StoreError::Schema`] - 没有主键，或 `key` 的个数不对。
+    /// * [`StoreError::TypeMismatch`] - 某个值的类型和主键列不一致。
     pub fn visible_seq(&self, table: &str, key: &[Cell]) -> Result<Option<u64>, StoreError> {
         let schema = self.schemas.get(table).ok_or(StoreError::NotFound)?;
         let pk: Vec<&ColumnDef> = schema
@@ -508,11 +522,26 @@ impl TableSet {
         ))
     }
 
-    /// 编码一条带期望 `seq` 的覆盖。期望必须等于当前可见序号，且不能为 0。
+    /// 把一次条件覆盖编码成 WAL 载荷。
+    ///
+    /// 不写盘。载荷前 8 字节是期望序号，后面是与 [`TableSet::encode_row`] 相同的行。`expected` 必须大于 0，并且等于这个主键的可见序号。
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - 带主键的调用方表。
+    /// * `values` - 覆盖后的整行，列顺序与建表时一致。主键列必须仍指向当前那一行。
+    /// * `expected` - 调用方看见的可见 `seq`，不能为 0。
+    ///
+    /// # Returns
+    ///
+    /// 可以交给 [`TableSet::replace_encoded`] 的字节。
     ///
     /// # Errors
     ///
-    /// 期望不符时返回 [`StoreError::Conflict`]。
+    /// * [`StoreError::Conflict`] - `expected` 为 0，或不是当前可见序号。
+    /// * [`StoreError::NotFound`] - 表不存在。
+    /// * [`StoreError::Schema`] - 没有主键，列数不对，或字符串超过 1024 字节。
+    /// * [`StoreError::TypeMismatch`] - 某个值的类型和列定义不一致。
     pub fn encode_expect(
         &self,
         table: &str,
@@ -542,11 +571,20 @@ impl TableSet {
         Ok(out)
     }
 
-    /// 应用覆盖。期望序号必须仍是这个主键的可见序号。
+    /// 把一条条件覆盖应用到内存表。
+    ///
+    /// 行留在原来的槽位，主键索引的指向不变，只换单元格和可见 `seq`。重放时期望序号必须仍然对得上，否则拒绝这条记录。
+    ///
+    /// # Arguments
+    ///
+    /// * `bytes` - [`TableSet::encode_expect`] 的输出。短于 8 字节会失败。
+    /// * `seq` - 这次提交分配到的新序号，会成为该主键下一次的期望值。
     ///
     /// # Errors
     ///
-    /// 期望不符、表不存在或载荷截断时返回错误。
+    /// * [`StoreError::Conflict`] - 载荷里的期望序号不是当前可见序号。
+    /// * [`StoreError::NotFound`] - 表不存在。
+    /// * [`StoreError::Schema`] - 载荷截断或列对不上。
     pub fn replace_encoded(&mut self, bytes: &[u8], seq: u64) -> Result<(), StoreError> {
         if bytes.len() < 8 {
             return Err(StoreError::Schema("truncated".into()));
@@ -582,6 +620,7 @@ impl TableSet {
             .and_then(|index| index.get(&key_bytes(&key)).copied())
             .ok_or(StoreError::Conflict)?;
         self.replace_row(&table, &schema, index, values);
+        // 覆盖不新开槽位，所以序号写回原来的下标，而不是再 push 一条。
         if let Some(slot) = self
             .seqs
             .get_mut(&table)
@@ -592,6 +631,26 @@ impl TableSet {
         Ok(())
     }
 
+    /// 扫描一张表里仍然可见的行。
+    ///
+    /// 墓碑行会被跳过，并且不占用 `limit`。调用方建成的表在列尾追加文本列 `seq`。引擎登记的四张表不加这一列。
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - 已登记的表名。
+    /// * `column` - 等值过滤的列。`None` 表示不过滤。
+    /// * `expected` - 与 `column` 一起给出的值。类型必须和列一致。
+    /// * `limit` - 最多返回的可见行数。
+    ///
+    /// # Returns
+    ///
+    /// 列名，以及每行的文本。调用方表的最后一列是可见 `seq`。
+    ///
+    /// # Errors
+    ///
+    /// * [`StoreError::NotFound`] - 表不存在。
+    /// * [`StoreError::Schema`] - 过滤列不存在。
+    /// * [`StoreError::TypeMismatch`] - 过滤值的类型不对。
     pub fn scan(
         &self,
         table: &str,
@@ -652,6 +711,7 @@ impl TableSet {
             }
         }
         if !BUILTIN_TABLES.contains(&table) {
+            // seq 不是建表列，只附在调用方表的结果末尾，给 EXPECT 读取。
             columns.push("seq".into());
             for (row, seq) in out.iter_mut().zip(emitted.iter()) {
                 row.push(seq.to_string());
@@ -715,7 +775,18 @@ impl TableSet {
             .collect())
     }
 
-    /// 把主键编码成墓碑载荷。键必须已经存在。
+    /// 把主键编码成墓碑载荷。
+    ///
+    /// 不写盘。键必须当前可见。载荷是表名加上按主键列顺序排列的值。
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - 已登记、并且有主键的表。
+    /// * `key` - 主键列的值，顺序和个数与建表时的主键列一致。
+    ///
+    /// # Returns
+    ///
+    /// 可以交给 [`TableSet::delete_encoded`] 的字节。
     ///
     /// # Errors
     ///
@@ -757,7 +828,13 @@ impl TableSet {
         Ok(out)
     }
 
-    /// 应用一条墓碑。主键当前不可见时失败，避免把没写过的删除重放进去。
+    /// 应用一条墓碑，使主键从查询和二级索引里消失。
+    ///
+    /// 行的字节留在表槽里，只从主键索引去掉，并记入不可见集合。重放时键已经不可见就失败，避免同一条墓碑被应用两次。
+    ///
+    /// # Arguments
+    ///
+    /// * `bytes` - [`TableSet::encode_delete`] 的输出。
     ///
     /// # Errors
     ///
