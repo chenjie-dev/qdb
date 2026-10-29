@@ -1,4 +1,4 @@
-//! 只读 SQL 子集，以及 `CREATE TABLE`、`INSERT`（含 `EXPECT`）、按主键的 `UPDATE` 和 `DELETE`。
+//! 只读 SQL 子集，以及 `CREATE TABLE`、`INSERT`（含 `EXPECT`）、按主键的 `UPDATE`、`DELETE` 和 `ALTER TABLE ... RENAME TO`。
 //!
 //! 语法边界见 `docs/manual/sql.md`。`WHERE`、表达式、`CASE`、`COALESCE`、`NULLIF`、`GROUP BY`、`HAVING`、`DISTINCT`、`UNION`、`INTERSECT`、`EXCEPT` 和 `ORDER BY` 都会生效。
 #![forbid(unsafe_code)]
@@ -23,7 +23,7 @@ pub enum SqlError {
 
 /// 在一个 [`Engine`] 上跑 SQL。
 ///
-/// [`SqlEngine::query`] 只读。`CREATE TABLE`、`INSERT`、`UPDATE` 和 `DELETE` 走 [`SqlEngine::execute`]，需要可写引擎。
+/// [`SqlEngine::query`] 只读。`CREATE TABLE`、`INSERT`、`UPDATE`、`DELETE` 和 `ALTER TABLE` 走 [`SqlEngine::execute`]，需要可写引擎。
 /// 语法以 `docs/manual/sql.md` 为准。
 pub struct SqlEngine<'a> {
     engine: &'a Engine,
@@ -61,7 +61,7 @@ impl<'a> SqlEngine<'a> {
     ///
     /// # Returns
     ///
-    /// 查询返回行。建表成功时 `rows` 是 `created`，插入和条件覆盖是 `inserted`，更新是 `updated`，删除是 `deleted`，删表是 `dropped`，清空表是 `truncated`。更新只改非主键列，并分配新的 `seq`。删表和清空都不擦 WAL 里已经落盘的行。清空后表定义还在。
+    /// 查询返回行。建表成功时 `rows` 是 `created`，插入和条件覆盖是 `inserted`，更新是 `updated`，删除是 `deleted`，删表是 `dropped`，清空表是 `truncated`，改名是 `renamed`。更新只改非主键列，并分配新的 `seq`。改名不改变每一行已有的 `seq`。删表和清空都不擦 WAL 里已经落盘的行。清空后表定义还在。
     ///
     /// # Errors
     ///
@@ -92,6 +92,9 @@ impl<'a> SqlEngine<'a> {
         }
         if head == "truncate" {
             return exec_truncate(engine, &tokens);
+        }
+        if head == "alter" {
+            return exec_alter(engine, &tokens);
         }
         if head == "expire" {
             return exec_expire(engine, &tokens);
@@ -1594,6 +1597,32 @@ fn exec_truncate(engine: &mut Engine, tokens: &[String]) -> Result<QueryResult, 
     Ok(QueryResult {
         columns: vec!["result".into()],
         rows: vec![vec!["truncated".into()]],
+    })
+}
+
+fn exec_alter(engine: &mut Engine, tokens: &[String]) -> Result<QueryResult, SqlError> {
+    let mut index = 0;
+    expect(tokens, &mut index, "alter")?;
+    expect(tokens, &mut index, "table")?;
+    let from = tokens
+        .get(index)
+        .ok_or_else(|| SqlError::Syntax("alter".into()))?
+        .to_ascii_lowercase();
+    index += 1;
+    expect(tokens, &mut index, "rename")?;
+    expect(tokens, &mut index, "to")?;
+    let to = tokens
+        .get(index)
+        .ok_or_else(|| SqlError::Syntax("alter".into()))?
+        .to_ascii_lowercase();
+    index += 1;
+    if index != tokens.len() {
+        return Err(SqlError::Syntax("alter".into()));
+    }
+    engine.rename_table(&from, &to).map_err(map_store)?;
+    Ok(QueryResult {
+        columns: vec!["result".into()],
+        rows: vec![vec!["renamed".into()]],
     })
 }
 

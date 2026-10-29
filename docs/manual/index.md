@@ -40,7 +40,7 @@ QDB 0.1 是单机内存行情库。一个写入者把成交、报价和时钟写
 | 章节 | 内容 |
 |---|---|
 | [数据模型](data-model.md) | 代码、价格、周期、四张逻辑表 |
-| [SQL](sql.md) | 词法、表达式、`SELECT`、连接、`UNION` / `INTERSECT` / `EXCEPT`、建表、`UPDATE` 和与 PostgreSQL 的差异 |
+| [SQL](sql.md) | 词法、表达式、`SELECT`、连接、`UNION` / `INTERSECT` / `EXCEPT`、建表、`UPDATE`、`ALTER TABLE` 和与 PostgreSQL 的差异 |
 | [客户端](client.md) | 只读命令行，查询表结构、数据和实时变更 |
 | [库接口](library.md) | `Engine` 的打开、写入和读取 |
 | [订阅](subscribe.md) | 按代码和周期过滤，用 `from_seq` 续传 |

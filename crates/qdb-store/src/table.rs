@@ -1,6 +1,6 @@
 //! 普通表。类型只有 `INT64`、`STRING`、`BOOL`。主键可以多列，合起来唯一。二级索引用于等值查找。
 //!
-//! 删除不改已经 `fsync` 的字节，只把行标成不可见。调用方建成的表在扫描结果最后附带可见 `seq`，这个 `seq` 不是建表时的列。
+//! 删除不改已经 `fsync` 的字节，只把行标成不可见。改名只换内存里的表名，行槽和可见序号原样跟着走。调用方建成的表在扫描结果最后附带可见 `seq`，这个 `seq` 不是建表时的列。
 //! 引擎登记的四张表仍由写入路径维护，不走这里的删除和条件覆盖。
 #![forbid(unsafe_code)]
 
@@ -485,6 +485,64 @@ impl TableSet {
             secondary.insert(index.column.clone(), HashMap::new());
         }
         self.secondary.insert(name, secondary);
+        Ok(())
+    }
+
+    /// 把新旧表名编码成改名载荷。
+    ///
+    /// # Arguments
+    ///
+    /// * `from` - 当前表名。
+    /// * `to` - 改名之后的表名。
+    ///
+    /// # Returns
+    ///
+    /// 两个小端长度加名字，先旧后新。
+    pub fn encode_rename(from: &str, to: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        push_str(&mut out, from);
+        push_str(&mut out, to);
+        out
+    }
+
+    /// 按 [`TableSet::encode_rename`] 的载荷改表名。
+    ///
+    /// 不改 WAL 里已经写下的行。行槽、可见序号、截止时间、主键和二级索引原样挪到新名字，不给每一行分配新序号。定义里的表名改成新名字。旧名字可以再 `CREATE TABLE`。
+    ///
+    /// # Arguments
+    ///
+    /// * `bytes` - [`TableSet::encode_rename`] 的输出。
+    ///
+    /// # Errors
+    ///
+    /// * [`StoreError::NotFound`] - 旧名字不存在。
+    /// * [`StoreError::TableExists`] - 新名字已经有一张调用方表。
+    /// * [`StoreError::Schema`] - 旧名字或新名字是引擎登记的四张表之一，或载荷被截断。
+    pub fn rename_encoded(&mut self, bytes: &[u8]) -> Result<(), StoreError> {
+        let mut cursor = 0;
+        let from = take_str(bytes, &mut cursor)?;
+        let to = take_str(bytes, &mut cursor)?;
+        if cursor != bytes.len() {
+            return Err(StoreError::Schema("truncated".into()));
+        }
+        if BUILTIN_TABLES.contains(&from.as_str()) || BUILTIN_TABLES.contains(&to.as_str()) {
+            return Err(StoreError::Schema("reserved table".into()));
+        }
+        if self.schemas.contains_key(&to) {
+            return Err(StoreError::TableExists);
+        }
+        let Some(mut schema) = self.schemas.remove(&from) else {
+            return Err(StoreError::NotFound);
+        };
+        schema.name = to.clone();
+        self.schemas.insert(to.clone(), schema);
+        // 行、序号、期限和索引必须一起换名字，否则新名字查不到行，旧名字还留着下标。
+        move_name(&mut self.rows, &from, &to);
+        move_name(&mut self.primary, &from, &to);
+        move_name(&mut self.secondary, &from, &to);
+        move_name(&mut self.deleted, &from, &to);
+        move_name(&mut self.seqs, &from, &to);
+        move_name(&mut self.expires, &from, &to);
         Ok(())
     }
 
@@ -1479,6 +1537,12 @@ fn primary_key(schema: &TableSchema, values: &[Cell]) -> Option<Vec<u8>> {
 
 fn push_u16(out: &mut Vec<u8>, value: u16) {
     out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn move_name<V>(map: &mut HashMap<String, V>, from: &str, to: &str) {
+    if let Some(value) = map.remove(from) {
+        map.insert(to.to_string(), value);
+    }
 }
 
 fn push_str(out: &mut Vec<u8>, value: &str) {

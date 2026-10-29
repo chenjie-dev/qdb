@@ -9,7 +9,7 @@ let sql = qdb_sql::SqlEngine::new(&engine);
 let result = sql.query("SELECT close FROM klines WHERE symbol = 'SSE:600000' AND period = '1m' LIMIT 10")?;
 ```
 
-`query` 只读。`CREATE TABLE`、`INSERT` 和 `DELETE` 用 `SqlEngine::execute`，需要可写引擎。
+`query` 只读。`CREATE TABLE`、`INSERT`、`UPDATE`、`DELETE`、`DROP TABLE`、`TRUNCATE TABLE`、`ALTER TABLE` 和 `EXPIRE AT` 用 `SqlEngine::execute`，需要可写引擎。
 
 ## 词法
 
@@ -656,6 +656,33 @@ INSERT INTO note VALUES (1, 'again', true);
 
 没有 `RESTART IDENTITY`、`CASCADE`，也不能一次清空多张表。这不是擦掉历史。
 
+## ALTER TABLE
+
+给一张调用方建成的表改名。成功时 `columns` 是 `result`，`rows` 是 `renamed`。语句写入 WAL。行还在，只是换成新名字。
+
+### 语法
+
+```text
+ALTER TABLE name RENAME TO name
+```
+
+### 说明
+
+已经落盘的建表记录和行留在 WAL 里，那些字节仍写着改名前的名字。内存里的定义、行、主键、二级索引、可见 `seq` 和截止时间一起挪到新名字。每一行的 `seq` 不变。之后 `SELECT`、`DESCRIBE` 和 `SHOW TABLES` 使用新名字。旧名字可以再 `CREATE TABLE`，新表是空的，不带走已经改名的行。
+
+内置表不能作为旧名字或新名字，返回 `syntax: reserved table`。旧名字不存在返回 `symbol not found`。新名字已经有一张调用方表，或新旧名字相同，返回 `syntax: table already exists`。`RENAME TO` 后面还有别的词返回 `syntax: alter`。只读打开的引擎拒绝这条语句。重新打开库之后，仍然只有新名字。
+
+### 示例
+
+```sql
+ALTER TABLE note RENAME TO memo;
+SELECT code FROM memo WHERE id = 1;
+```
+
+### 兼容性
+
+没有 `RENAME COLUMN`、`ADD COLUMN`、`DROP COLUMN`、`IF EXISTS`，也不能一次改多张表。这不是改写每一行。
+
 ## EXPIRE AT
 
 按调用方给出的 UTC 纳秒水位，把已经到期的主键收成墓碑。成功时 `columns` 是 `result`，`rows` 是 `expired`。没有命中时也返回这一行，并且不写 WAL。
@@ -825,7 +852,7 @@ pub struct QueryResult {
 | 函数 | 作用 |
 |---|---|
 | `SqlEngine::query` | `SELECT`、`SHOW`、`DESCRIBE`。不写 WAL |
-| `SqlEngine::execute` | 另外接受 `CREATE TABLE`、`INSERT` 和按主键的 `DELETE`。需要可写引擎 |
+| `SqlEngine::execute` | `CREATE TABLE`、`INSERT`、`UPDATE`、`DELETE`、`DROP TABLE`、`TRUNCATE TABLE`、`ALTER TABLE`、`EXPIRE AT`。需要可写引擎 |
 | `split_subscribe` | 若语句以 `SUBSCRIBE` 结尾，返回去掉它之后的 `SELECT` |
 | `captured_rows` | 当前结果，最多 100000 行，给订阅记住已经看过的行 |
 | `live_rows` | 把一批新变更投影成与 `SELECT` 相同的列 |
@@ -846,7 +873,7 @@ WebSocket `GET /v1/ws` 接受同一套 `SELECT`，见 [服务进程](server.md)�
 | 窗口 | `OVER`、`rank`、`lag`、`lead` |
 | 表达式 | 四则以外的函数、正则。`CAST` 只接受 `INT64`、`STRING`、`BOOL` |
 | 谓词 | `SIMILAR TO`、`ANY` / `ALL`、数组 |
-| 写入 | `ALTER`、`COPY`。`UPDATE` 只按完整主键改非主键列。`DELETE` 只按主键追加墓碑。`DROP TABLE` 去掉调用方建成的表。`TRUNCATE TABLE` 只清掉可见行 |
+| 写入 | `COPY`。`ALTER TABLE` 只能 `RENAME TO`。`UPDATE` 只按完整主键改非主键列。`DELETE` 只按主键追加墓碑。`DROP TABLE` 去掉调用方建成的表。`TRUNCATE TABLE` 只清掉可见行 |
 | 目录 | `information_schema`、`pg_catalog` |
 | 协议 | 预编译语句、参数绑定、PostgreSQL 线协议 |
 

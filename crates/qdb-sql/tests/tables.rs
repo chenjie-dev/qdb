@@ -1001,3 +1001,138 @@ fn update_replaces_non_key_columns_and_keeps_the_deadline() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn rename_moves_rows_seq_and_indexes_to_the_new_name() {
+    let (dir, mut engine) = open();
+    SqlEngine::execute(
+        &mut engine,
+        "CREATE TABLE note (id INT64 PRIMARY KEY, code STRING, INDEX idx_code (code))",
+    )
+    .unwrap();
+    SqlEngine::execute(&mut engine, "CREATE TABLE log (id INT64, code STRING)").unwrap();
+    SqlEngine::execute(&mut engine, "CREATE TABLE other (id INT64 PRIMARY KEY)").unwrap();
+    SqlEngine::execute(
+        &mut engine,
+        "INSERT INTO note VALUES (1, 'old') EXPIRE AT 100",
+    )
+    .unwrap();
+    SqlEngine::execute(&mut engine, "INSERT INTO log VALUES (7, 'kept')").unwrap();
+    let before = SqlEngine::new(&engine)
+        .query("SELECT seq FROM note WHERE id = 1")
+        .unwrap();
+    let renamed = SqlEngine::execute(&mut engine, "ALTER TABLE note RENAME TO memo").unwrap();
+    assert_eq!(renamed.rows, vec![vec!["renamed".to_string()]]);
+    SqlEngine::execute(&mut engine, "ALTER TABLE log RENAME TO audit").unwrap();
+    assert_eq!(
+        SqlEngine::new(&engine)
+            .query("SELECT seq FROM memo WHERE id = 1")
+            .unwrap()
+            .rows,
+        before.rows
+    );
+    assert_eq!(
+        SqlEngine::new(&engine)
+            .query("SELECT id FROM memo WHERE code = 'old'")
+            .unwrap()
+            .rows,
+        vec![vec!["1".to_string()]]
+    );
+    assert_eq!(
+        SqlEngine::new(&engine)
+            .query("SELECT code FROM audit")
+            .unwrap()
+            .rows,
+        vec![vec!["kept".to_string()]]
+    );
+    assert_eq!(
+        message(
+            SqlEngine::new(&engine)
+                .query("SELECT code FROM note")
+                .unwrap_err()
+        ),
+        "syntax: unknown table note"
+    );
+    let listed = SqlEngine::new(&engine).query("SHOW TABLES").unwrap();
+    assert!(listed.rows.iter().any(|row| row[0] == "memo"));
+    assert!(listed.rows.iter().all(|row| row[0] != "note"));
+    assert_eq!(
+        SqlEngine::new(&engine)
+            .query("DESCRIBE memo")
+            .unwrap()
+            .rows
+            .first()
+            .map(|row| row[0].clone()),
+        Some("id".to_string())
+    );
+    assert_eq!(
+        message(SqlEngine::execute(&mut engine, "ALTER TABLE memo RENAME TO memo").unwrap_err()),
+        "syntax: table already exists"
+    );
+    assert_eq!(
+        message(SqlEngine::execute(&mut engine, "ALTER TABLE memo RENAME TO other").unwrap_err()),
+        "syntax: table already exists"
+    );
+    assert_eq!(
+        message(SqlEngine::execute(&mut engine, "ALTER TABLE ticks RENAME TO quote").unwrap_err()),
+        "syntax: reserved table"
+    );
+    assert_eq!(
+        message(SqlEngine::execute(&mut engine, "ALTER TABLE memo RENAME TO ticks").unwrap_err()),
+        "syntax: reserved table"
+    );
+    assert_eq!(
+        message(SqlEngine::execute(&mut engine, "ALTER TABLE missing RENAME TO x").unwrap_err()),
+        "symbol not found"
+    );
+    assert_eq!(
+        message(
+            SqlEngine::execute(&mut engine, "ALTER TABLE memo RENAME TO next extra").unwrap_err()
+        ),
+        "syntax: alter"
+    );
+    SqlEngine::execute(
+        &mut engine,
+        "CREATE TABLE note (id INT64 PRIMARY KEY, code STRING)",
+    )
+    .unwrap();
+    assert!(SqlEngine::new(&engine)
+        .query("SELECT code FROM note")
+        .unwrap()
+        .rows
+        .is_empty());
+    drop(engine);
+    let mut reader = Engine::open_read(&dir).unwrap();
+    assert_eq!(
+        message(SqlEngine::execute(&mut reader, "ALTER TABLE memo RENAME TO gone").unwrap_err()),
+        "read-only connection"
+    );
+    drop(reader);
+    let mut engine = Engine::open(&dir).unwrap();
+    assert_eq!(
+        SqlEngine::new(&engine)
+            .query("SELECT code FROM memo")
+            .unwrap()
+            .rows,
+        vec![vec!["old".to_string()]]
+    );
+    assert!(SqlEngine::new(&engine)
+        .query("SELECT code FROM note")
+        .unwrap()
+        .rows
+        .is_empty());
+    SqlEngine::execute(&mut engine, "EXPIRE AT 100").unwrap();
+    assert!(SqlEngine::new(&engine)
+        .query("SELECT id FROM memo")
+        .unwrap()
+        .rows
+        .is_empty());
+    assert_eq!(
+        SqlEngine::new(&engine)
+            .query("SELECT code FROM audit")
+            .unwrap()
+            .rows,
+        vec![vec!["kept".to_string()]]
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

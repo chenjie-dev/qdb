@@ -58,6 +58,8 @@ pub enum MsgType {
     TableDrop = 12,
     /// 调用方表的可见行从内存里去掉。表定义还在，已经落盘的行留在 WAL 里。
     TableTruncate = 13,
+    /// 调用方表改名。行、序号和索引留在内存里，已经落盘的记录仍用改名前的名字。
+    TableRename = 14,
 }
 
 impl MsgType {
@@ -65,7 +67,7 @@ impl MsgType {
     ///
     /// # Arguments
     ///
-    /// * `value` - 1 到 13。其余值没有对应类型。
+    /// * `value` - 1 到 14。其余值没有对应类型。
     ///
     /// # Returns
     ///
@@ -85,6 +87,7 @@ impl MsgType {
             11 => Self::RowReplace,
             12 => Self::TableDrop,
             13 => Self::TableTruncate,
+            14 => Self::TableRename,
             _ => return None,
         })
     }

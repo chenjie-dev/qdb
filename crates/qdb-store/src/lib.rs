@@ -528,6 +528,41 @@ impl Engine {
         self.commit(MsgType::TableTruncate, 0, 0, 0, 0, &payload, 0)
     }
 
+    /// 把一张调用方建成的表改名。
+    ///
+    /// 行、可见序号、截止时间和索引留在内存里，不给每一行分配新序号。这次提交自己有一条 `seq` 并 `fsync`。已经落盘的旧记录仍写着改名前的名字。旧名字之后可以再 `CREATE TABLE`。空表也写一条记录。
+    ///
+    /// # Arguments
+    ///
+    /// * `from` - 当前表名。不能是 `symbols`、`ticks`、`snapshots`、`klines`。
+    /// * `to` - 新表名。不能是这四张表，也不能已经有一张调用方表。与 `from` 相同视为新名字已占用。
+    ///
+    /// # Returns
+    ///
+    /// 这条改名记录的 `seq`。它不是表里某一行的序号。
+    ///
+    /// # Errors
+    ///
+    /// * [`StoreError::NotFound`] - `from` 不存在。
+    /// * [`StoreError::TableExists`] - `to` 已经有一张调用方表，或与 `from` 相同。
+    /// * [`StoreError::Schema`] - `from` 或 `to` 是引擎登记的四张表之一。
+    /// * [`StoreError::ReadOnly`] - 引擎是只读打开的。
+    /// * [`StoreError::Crc`] - 打开时 WAL 已损坏，拒绝再写。
+    pub fn rename_table(&mut self, from: &str, to: &str) -> Result<u64, StoreError> {
+        self.ensure_writable()?;
+        if table::BUILTIN_TABLES.contains(&from) || table::BUILTIN_TABLES.contains(&to) {
+            return Err(StoreError::Schema("reserved table".into()));
+        }
+        if self.tables.schema(from).is_none() {
+            return Err(StoreError::NotFound);
+        }
+        if self.tables.schema(to).is_some() {
+            return Err(StoreError::TableExists);
+        }
+        let payload = table::TableSet::encode_rename(from, to);
+        self.commit(MsgType::TableRename, 0, 0, 0, 0, &payload, 0)
+    }
+
     /// 按建表时的列顺序插入一行。
     ///
     /// 主键重复时不写入，也不分配 `seq`。成功时这条记录的 `seq` 成为该主键的可见序号。
@@ -2146,6 +2181,11 @@ impl Engine {
             }
             Some(MsgType::TableTruncate) => {
                 self.tables.truncate_encoded(&record.payload)?;
+                self.agg.note_seq(record.seq)?;
+                Ok(Vec::new())
+            }
+            Some(MsgType::TableRename) => {
+                self.tables.rename_encoded(&record.payload)?;
                 self.agg.note_seq(record.seq)?;
                 Ok(Vec::new())
             }
