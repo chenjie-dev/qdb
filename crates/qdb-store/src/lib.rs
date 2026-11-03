@@ -28,6 +28,9 @@ pub use catalog::{Catalog, CatalogError};
 pub use dump::{playback, replay_bytes, replay_file};
 pub use table::{Cell, ColumnDef, ColumnType, IndexDef, TableSchema};
 
+/// 引擎私有 Tick 表默认保留窗口：2 小时（按事件时间）。
+pub const TICK_RETENTION_NS: i64 = 2 * 60 * 60 * 1_000_000_000;
+
 /// 写入、查询或恢复失败。
 ///
 /// [`StoreError::Io`] 和 [`StoreError::Schema`] 的字符串说明具体原因。其余变体各自对应一种固定失败。
@@ -1453,6 +1456,7 @@ impl Engine {
             self.frames
                 .push(bar_frame(seq, event_ts_ns, event, index as u16 + 1));
         }
+        self.trim_frames();
         if self.pending.is_empty() {
             self.group_started_ns = now_ns();
         }
@@ -2162,6 +2166,7 @@ impl Engine {
                     volume: trade.volume,
                     amount: trade.amount,
                 });
+                self.prune_ticks(symbol_id, event_ts_ns);
                 let quote = self.quotes.entry(symbol_id).or_insert(QuoteRow {
                     seq: record.seq,
                     last: trade.price,
@@ -2260,6 +2265,27 @@ impl Engine {
         }
         self.shm = Some(shm);
         Ok(())
+    }
+
+    /// 私有帧列表只保留最近一个环形缓冲长度，与共享内存环同窗。
+    fn trim_frames(&mut self) {
+        let cap = self.region.ring_capacity as usize;
+        if cap == 0 || self.frames.len() <= cap {
+            return;
+        }
+        let drop = self.frames.len() - cap;
+        self.frames.drain(0..drop);
+    }
+
+    /// 丢掉早于 `event_ts_ns - TICK_RETENTION_NS` 的逐笔。
+    fn prune_ticks(&mut self, symbol_id: u32, event_ts_ns: i64) {
+        let floor = event_ts_ns.saturating_sub(TICK_RETENTION_NS);
+        if let Some(rows) = self.ticks.get_mut(&symbol_id) {
+            let keep = rows.partition_point(|row| row.ts < floor);
+            if keep > 0 {
+                rows.drain(0..keep);
+            }
+        }
     }
 
     fn changes_for(&self, record: &WalRecord, events: &[BarEvent]) -> Vec<Change> {

@@ -106,12 +106,14 @@ flowchart LR
 
 | 参数 | 默认 | 说明 |
 | --- | --- | --- |
-| `max_symbols` | 65536 | 符号 ID 从 1 开始，0 表示无效 |
+| `max_symbols` | 8192（`qdb`）；库接口 `dev` 为 1024 | 符号 ID 从 1 开始，0 表示无效。全市场用环境变量调到 65536 |
 | `frame_size` | 256 | 含帧头 |
-| `ring_capacity` | 65536 | 帧数，开发默认约 16MB。生产可调到 2 的幂 |
+| `ring_capacity` | 16384（`qdb`）；库接口 `dev` 为 4096 | 帧数，必须是 2 的幂。全市场可设 65536 |
 | `reader_slots` | 64 | 已注册读者，用于水位。未注册读者仍可自检 gap |
-| `period_slots` | 8 | 未闭合 K 线表预留，第一版用 6 个周期 |
+| `period_slots` | 8 | 未闭合 K 线表预留，第一版用 7 个周期 |
 | 文件权限 | `0640` | 属主可写，同组只读 |
+
+`qdb` 进程用 `QDB_MAX_SYMBOLS`、`QDB_RING_CAPACITY`（须为 2 的幂）、可选 `QDB_READER_SLOTS` 覆盖上表。缺省 [`RegionConfig::desk`]：约 12.5 MiB 逻辑长度。`RegionConfig::market`（65536×65536）约 84 MiB。创建区域时不整文件预清零，未写入的页保持按需分配，避免一启动就把整区算进 RSS。引擎私有的发布帧列表长度不超过当前 `ring_capacity`。已闭合 K 线每个 `(symbol_id, period)` 在内存最多保留 8192 根。
 
 逻辑布局：
 
@@ -402,7 +404,7 @@ struct KlinePod {
 }
 ```
 
-未闭合 K 线放在共享内存的二维表 `[symbol_id][period_index]`，每个周期每只股票最多一根。已闭合 K 线追加到引擎私有的按 `(symbol_id, period_id)` 排序的段里，不在原槽改写。
+未闭合 K 线放在共享内存的二维表 `[symbol_id][period_index]`，每个周期每只股票最多一根。已闭合 K 线追加到引擎私有的按 `(symbol_id, period_id)` 排序的段里，不在原槽改写。每个键在内存里最多保留最近 8192 根；更早的闭合桶丢掉，WAL 与检查点仍可恢复历史。
 
 修订已闭合 K 线时追加一根相同 `bucket_start_ns`、更大 `revision` 的记录。查询取该桶最大 `revision`。旧修订保留，直到快照压缩。`origin = import` 的桶不会被实时 Tick 改写；晚到的 Tick 记为异常。
 
@@ -1186,7 +1188,7 @@ M1 到 M5 构成最低可用版本。WebSocket 文本推送已接在同一套 `S
 | 分布式控制面 | epoch 防脑裂 | 共享内存解决不了跨机写入权 |
 | 表模型 | 通用结构化表。追加和最新值是两种存法。主键可以多列 | 引擎不理解业务。现有业务表只是已写上的适配，不再扩展 |
 
-组提交间隔、Tick 保留 2 小时、WAL 保留 7 天、环形缓冲 65536 帧都是默认配置，不是布局的一部分。改配置不需要换 `abi_version`。改帧头、槽位大小或 seqlock 规则需要 `abi_version + 1`。
+组提交间隔、Tick 保留 2 小时、WAL 保留 7 天、环形缓冲缺省 16384 帧（全市场可 65536）都是默认配置，不是布局的一部分。改配置不需要换 `abi_version`。改帧头、槽位大小或 seqlock 规则需要 `abi_version + 1`。
 
 ## 15. 需求对照
 

@@ -25,6 +25,7 @@ use serde_json::Value;
 
 struct Databases {
     catalog: Catalog,
+    region: qdb_shm::RegionConfig,
     engines: Mutex<HashMap<String, Arc<Mutex<Engine>>>>,
 }
 
@@ -46,7 +47,7 @@ impl Databases {
         }
         let engine = Arc::new(Mutex::new(
             self.catalog
-                .open_database_with(name, &qdb_shm::RegionConfig::market())
+                .open_database_with(name, &self.region)
                 .map_err(|err| err.to_string())?,
         ));
         engines.insert(name.to_string(), engine.clone());
@@ -66,9 +67,23 @@ fn main() {
         }
     };
     let root = std::env::args().nth(1).unwrap_or_else(|| "data".into());
+    let region = match qdb_shm::RegionConfig::from_env() {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            eprintln!("共享内存容量不合法: {err}");
+            std::process::exit(1);
+        }
+    };
+    eprintln!(
+        "region max_symbols={} ring={} (~{} MiB)",
+        region.max_symbols,
+        region.ring_capacity,
+        (region.byte_len() + 512 * 1024) / (1024 * 1024)
+    );
     let catalog = Catalog::open(std::path::Path::new(&root)).expect("open qdb");
     let databases = Databases {
         catalog,
+        region,
         engines: Mutex::new(HashMap::new()),
     };
     let engine = databases.get("default").expect("open default database");

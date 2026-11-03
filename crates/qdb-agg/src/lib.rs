@@ -11,6 +11,11 @@ use qdb_abi::{
 };
 use thiserror::Error;
 
+/// 每个 `(symbol_id, period)` 在内存里最多保留的已闭合 K 线根数。
+///
+/// 超出时丢掉最旧的。与 `GET /v1/klines` 的 `limit` 上限同量级，避免长跑把私有堆撑爆。
+pub const MAX_SEALED_BARS: usize = 8_192;
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AggError {
     #[error("gap at seq {seq}, last applied {last_applied}")]
@@ -267,7 +272,12 @@ impl KlineAggregator {
         let mut bar = self.open.remove(&key).expect("open bar");
         bar.body.state = STATE_CLOSED;
         bar.seq = seq;
-        self.sealed.entry(key).or_default().push(bar.body);
+        let rows = self.sealed.entry(key).or_default();
+        rows.push(bar.body);
+        if rows.len() > MAX_SEALED_BARS {
+            let drop = rows.len() - MAX_SEALED_BARS;
+            rows.drain(0..drop);
+        }
         BarEvent::Seal(bar)
     }
 }
@@ -421,6 +431,21 @@ mod tests {
         assert_eq!(agg.sealed(1, Period::M1).len(), 1);
         assert_eq!(agg.sealed(1, Period::M1)[0].close, 100);
         assert!(agg.open_bar(1, Period::M1).is_none());
+    }
+
+    #[test]
+    fn sealed_bars_drop_the_oldest_when_over_cap() {
+        let mut agg = KlineAggregator::default();
+        let base = utc_ns(2024, 1, 2, 0, 0, 0);
+        let total = MAX_SEALED_BARS as i64 + 5;
+        for i in 0..total {
+            let t = base + i * 1_000_000_000;
+            agg.apply_trade((i + 1) as u64, &binance(t, 100 + i))
+                .unwrap();
+        }
+        let sealed = agg.sealed(1, Period::S1);
+        assert_eq!(sealed.len(), MAX_SEALED_BARS);
+        assert_eq!(sealed[0].close, 100 + (total - 1 - MAX_SEALED_BARS as i64));
     }
 
     fn binance(ts_ns: i64, price: i64) -> TradeInput {

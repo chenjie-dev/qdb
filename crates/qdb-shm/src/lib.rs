@@ -63,7 +63,7 @@ impl RegionConfig {
     ///
     /// # Returns
     ///
-    /// 库接口默认打开库时用这份配置。不适合全市场。
+    /// 库接口默认打开库时用这份配置。逻辑长度约 2 MiB。不适合全市场。
     pub fn dev() -> Self {
         Self {
             max_symbols: 1024,
@@ -72,11 +72,25 @@ impl RegionConfig {
         }
     }
 
+    /// 单机席位缺省：8192 个符号槽、16384 帧、64 个读者槽。
+    ///
+    /// # Returns
+    ///
+    /// `qdb` 未设置环境变量时的配置。逻辑长度约 12.5 MiB，覆盖常见 A 股代码量。
+    pub fn desk() -> Self {
+        Self {
+            max_symbols: 8_192,
+            ring_capacity: 16_384,
+            reader_slots: 64,
+        }
+    }
+
     /// 行情中心规模：65536 个符号槽、65536 帧、64 个读者槽。
     ///
     /// # Returns
     ///
-    /// `qdb` 进程打开库时使用的配置。映射文件大约数百兆。
+    /// 全市场预设。逻辑长度约 84 MiB。`qdb` 用 `QDB_MAX_SYMBOLS=65536` 与
+    /// `QDB_RING_CAPACITY=65536` 选这份规模。
     pub fn market() -> Self {
         Self {
             max_symbols: 65_536,
@@ -97,6 +111,53 @@ impl RegionConfig {
             reader_slots: 4,
         }
     }
+
+    /// 从环境变量读出 `qdb` 进程要用的区域容量。
+    ///
+    /// 缺省是 [`Self::desk`]。可读 `QDB_MAX_SYMBOLS`、`QDB_RING_CAPACITY`（须为 2 的幂）、
+    /// 可选 `QDB_READER_SLOTS`。
+    ///
+    /// # Returns
+    ///
+    /// 解析后的配置。
+    ///
+    /// # Errors
+    ///
+    /// * [`ShmError::BadCapacity`] - 帧槽不是 2 的幂，或符号槽 / 读者槽为 0。
+    /// * [`ShmError::Io`] - 环境变量不是无符号整数。
+    pub fn from_env() -> Result<Self, ShmError> {
+        let mut cfg = Self::desk();
+        if let Ok(raw) = std::env::var("QDB_MAX_SYMBOLS") {
+            cfg.max_symbols = parse_u32_env("QDB_MAX_SYMBOLS", &raw)?;
+        }
+        if let Ok(raw) = std::env::var("QDB_RING_CAPACITY") {
+            cfg.ring_capacity = parse_u32_env("QDB_RING_CAPACITY", &raw)?;
+        }
+        if let Ok(raw) = std::env::var("QDB_READER_SLOTS") {
+            cfg.reader_slots = parse_u32_env("QDB_READER_SLOTS", &raw)?;
+        }
+        if cfg.max_symbols == 0 || cfg.reader_slots == 0 {
+            return Err(ShmError::BadCapacity);
+        }
+        if cfg.ring_capacity == 0 || !cfg.ring_capacity.is_power_of_two() {
+            return Err(ShmError::BadCapacity);
+        }
+        Ok(cfg)
+    }
+
+    /// 按当前参数算出 `region.bin` 的逻辑字节数。
+    ///
+    /// # Returns
+    ///
+    /// 头页、读者槽、符号、快照、未闭合 K 线表和环形缓冲的合计长度。
+    pub fn byte_len(&self) -> usize {
+        region_len(self)
+    }
+}
+
+fn parse_u32_env(name: &str, raw: &str) -> Result<u32, ShmError> {
+    raw.parse::<u32>()
+        .map_err(|_| ShmError::Io(format!("{name} must be an unsigned integer")))
 }
 
 pub struct ShmRegion {
@@ -155,7 +216,8 @@ impl ShmRegion {
         // SAFETY: 文件长度已设为区域长度，映射在 `ShmRegion` 持有期间有效。
         let mut mmap =
             unsafe { MmapMut::map_mut(&file) }.map_err(|err| ShmError::Io(err.to_string()))?;
-        mmap.fill(0);
+        // 不整文件 `fill(0)`：`set_len` 已保证扩展字节为 0，整区清零会把全部页拉进
+        // 进程 RSS。只写头页；符号 / 快照 / K 线 / 环在首次写入时再按需落页。
         write_header(&mut mmap, cfg);
         Ok(Self {
             mmap,
@@ -656,6 +718,38 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn desk_region_is_much_smaller_than_market() {
+        let desk = RegionConfig::desk().byte_len();
+        let market = RegionConfig::market().byte_len();
+        assert!(desk < 16 * 1024 * 1024, "desk={desk}");
+        assert!(market > 80 * 1024 * 1024, "market={market}");
+        assert!(desk * 4 < market);
+    }
+
+    #[test]
+    fn from_env_rejects_non_power_of_two_ring() {
+        let prev = std::env::var("QDB_RING_CAPACITY").ok();
+        std::env::set_var("QDB_RING_CAPACITY", "1000");
+        let err = RegionConfig::from_env().unwrap_err();
+        match prev {
+            Some(value) => std::env::set_var("QDB_RING_CAPACITY", value),
+            None => std::env::remove_var("QDB_RING_CAPACITY"),
+        }
+        assert!(matches!(err, ShmError::BadCapacity));
+    }
+
+    #[test]
+    fn create_does_not_require_touching_every_page() {
+        let path = temp_path("sparse");
+        let cfg = RegionConfig::desk();
+        let region = ShmRegion::create(&path, &cfg).unwrap();
+        drop(region);
+        let meta = std::fs::metadata(&path).unwrap();
+        assert_eq!(meta.len(), cfg.byte_len() as u64);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

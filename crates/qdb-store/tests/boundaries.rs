@@ -2,7 +2,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use qdb_abi::Period;
-use qdb_store::{Cell, ColumnDef, ColumnType, Engine, IndexDef, StoreError, TableSchema};
+use qdb_shm::RegionConfig;
+use qdb_store::{
+    Cell, ColumnDef, ColumnType, Engine, IndexDef, StoreError, TableSchema, TICK_RETENTION_NS,
+};
 
 static TEMP: AtomicU64 = AtomicU64::new(0);
 
@@ -149,14 +152,22 @@ fn user_table_rejects_reserved_names_long_strings_and_duplicate_keys() {
 fn negative_and_late_timestamps_stay_in_ticks_without_panicking() {
     let dir = temp("time");
     let mut engine = Engine::open(&dir).unwrap();
+    // 负时间单独写一笔，确认不 panic；与 2024 时间戳相隔超过保留窗时会被剪掉。
     engine.write_trade("SSE", "600000", -1, 10, 1).unwrap();
-    engine.write_trade("SSE", "600000", utc(2), 20, 1).unwrap();
-    engine.write_trade("SSE", "600000", utc(0), 5, 1).unwrap();
     let id = engine.resolve("SSE:600000").unwrap();
+    assert_eq!(engine.ticks(id).len(), 1);
+    assert_eq!(engine.ticks(id)[0].ts, -1);
+
+    let base = utc(0);
+    engine
+        .write_trade("SSE", "600000", base + 500_000_000, 20, 1)
+        .unwrap();
+    engine
+        .write_trade("SSE", "600000", base + 100_000_000, 5, 1)
+        .unwrap();
     let ticks = engine.ticks(id);
-    assert_eq!(ticks.len(), 3);
-    assert_eq!(ticks[0].ts, -1);
-    assert_eq!(ticks[2].price, 5);
+    assert_eq!(ticks.len(), 2);
+    assert_eq!(ticks[1].price, 5);
     assert!(engine
         .klines(id, Period::M1)
         .iter()
@@ -339,6 +350,40 @@ fn grouped_trades_flush_in_batches_instead_of_once_per_row() {
     assert!(engine.flush_count() < 512);
     let id = engine.resolve("SSE:600000").unwrap();
     assert_eq!(engine.ticks(id).len(), 512);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn ticks_older_than_retention_window_are_dropped() {
+    let dir = temp("tick-ret");
+    let mut engine = Engine::open(&dir).unwrap();
+    let t0 = utc(0);
+    engine.write_trade("SSE", "600000", t0, 10, 1).unwrap();
+    engine
+        .write_trade("SSE", "600000", t0 + TICK_RETENTION_NS + 1, 11, 1)
+        .unwrap();
+    let id = engine.resolve("SSE:600000").unwrap();
+    let ticks = engine.ticks(id);
+    assert_eq!(ticks.len(), 1);
+    assert_eq!(ticks[0].price, 11);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn private_frames_stay_within_ring_capacity() {
+    let dir = temp("frame-cap");
+    let cfg = RegionConfig {
+        max_symbols: 32,
+        ring_capacity: 8,
+        reader_slots: 4,
+    };
+    let mut engine = Engine::open_with(&dir, &cfg).unwrap();
+    engine.set_group_commit(64, 0);
+    for i in 0..40 {
+        engine.write_trade("SSE", "600000", i, 10, 1).unwrap();
+    }
+    engine.flush().unwrap();
+    assert!(engine.frames().len() <= cfg.ring_capacity as usize);
     let _ = std::fs::remove_dir_all(dir);
 }
 
