@@ -26,6 +26,7 @@ use serde_json::Value;
 struct Databases {
     catalog: Catalog,
     region: qdb_shm::RegionConfig,
+    tick_retention_ns: i64,
     engines: Mutex<HashMap<String, Arc<Mutex<Engine>>>>,
 }
 
@@ -45,13 +46,30 @@ impl Databases {
         if !self.catalog.exists(name) {
             return Err(format!("database not found: {name}"));
         }
-        let engine = Arc::new(Mutex::new(
-            self.catalog
-                .open_database_with(name, &self.region)
-                .map_err(|err| err.to_string())?,
-        ));
+        let mut opened = self
+            .catalog
+            .open_database_with(name, &self.region)
+            .map_err(|err| err.to_string())?;
+        opened.set_tick_retention_ns(self.tick_retention_ns);
+        let engine = Arc::new(Mutex::new(opened));
         engines.insert(name.to_string(), engine.clone());
         Ok(engine)
+    }
+}
+
+/// 读 `QDB_TICK_RETENTION_SECS`。未设置时用库缺省 2 小时；`0` 表示内存里不按时间丢掉逐笔。
+fn tick_retention_from_env() -> Result<i64, String> {
+    match std::env::var("QDB_TICK_RETENTION_SECS") {
+        Err(_) => Ok(qdb_store::TICK_RETENTION_NS),
+        Ok(raw) => {
+            let secs: i64 = raw
+                .parse()
+                .map_err(|_| String::from("QDB_TICK_RETENTION_SECS must be an integer"))?;
+            if secs < 0 {
+                return Err(String::from("QDB_TICK_RETENTION_SECS must be >= 0"));
+            }
+            Ok(secs.saturating_mul(1_000_000_000))
+        }
     }
 }
 
@@ -74,16 +92,25 @@ fn main() {
             std::process::exit(1);
         }
     };
+    let tick_retention_ns = match tick_retention_from_env() {
+        Ok(ns) => ns,
+        Err(err) => {
+            eprintln!("{err}");
+            std::process::exit(1);
+        }
+    };
     eprintln!(
-        "region max_symbols={} ring={} (~{} MiB)",
+        "region max_symbols={} ring={} (~{} MiB); tick_retention_secs={}",
         region.max_symbols,
         region.ring_capacity,
-        (region.byte_len() + 512 * 1024) / (1024 * 1024)
+        (region.byte_len() + 512 * 1024) / (1024 * 1024),
+        tick_retention_ns / 1_000_000_000
     );
     let catalog = Catalog::open(std::path::Path::new(&root)).expect("open qdb");
     let databases = Databases {
         catalog,
         region,
+        tick_retention_ns,
         engines: Mutex::new(HashMap::new()),
     };
     let engine = databases.get("default").expect("open default database");

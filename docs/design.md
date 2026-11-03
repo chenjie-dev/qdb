@@ -113,7 +113,7 @@ flowchart LR
 | `period_slots` | 8 | 未闭合 K 线表预留，第一版用 7 个周期 |
 | 文件权限 | `0640` | 属主可写，同组只读 |
 
-`qdb` 进程用 `QDB_MAX_SYMBOLS`、`QDB_RING_CAPACITY`（须为 2 的幂）、可选 `QDB_READER_SLOTS` 覆盖上表。缺省 [`RegionConfig::desk`]：约 12.5 MiB 逻辑长度。`RegionConfig::market`（65536×65536）约 84 MiB。创建区域时不整文件预清零，未写入的页保持按需分配，避免一启动就把整区算进 RSS。引擎私有的发布帧列表长度不超过当前 `ring_capacity`。已闭合 K 线每个 `(symbol_id, period)` 在内存最多保留 8192 根。
+`qdb` 进程用 `QDB_MAX_SYMBOLS`、`QDB_RING_CAPACITY`（须为 2 的幂）、可选 `QDB_READER_SLOTS` 覆盖上表，按机器内存选型，而不是在引擎里写死一份「全市场」或「席位」容量。缺省 [`RegionConfig::desk`]：约 12.5 MiB 逻辑长度。`RegionConfig::market`（65536×65536）约 84 MiB。创建区域时不整文件预清零，未写入的页保持按需分配，避免一启动就把整区算进 RSS。引擎私有的发布帧列表长度与当前 `ring_capacity` 对齐（环外续传走 WAL）。已闭合 K 线在内存里只追加，不设硬上限；内存压力由部署侧调小区域、Tick 保留窗或机器规格解决。
 
 逻辑布局：
 
@@ -361,7 +361,7 @@ Tick 只追加。成交表不更新旧行。报价更新的是快照槽，同时
 Segment { symbol_id, start_seq, end_seq, start_ts, end_ts, rows: Vec<TickRow> }
 ```
 
-这是引擎私有内存。环形缓冲被覆盖之后，SQL 仍能查询保留窗口内的 Tick。默认保留最近 2 小时，可配置。超出保留窗口的 Tick 查询返回 `RetentionExceeded`，不静默截断。更早的数据留在 WAL 保留期内，供恢复和续传，不保证都能被 SQL 扫到。
+这是引擎私有内存。环形缓冲被覆盖之后，SQL 仍能查询保留窗口内的 Tick。缺省保留最近 2 小时，可用 `Engine::set_tick_retention_ns` 或 `QDB_TICK_RETENTION_SECS` 改；`0` 表示不按时间丢掉。超出已配置保留窗口的 Tick 查询应返回 `RetentionExceeded`（第一版实现为内存里已剪掉、查询只见窗内行）。更早的数据留在 WAL 保留期内，供恢复和续传，不保证都能被 SQL 扫到。
 
 同一 `(exchange_id, trade_id)` 在去重窗口内出现两次时，第二次不分配新 `seq`。去重窗口默认 65536 条或 60 秒。
 
@@ -404,7 +404,7 @@ struct KlinePod {
 }
 ```
 
-未闭合 K 线放在共享内存的二维表 `[symbol_id][period_index]`，每个周期每只股票最多一根。已闭合 K 线追加到引擎私有的按 `(symbol_id, period_id)` 排序的段里，不在原槽改写。每个键在内存里最多保留最近 8192 根；更早的闭合桶丢掉，WAL 与检查点仍可恢复历史。
+未闭合 K 线放在共享内存的二维表 `[symbol_id][period_index]`，每个周期每只股票最多一根。已闭合 K 线追加到引擎私有的按 `(symbol_id, period_id)` 排序的段里，不在原槽改写。第一版不对已闭合段做条数硬截断；需要控内存时由部署调配置或做快照压缩（见运维节）。
 
 修订已闭合 K 线时追加一根相同 `bucket_start_ns`、更大 `revision` 的记录。查询取该桶最大 `revision`。旧修订保留，直到快照压缩。`origin = import` 的桶不会被实时 Tick 改写；晚到的 Tick 记为异常。
 

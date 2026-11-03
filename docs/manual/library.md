@@ -46,9 +46,9 @@ pub fn poll(&mut self) -> Result<Vec<Change>, StoreError>
 
 `poll` 只读取打开之后新 `fsync` 的记录，并更新这次打开的内存表。返回的 `Change` 按表区分：`ticks`、`snapshots`、`klines`。没有新记录时返回空向量。坏 CRC 返回 `wal crc failed`。文件尾部不足一条记录时忽略，不视为损坏。
 
-开发配置的共享内存是 1024 个证券槽、4096 帧环形缓冲（约 2 MiB）。`qdb` 进程缺省是 8192 / 16384（约 12.5 MiB），可用环境变量改到全市场 65536 / 65536（约 84 MiB），见 [限制](limits.md)。
+开发配置的共享内存是 1024 个证券槽、4096 帧环形缓冲（约 2 MiB）。`qdb` 进程缺省是 8192 / 16384（约 12.5 MiB），按机器用环境变量改到所需规模（例如全市场 65536 / 65536，约 84 MiB），见 [限制](limits.md)。
 
-`open_with` 可传入任意 `RegionConfig`。进程内发布帧列表长度不超过该配置的 `ring_capacity`。Tick 按事件时间只保留最近 2 小时。
+`open_with` 可传入任意 `RegionConfig`。进程内发布帧列表与该配置的 `ring_capacity` 同窗。`set_tick_retention_ns` 控制私有 Tick 保留；`0` 表示不剪枝，缺省是 2 小时。
 
 ## 写入
 

@@ -7,9 +7,9 @@
 
 ## 已做 / 未做 / 已知风险 / 复验命令
 
-- 已做：`qdb` 缺省区域改为 desk（8192×16384，约 12.5 MiB）；`QDB_MAX_SYMBOLS` / `QDB_RING_CAPACITY` / `QDB_READER_SLOTS`；创建区域不再整文件 `fill(0)`；私有 frames 上限 = ring；Tick 2h 剪枝；已闭合 K 线每键最多 8192；设计与手册同步。
-- 未做：查询超出 Tick 保留窗时返回 `RetentionExceeded`（设计已写、本轮仍只剪枝）；已闭合 K 线超出窗后不从 WAL 自动回填 SQL；稀疏文件在部分文件系统上的实际占用未做跨平台计量。
-- 已知风险：已有按 `market` 规模规划的部署需显式设环境变量；剪枝后长窗 SQL 结果变短。
+- 已做：区域容量环境变量化（缺省 desk）；不整文件 `fill(0)`；私有 frames 与 `ring_capacity` 对齐；Tick 保留可配置（`set_tick_retention_ns` / `QDB_TICK_RETENTION_SECS`，`0`=不剪）；**撤销**已闭合 K 线条数硬上限。
+- 未做：`RetentionExceeded` 查询错误；按机器自动探测物理内存给缺省区域。
+- 已知风险：大机器若忘记调大 `QDB_MAX_SYMBOLS` 会先碰到符号槽满；小机器若设成 market 仍会占约 84 MiB 逻辑长度。
 - 复验命令：
 
 ```bash
@@ -26,7 +26,7 @@ cargo test -p qdb-store --test boundaries -- --test-threads=1 ticks_older privat
 | 非法 ring 容量启动失败 | pass | `from_env_rejects_non_power_of_two_ring` |
 | Tick 超过 2h 被丢掉 | pass | `ticks_older_than_retention_window_are_dropped` |
 | 私有 frames ≤ ring | pass | `private_frames_stay_within_ring_capacity` |
-| 已闭合 K 线有上限 | pass | `sealed_bars_drop_the_oldest_when_over_cap` |
+| 已闭合 K 线无条数硬上限 | pass | 已删 `MAX_SEALED_BARS`；`zero_tick_retention_keeps_old_prints` |
 
 ## 冒烟（非仅 /health）
 

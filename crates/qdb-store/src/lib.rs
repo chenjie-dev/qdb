@@ -28,7 +28,9 @@ pub use catalog::{Catalog, CatalogError};
 pub use dump::{playback, replay_bytes, replay_file};
 pub use table::{Cell, ColumnDef, ColumnType, IndexDef, TableSchema};
 
-/// 引擎私有 Tick 表默认保留窗口：2 小时（按事件时间）。
+/// 引擎私有 Tick 表的缺省保留窗口：2 小时（按事件时间）。
+///
+/// `0` 表示不剪枝。部署可用 [`Engine::set_tick_retention_ns`] 或进程环境变量改掉。
 pub const TICK_RETENTION_NS: i64 = 2 * 60 * 60 * 1_000_000_000;
 
 /// 写入、查询或恢复失败。
@@ -182,6 +184,8 @@ pub struct Engine {
     wal_pos: u64,
     tables: table::TableSet,
     region: RegionConfig,
+    /// 私有 Tick 保留窗口（纳秒）。`0` 表示不按时间丢掉。
+    tick_retention_ns: i64,
     group_limit: u64,
     group_interval_ns: u64,
     group_started_ns: u64,
@@ -319,6 +323,7 @@ impl Engine {
             wal_pos: loaded.consumed,
             tables: table::TableSet::default(),
             region: region.clone(),
+            tick_retention_ns: TICK_RETENTION_NS,
             group_limit: 1,
             group_interval_ns: 0,
             group_started_ns: 0,
@@ -1479,6 +1484,26 @@ impl Engine {
         self.group_interval_ns = interval_ns;
     }
 
+    /// 设置私有 Tick 表按事件时间的保留窗口。
+    ///
+    /// 不改已经落盘的 WAL。只影响之后写入时是否丢掉更早的内存逐笔。
+    ///
+    /// # Arguments
+    ///
+    /// * `retention_ns` - 保留多久。`0` 表示不剪枝，内存里一直留着。
+    pub fn set_tick_retention_ns(&mut self, retention_ns: i64) {
+        self.tick_retention_ns = retention_ns.max(0);
+    }
+
+    /// 当前 Tick 保留窗口（纳秒）。`0` 表示不剪枝。
+    ///
+    /// # Returns
+    ///
+    /// 最近一次 [`Engine::set_tick_retention_ns`] 的值，打开时缺省为 [`TICK_RETENTION_NS`]。
+    pub fn tick_retention_ns(&self) -> i64 {
+        self.tick_retention_ns
+    }
+
     /// 已经完成的 `fsync` 次数。
     ///
     /// 组提交把多条写入并成一次时，这个数小于写入次数。
@@ -2277,9 +2302,12 @@ impl Engine {
         self.frames.drain(0..drop);
     }
 
-    /// 丢掉早于 `event_ts_ns - TICK_RETENTION_NS` 的逐笔。
+    /// 按当前 [`Engine::tick_retention_ns`] 丢掉过期逐笔。`0` 时什么也不做。
     fn prune_ticks(&mut self, symbol_id: u32, event_ts_ns: i64) {
-        let floor = event_ts_ns.saturating_sub(TICK_RETENTION_NS);
+        if self.tick_retention_ns <= 0 {
+            return;
+        }
+        let floor = event_ts_ns.saturating_sub(self.tick_retention_ns);
         if let Some(rows) = self.ticks.get_mut(&symbol_id) {
             let keep = rows.partition_point(|row| row.ts < floor);
             if keep > 0 {

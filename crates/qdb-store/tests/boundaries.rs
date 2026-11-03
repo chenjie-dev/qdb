@@ -370,6 +370,21 @@ fn ticks_older_than_retention_window_are_dropped() {
 }
 
 #[test]
+fn zero_tick_retention_keeps_old_prints() {
+    let dir = temp("tick-keep");
+    let mut engine = Engine::open(&dir).unwrap();
+    engine.set_tick_retention_ns(0);
+    let t0 = utc(0);
+    engine.write_trade("SSE", "600000", t0, 10, 1).unwrap();
+    engine
+        .write_trade("SSE", "600000", t0 + TICK_RETENTION_NS + 1, 11, 1)
+        .unwrap();
+    let id = engine.resolve("SSE:600000").unwrap();
+    assert_eq!(engine.ticks(id).len(), 2);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn private_frames_stay_within_ring_capacity() {
     let dir = temp("frame-cap");
     let cfg = RegionConfig {
