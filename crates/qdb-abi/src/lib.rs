@@ -62,6 +62,8 @@ pub enum MsgType {
     TableRename = 14,
     /// 调用方表改列名。行槽按位置不动，已经落盘的行仍按旧列名解释。
     TableRenameColumn = 15,
+    /// 调用方表末尾加一列。已有行填类型默认值，已经落盘的行仍按旧列数解释。
+    TableAddColumn = 16,
 }
 
 impl MsgType {
@@ -69,7 +71,7 @@ impl MsgType {
     ///
     /// # Arguments
     ///
-    /// * `value` - 1 到 15。其余值没有对应类型。
+    /// * `value` - 1 到 16。其余值没有对应类型。
     ///
     /// # Returns
     ///
@@ -91,6 +93,7 @@ impl MsgType {
             13 => Self::TableTruncate,
             14 => Self::TableRename,
             15 => Self::TableRenameColumn,
+            16 => Self::TableAddColumn,
             _ => return None,
         })
     }

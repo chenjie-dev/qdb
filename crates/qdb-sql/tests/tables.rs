@@ -1270,3 +1270,122 @@ fn rename_column_keeps_row_slots_and_updates_indexes() {
     );
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn add_column_pads_existing_rows_with_type_defaults() {
+    let (dir, mut engine) = open();
+    SqlEngine::execute(
+        &mut engine,
+        "CREATE TABLE note (id INT64 PRIMARY KEY, code STRING)",
+    )
+    .unwrap();
+    SqlEngine::execute(&mut engine, "INSERT INTO note VALUES (1, 'old')").unwrap();
+    let before = SqlEngine::new(&engine)
+        .query("SELECT seq FROM note WHERE id = 1")
+        .unwrap();
+    let added = SqlEngine::execute(&mut engine, "ALTER TABLE note ADD COLUMN active BOOL").unwrap();
+    assert_eq!(added.rows, vec![vec!["added".to_string()]]);
+    assert_eq!(
+        SqlEngine::new(&engine)
+            .query("SELECT code, active FROM note WHERE id = 1")
+            .unwrap()
+            .rows,
+        vec![vec!["old".to_string(), "false".to_string()]]
+    );
+    assert_eq!(
+        SqlEngine::new(&engine)
+            .query("SELECT seq FROM note WHERE id = 1")
+            .unwrap()
+            .rows,
+        before.rows
+    );
+    SqlEngine::execute(&mut engine, "ALTER TABLE note ADD COLUMN n INT64").unwrap();
+    SqlEngine::execute(&mut engine, "ALTER TABLE note ADD COLUMN tag STRING").unwrap();
+    assert_eq!(
+        SqlEngine::new(&engine)
+            .query("SELECT n, tag FROM note WHERE id = 1")
+            .unwrap()
+            .rows,
+        vec![vec!["0".to_string(), "".to_string()]]
+    );
+    SqlEngine::execute(
+        &mut engine,
+        "INSERT INTO note VALUES (2, 'new', true, 3, 'x')",
+    )
+    .unwrap();
+    assert_eq!(
+        SqlEngine::new(&engine)
+            .query("SELECT id, active, n, tag FROM note WHERE id = 2")
+            .unwrap()
+            .rows,
+        vec![vec![
+            "2".to_string(),
+            "true".to_string(),
+            "3".to_string(),
+            "x".to_string()
+        ]]
+    );
+    assert_eq!(
+        message(
+            SqlEngine::execute(&mut engine, "INSERT INTO note VALUES (3, 'short')").unwrap_err()
+        ),
+        "syntax: column count"
+    );
+    assert_eq!(
+        message(
+            SqlEngine::execute(&mut engine, "ALTER TABLE note ADD COLUMN active BOOL").unwrap_err()
+        ),
+        "syntax: duplicate column"
+    );
+    assert_eq!(
+        message(
+            SqlEngine::execute(
+                &mut engine,
+                "ALTER TABLE note ADD COLUMN more INT64 PRIMARY KEY"
+            )
+            .unwrap_err()
+        ),
+        "syntax: primary key required"
+    );
+    assert_eq!(
+        message(
+            SqlEngine::execute(&mut engine, "ALTER TABLE note ADD COLUMN bad FLOAT").unwrap_err()
+        ),
+        "syntax: unknown type FLOAT"
+    );
+    assert_eq!(
+        message(
+            SqlEngine::execute(&mut engine, "ALTER TABLE ticks ADD COLUMN n INT64").unwrap_err()
+        ),
+        "syntax: reserved table"
+    );
+    assert_eq!(
+        message(
+            SqlEngine::execute(&mut engine, "ALTER TABLE missing ADD COLUMN n INT64").unwrap_err()
+        ),
+        "symbol not found"
+    );
+    let described = SqlEngine::new(&engine).query("DESCRIBE note").unwrap();
+    assert_eq!(
+        described.rows.last().map(|row| row[0].clone()),
+        Some("tag".to_string())
+    );
+    drop(engine);
+    let mut reader = Engine::open_read(&dir).unwrap();
+    assert_eq!(
+        message(
+            SqlEngine::execute(&mut reader, "ALTER TABLE note ADD COLUMN extra BOOL").unwrap_err()
+        ),
+        "read-only connection"
+    );
+    drop(reader);
+    let engine = Engine::open(&dir).unwrap();
+    assert_eq!(
+        SqlEngine::new(&engine)
+            .query("SELECT active, n, tag FROM note WHERE id = 1")
+            .unwrap()
+            .rows,
+        vec![vec!["false".to_string(), "0".to_string(), "".to_string()]]
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}

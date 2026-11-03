@@ -1,6 +1,6 @@
 //! 普通表。类型只有 `INT64`、`STRING`、`BOOL`。主键可以多列，合起来唯一。二级索引用于等值查找。
 //!
-//! 删除不改已经 `fsync` 的字节，只把行标成不可见。改表名或列名只换内存里的名字，行槽和可见序号原样留下。调用方建成的表在扫描结果最后附带可见 `seq`，这个 `seq` 不是建表时的列。
+//! 删除不改已经 `fsync` 的字节，只把行标成不可见。改表名或列名只换内存里的名字。加列只在末尾追加，已有行填类型默认值。行槽和可见序号原样留下。调用方建成的表在扫描结果最后附带可见 `seq`，这个 `seq` 不是建表时的列。
 //! 引擎登记的四张表仍由写入路径维护，不走这里的删除和条件覆盖。
 #![forbid(unsafe_code)]
 
@@ -607,6 +607,72 @@ impl TableSet {
         if let Some(by_column) = self.secondary.get_mut(&table) {
             if let Some(entries) = by_column.remove(&from) {
                 by_column.insert(to, entries);
+            }
+        }
+        Ok(())
+    }
+
+    /// 把表名和新列定义编码成加列载荷。
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - 调用方表名。
+    /// * `column` - 新列。不能带主键标记。
+    ///
+    /// # Returns
+    ///
+    /// 表名、列名、类型字节。主键标记不进载荷，加列永远不是主键。
+    pub fn encode_add_column(table: &str, column: &ColumnDef) -> Vec<u8> {
+        let mut out = Vec::new();
+        push_str(&mut out, table);
+        push_str(&mut out, &column.name);
+        out.push(column.ty as u8);
+        out
+    }
+
+    /// 按 [`TableSet::encode_add_column`] 的载荷在末尾加一列。
+    ///
+    /// 不改 WAL 里已经写下的行。定义末尾多一列。每一个行槽（含墓碑槽）补上该类型的默认值：`INT64` 是 0，`STRING` 是空串，`BOOL` 是 `false`。可见 `seq` 和截止时间不变。新列没有二级索引。
+    ///
+    /// # Arguments
+    ///
+    /// * `bytes` - [`TableSet::encode_add_column`] 的输出。
+    ///
+    /// # Errors
+    ///
+    /// * [`StoreError::NotFound`] - 表不存在。
+    /// * [`StoreError::Schema`] - 表是引擎登记的四张表之一、列名已占用、类型非法，或载荷被截断。
+    pub fn add_column_encoded(&mut self, bytes: &[u8]) -> Result<(), StoreError> {
+        let mut cursor = 0;
+        let table = take_str(bytes, &mut cursor)?;
+        let name = take_str(bytes, &mut cursor)?;
+        let ty = ColumnType::from_u8(take_u8(bytes, &mut cursor)?)
+            .ok_or_else(|| StoreError::Schema("bad column type".into()))?;
+        if cursor != bytes.len() {
+            return Err(StoreError::Schema("truncated".into()));
+        }
+        if BUILTIN_TABLES.contains(&table.as_str()) {
+            return Err(StoreError::Schema("reserved table".into()));
+        }
+        if name.is_empty() {
+            return Err(StoreError::Schema("duplicate column".into()));
+        }
+        let Some(schema) = self.schemas.get_mut(&table) else {
+            return Err(StoreError::NotFound);
+        };
+        if schema.columns.iter().any(|column| column.name == name) {
+            return Err(StoreError::Schema("duplicate column".into()));
+        }
+        schema.columns.push(ColumnDef {
+            name,
+            ty,
+            primary_key: false,
+        });
+        let fill = default_cell(ty);
+        // 墓碑槽也要补齐，否则行下标和主键、序号向量会对不齐。
+        if let Some(rows) = self.rows.get_mut(&table) {
+            for row in rows {
+                row.push(fill.clone());
             }
         }
         Ok(())
@@ -1603,6 +1669,14 @@ fn primary_key(schema: &TableSchema, values: &[Cell]) -> Option<Vec<u8>> {
 
 fn push_u16(out: &mut Vec<u8>, value: u16) {
     out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn default_cell(ty: ColumnType) -> Cell {
+    match ty {
+        ColumnType::Int64 => Cell::Int64(0),
+        ColumnType::String => Cell::String(String::new()),
+        ColumnType::Bool => Cell::Bool(false),
+    }
 }
 
 fn move_name<V>(map: &mut HashMap<String, V>, from: &str, to: &str) {

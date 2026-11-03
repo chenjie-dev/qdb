@@ -107,6 +107,7 @@ cargo test --workspace -- --test-threads=1
 | `UPDATE` | 只改非主键列，`seq` 更新，二级索引改指向新值；`SET a = b, b = a` 交换；缺键或重复键整句不写；主键列、无主键表和内置表失败；截止时间保留；重启后仍是新值 |
 | `ALTER TABLE ... RENAME TO` | 行、可见 `seq`、索引和截止时间跟着新名字走；旧名字可以再建且是空表；同名、已有表、内置表和不存在的表失败；重启后只有新名字 |
 | `ALTER TABLE ... RENAME COLUMN` | 列名和二级索引跟着改，行槽和行 `seq` 不变；主键列也可改名；缺列、重名、内置表失败；重启后仍用新列名 |
+| `ALTER TABLE ... ADD COLUMN` | 末尾加列，已有行填类型默认值，行 `seq` 不变；不能加主键；重名、内置表、未知类型失败；之后插入要写满新列；重启后仍在 |
 | `JOIN` | `INNER`、`LEFT`、`RIGHT`、`FULL`、`CROSS`；`OUTER` 和 `AS`；`ON` 的 `AND`；缺 `ON`、重复别名、`CROSS` 带 `ON`、重名列、连接上的聚合都失败；连接后引用不存在的列失败，存在的列可以 `BETWEEN`；补出来的空列不再匹配空字符串 |
 
 ## 写法

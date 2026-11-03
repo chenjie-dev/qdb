@@ -611,6 +611,52 @@ impl Engine {
         self.commit(MsgType::TableRenameColumn, 0, 0, 0, 0, &payload, 0)
     }
 
+    /// 在一张调用方建成的表末尾加一列。
+    ///
+    /// 已有行（含墓碑槽）填类型默认值：`INT64` 是 0，`STRING` 是空串，`BOOL` 是 `false`。每一行的可见 `seq` 不变。新列不能是主键，也不带二级索引。这次提交自己有一条 `seq` 并 `fsync`。已经落盘的行仍按旧列数解释。
+    ///
+    /// # Arguments
+    ///
+    /// * `table` - 调用方建成的表名。不能是 `symbols`、`ticks`、`snapshots`、`klines`。
+    /// * `column` - 新列。名字不能为空，也不能已经存在。`primary_key` 必须是 `false`。
+    ///
+    /// # Returns
+    ///
+    /// 这条加列记录的 `seq`。它不是表里某一行的序号。
+    ///
+    /// # Errors
+    ///
+    /// * [`StoreError::NotFound`] - 表不存在。
+    /// * [`StoreError::Schema`] - 表是引擎登记的四张表之一、列名已占用、名字为空，或要求做成主键。
+    /// * [`StoreError::ReadOnly`] - 引擎是只读打开的。
+    /// * [`StoreError::Crc`] - 打开时 WAL 已损坏，拒绝再写。
+    pub fn add_column(&mut self, table: &str, column: ColumnDef) -> Result<u64, StoreError> {
+        self.ensure_writable()?;
+        if table::BUILTIN_TABLES.contains(&table) {
+            return Err(StoreError::Schema("reserved table".into()));
+        }
+        if column.primary_key {
+            return Err(StoreError::Schema("primary key required".into()));
+        }
+        if column.name.is_empty() {
+            return Err(StoreError::Schema("duplicate column".into()));
+        }
+        let schema = self
+            .tables
+            .schema(table)
+            .cloned()
+            .ok_or(StoreError::NotFound)?;
+        if schema
+            .columns
+            .iter()
+            .any(|existing| existing.name == column.name)
+        {
+            return Err(StoreError::Schema("duplicate column".into()));
+        }
+        let payload = table::TableSet::encode_add_column(table, &column);
+        self.commit(MsgType::TableAddColumn, 0, 0, 0, 0, &payload, 0)
+    }
+
     /// 按建表时的列顺序插入一行。
     ///
     /// 主键重复时不写入，也不分配 `seq`。成功时这条记录的 `seq` 成为该主键的可见序号。
@@ -2261,6 +2307,11 @@ impl Engine {
             }
             Some(MsgType::TableRenameColumn) => {
                 self.tables.rename_column_encoded(&record.payload)?;
+                self.agg.note_seq(record.seq)?;
+                Ok(Vec::new())
+            }
+            Some(MsgType::TableAddColumn) => {
+                self.tables.add_column_encoded(&record.payload)?;
                 self.agg.note_seq(record.seq)?;
                 Ok(Vec::new())
             }

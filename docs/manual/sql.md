@@ -658,14 +658,17 @@ INSERT INTO note VALUES (1, 'again', true);
 
 ## ALTER TABLE
 
-给一张调用方建成的表改名，或改其中一列的名字。成功时 `columns` 是 `result`，`rows` 是 `renamed`。语句写入 WAL。行还在，单元格按位置留下。
+给一张调用方建成的表改名、改列名，或在末尾加一列。改名成功时 `rows` 是 `renamed`，加列成功时是 `added`。`columns` 都是 `result`。语句写入 WAL。
 
 ### 语法
 
 ```text
 ALTER TABLE name RENAME TO name
 ALTER TABLE name RENAME COLUMN name TO name
+ALTER TABLE name ADD COLUMN name type
 ```
+
+`type` 是 `INT64`、`STRING` 或 `BOOL`。
 
 ### 说明
 
@@ -673,19 +676,22 @@ ALTER TABLE name RENAME COLUMN name TO name
 
 `RENAME COLUMN` 只改列名。单元格仍按建表时的位置排列，不挪动，也不分配新的行 `seq`。引用该列的二级索引改成新名字，等值查找立刻走新列名。主键列也可以改名，键值本身不变。已经落盘的行仍按旧列名解释。
 
-内置表不能作为表名，也不能改它们的列，返回 `syntax: reserved table`。表不存在返回 `symbol not found`。新表名已经有一张调用方表，或新旧表名相同，返回 `syntax: table already exists`。旧列不存在返回 `syntax: unknown column 名称`。新列名已经是这张表里的列，或新旧列名相同，返回 `syntax: duplicate column`。名字后面还有别的词返回 `syntax: alter`。只读打开的引擎拒绝这条语句。重新打开库之后，仍然只有新名字。
+`ADD COLUMN` 在定义末尾加一列。已有行填类型默认值：`INT64` 是 `0`，`STRING` 是空字符串，`BOOL` 是 `false`。每一行的可见 `seq` 不变。新列不能标 `PRIMARY KEY`，也不带二级索引。之后的 `INSERT` 必须按新列数填写。已经落盘的行仍按旧列数解释。
+
+内置表不能作为表名，也不能改它们的列，返回 `syntax: reserved table`。表不存在返回 `symbol not found`。新表名已经有一张调用方表，或新旧表名相同，返回 `syntax: table already exists`。旧列不存在返回 `syntax: unknown column 名称`。新列名已经是这张表里的列，或新旧列名相同，返回 `syntax: duplicate column`。加列时写成主键返回 `syntax: primary key required`。类型不是三种之一返回 `syntax: unknown type 名称`。名字后面还有别的词返回 `syntax: alter`。只读打开的引擎拒绝这条语句。重新打开库之后，改名和加列的结果仍在。
 
 ### 示例
 
 ```sql
 ALTER TABLE note RENAME TO memo;
 ALTER TABLE memo RENAME COLUMN code TO ticker;
-SELECT ticker FROM memo WHERE id = 1;
+ALTER TABLE memo ADD COLUMN active BOOL;
+SELECT ticker, active FROM memo WHERE id = 1;
 ```
 
 ### 兼容性
 
-没有 `ADD COLUMN`、`DROP COLUMN`、`IF EXISTS`，也不能一次改多张表或一次改多列。这不是改写每一行。
+没有 `DROP COLUMN`、`DEFAULT`、`IF EXISTS`，也不能一次改多张表、一次改多列，或给新列建索引。这不是改写已经落盘的行字节。
 
 ## EXPIRE AT
 
@@ -856,7 +862,7 @@ pub struct QueryResult {
 | 函数 | 作用 |
 |---|---|
 | `SqlEngine::query` | `SELECT`、`SHOW`、`DESCRIBE`。不写 WAL |
-| `SqlEngine::execute` | `CREATE TABLE`、`INSERT`、`UPDATE`、`DELETE`、`DROP TABLE`、`TRUNCATE TABLE`、`ALTER TABLE`、`EXPIRE AT`。需要可写引擎 |
+| `SqlEngine::execute` | `CREATE TABLE`、`INSERT`、`UPDATE`、`DELETE`、`DROP TABLE`、`TRUNCATE TABLE`、`ALTER TABLE`（改表名、改列名、加列）、`EXPIRE AT`。需要可写引擎 |
 | `split_subscribe` | 若语句以 `SUBSCRIBE` 结尾，返回去掉它之后的 `SELECT` |
 | `captured_rows` | 当前结果，最多 100000 行，给订阅记住已经看过的行 |
 | `live_rows` | 把一批新变更投影成与 `SELECT` 相同的列 |
@@ -877,7 +883,7 @@ WebSocket `GET /v1/ws` 接受同一套 `SELECT`，见 [服务进程](server.md)�
 | 窗口 | `OVER`、`rank`、`lag`、`lead` |
 | 表达式 | 四则以外的函数、正则。`CAST` 只接受 `INT64`、`STRING`、`BOOL` |
 | 谓词 | `SIMILAR TO`、`ANY` / `ALL`、数组 |
-| 写入 | `COPY`。`ALTER TABLE` 只能 `RENAME TO` 和 `RENAME COLUMN`。`UPDATE` 只按完整主键改非主键列。`DELETE` 只按主键追加墓碑。`DROP TABLE` 去掉调用方建成的表。`TRUNCATE TABLE` 只清掉可见行 |
+| 写入 | `COPY`。`ALTER TABLE` 只能 `RENAME TO`、`RENAME COLUMN` 和 `ADD COLUMN`。`UPDATE` 只按完整主键改非主键列。`DELETE` 只按主键追加墓碑。`DROP TABLE` 去掉调用方建成的表。`TRUNCATE TABLE` 只清掉可见行 |
 | 目录 | `information_schema`、`pg_catalog` |
 | 协议 | 预编译语句、参数绑定、PostgreSQL 线协议 |
 

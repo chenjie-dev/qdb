@@ -1,4 +1,4 @@
-//! 只读 SQL 子集，以及 `CREATE TABLE`、`INSERT`（含 `EXPECT`）、按主键的 `UPDATE`、`DELETE` 和 `ALTER TABLE` 改名。
+//! 只读 SQL 子集，以及 `CREATE TABLE`、`INSERT`（含 `EXPECT`）、按主键的 `UPDATE`、`DELETE` 和 `ALTER TABLE` 改名、加列。
 //!
 //! 语法边界见 `docs/manual/sql.md`。`WHERE`、表达式、`CASE`、`COALESCE`、`NULLIF`、`GROUP BY`、`HAVING`、`DISTINCT`、`UNION`、`INTERSECT`、`EXCEPT` 和 `ORDER BY` 都会生效。
 #![forbid(unsafe_code)]
@@ -61,7 +61,7 @@ impl<'a> SqlEngine<'a> {
     ///
     /// # Returns
     ///
-    /// 查询返回行。建表成功时 `rows` 是 `created`，插入和条件覆盖是 `inserted`，更新是 `updated`，删除是 `deleted`，删表是 `dropped`，清空表是 `truncated`，改表名或改列名是 `renamed`。更新只改非主键列，并分配新的 `seq`。改名不改变每一行已有的 `seq`。删表和清空都不擦 WAL 里已经落盘的行。清空后表定义还在。
+    /// 查询返回行。建表成功时 `rows` 是 `created`，插入和条件覆盖是 `inserted`，更新是 `updated`，删除是 `deleted`，删表是 `dropped`，清空表是 `truncated`，改表名或改列名是 `renamed`，加列是 `added`。更新只改非主键列，并分配新的 `seq`。改名和加列不改变每一行已有的 `seq`。删表和清空都不擦 WAL 里已经落盘的行。清空后表定义还在。
     ///
     /// # Errors
     ///
@@ -1609,7 +1609,51 @@ fn exec_alter(engine: &mut Engine, tokens: &[String]) -> Result<QueryResult, Sql
         .ok_or_else(|| SqlError::Syntax("alter".into()))?
         .to_ascii_lowercase();
     index += 1;
-    expect(tokens, &mut index, "rename")?;
+    let action = tokens
+        .get(index)
+        .ok_or_else(|| SqlError::Syntax("alter".into()))?
+        .to_ascii_lowercase();
+    index += 1;
+    if action == "add" {
+        expect(tokens, &mut index, "column")?;
+        let column_name = tokens
+            .get(index)
+            .ok_or_else(|| SqlError::Syntax("alter".into()))?
+            .to_ascii_lowercase();
+        index += 1;
+        let type_name = tokens
+            .get(index)
+            .ok_or_else(|| SqlError::Syntax("alter".into()))?;
+        let ty = ColumnType::parse(&type_name.to_ascii_uppercase())
+            .ok_or_else(|| SqlError::Syntax(format!("unknown type {type_name}")))?;
+        index += 1;
+        if tokens
+            .get(index)
+            .is_some_and(|token| token.eq_ignore_ascii_case("primary"))
+        {
+            return Err(SqlError::Syntax("primary key required".into()));
+        }
+        if index != tokens.len() {
+            return Err(SqlError::Syntax("alter".into()));
+        }
+        engine
+            .add_column(
+                &table,
+                ColumnDef {
+                    name: column_name,
+                    ty,
+                    primary_key: false,
+                },
+            )
+            .map_err(map_store)?;
+        return Ok(QueryResult {
+            columns: vec!["result".into()],
+            rows: vec![vec!["added".into()]],
+        });
+    }
+    if action != "rename" {
+        return Err(SqlError::Syntax("alter".into()));
+    }
     if tokens
         .get(index)
         .is_some_and(|token| token.eq_ignore_ascii_case("column"))
