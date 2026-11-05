@@ -13,6 +13,7 @@
 | `Ambiguous` | `ambiguous symbol` | 裸代码对应多只证券 |
 | `Crc` | `wal crc failed` | 打开时 WAL 有坏 CRC，引擎拒绝继续写 |
 | `Gap` | `gap in wal` | 应用时序号不连续 |
+| `MaxMemory` | `maxmemory reached` | 私有数据集估算已达到 `maxmemory`。已有数据保留，读和删除仍可用 |
 | `Agg` | 聚合器的文案 | K 线聚合返回的缺口 |
 
 坏 CRC 之后，已重放的数据仍可查询。新的写入返回 `Crc`。

@@ -48,7 +48,7 @@ pub fn poll(&mut self) -> Result<Vec<Change>, StoreError>
 
 开发配置的共享内存是 1024 个证券槽、4096 帧环形缓冲（约 2 MiB）。`qdb` 进程缺省是 8192 / 16384（约 12.5 MiB），按机器用环境变量改到所需规模（例如全市场 65536 / 65536，约 84 MiB），见 [限制](limits.md)。
 
-`open_with` 可传入任意 `RegionConfig`。进程内发布帧列表与该配置的 `ring_capacity` 同窗。`set_tick_retention_ns` 控制私有 Tick 保留；`0` 表示不剪枝，缺省是 2 小时。
+`open_with` 可传入任意 `RegionConfig`。进程内发布帧列表与该配置的 `ring_capacity` 同窗。`set_tick_retention_ns` 控制私有 Tick 保留；`0` 表示不剪枝，缺省是 2 小时。`set_maxmemory` 给私有数据集设字节预算，`0` 表示不限制；到顶时 `write_*` 返回 `maxmemory reached`。
 
 ## 写入
 

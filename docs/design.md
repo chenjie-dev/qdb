@@ -113,7 +113,9 @@ flowchart LR
 | `period_slots` | 8 | 未闭合 K 线表预留，第一版用 7 个周期 |
 | 文件权限 | `0640` | 属主可写，同组只读 |
 
-`qdb` 进程用 `QDB_MAX_SYMBOLS`、`QDB_RING_CAPACITY`（须为 2 的幂）、可选 `QDB_READER_SLOTS` 覆盖上表，按机器内存选型，而不是在引擎里写死一份「全市场」或「席位」容量。缺省 [`RegionConfig::desk`]：约 12.5 MiB 逻辑长度。`RegionConfig::market`（65536×65536）约 84 MiB。创建区域时不整文件预清零，未写入的页保持按需分配，避免一启动就把整区算进 RSS。引擎私有的发布帧列表长度与当前 `ring_capacity` 对齐（环外续传走 WAL）。已闭合 K 线在内存里只追加，不设硬上限；内存压力由部署侧调小区域、Tick 保留窗或机器规格解决。
+`qdb` 进程用 `QDB_MAX_SYMBOLS`、`QDB_RING_CAPACITY`（须为 2 的幂）、可选 `QDB_READER_SLOTS` 覆盖上表，按机器内存选型，而不是在引擎里写死一份「全市场」或「席位」容量。缺省 [`RegionConfig::desk`]：约 12.5 MiB 逻辑长度。`RegionConfig::market`（65536×65536）约 84 MiB。创建区域时不整文件预清零，未写入的页保持按需分配，避免一启动就把整区算进 RSS。引擎私有的发布帧列表长度与当前 `ring_capacity` 对齐（环外续传走 WAL）。已闭合 K 线在内存里只追加，不设硬上限。
+
+私有堆另有字节预算 `maxmemory`（`Engine::set_maxmemory` / `QDB_MAXMEMORY`）。`0` 表示不限制，这是缺省，对齐 Redis 64 位。预算只覆盖逐笔、K 线、发布帧和调用方表载荷的估算，不含 `region.bin`。达到预算后策略固定为 `noeviction`：不删已有行，再增长的写入返回 `maxmemory reached`。单条写入可以让估算暂时超过预算，超限从下一条增长写入开始拒绝。`DELETE`、`DROP TABLE`、`TRUNCATE` 仍可执行，用来把占用降回去。重放 WAL 不受这个预算拦截，否则恢复会停在半路。
 
 逻辑布局：
 

@@ -94,5 +94,5 @@ maxmemory 8gb
 
 ## 5. 当前仓库落点
 
-- 已有：区域环境变量、创建不 `fill(0)`、Tick 保留可配（`0` 不剪）、已闭合 K 线条数硬上限已撤销。  
-- 未有：Redis 式 `maxmemory` / policy / 完整 `INFO memory` 对等物。要做须先改 `docs/design.md` 再实现。
+- 已有：区域环境变量、创建不 `fill(0)`、Tick 保留可配（`0` 不剪）、已闭合 K 线无条数硬上限、`QDB_MAXMEMORY` + `noeviction`（到顶拒绝增长，不淘汰）。
+- 未有：LRU/LFU 等淘汰策略、分配器级 RSS 计量。淘汰策略要另开设计，不能在权威写入路径上静默丢数据。

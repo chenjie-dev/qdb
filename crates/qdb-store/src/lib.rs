@@ -66,6 +66,9 @@ pub enum StoreError {
     Gap,
     #[error("stale epoch")]
     StaleEpoch,
+    /// 私有数据集估算已达到 [`Engine::maxmemory`]。策略是 Redis 的 `noeviction`：不删已有数据，拒绝再增长的写入。
+    #[error("maxmemory reached")]
+    MaxMemory,
     #[error(transparent)]
     Agg(#[from] qdb_agg::AggError),
 }
@@ -142,6 +145,12 @@ pub struct Metrics {
     pub write_seq: Arc<AtomicU64>,
     pub gap_total: Arc<AtomicU64>,
     pub late_tick_total: Arc<AtomicU64>,
+    /// 私有数据集估算字节。不含 `region.bin`。
+    pub used_memory: Arc<AtomicU64>,
+    /// `0` 表示不限制。
+    pub maxmemory: Arc<AtomicU64>,
+    /// 因达到 `maxmemory` 被拒绝的写入次数。
+    pub rejected_oom: Arc<AtomicU64>,
     pub crc_failed: Arc<AtomicBool>,
     pub heartbeat_ns: Arc<AtomicU64>,
     pub subscriber_count: Arc<AtomicU64>,
@@ -155,6 +164,9 @@ impl Metrics {
             write_seq: Arc::new(AtomicU64::new(0)),
             gap_total: Arc::new(AtomicU64::new(0)),
             late_tick_total: Arc::new(AtomicU64::new(0)),
+            used_memory: Arc::new(AtomicU64::new(0)),
+            maxmemory: Arc::new(AtomicU64::new(0)),
+            rejected_oom: Arc::new(AtomicU64::new(0)),
             crc_failed: Arc::new(AtomicBool::new(false)),
             heartbeat_ns: Arc::new(AtomicU64::new(0)),
             subscriber_count: Arc::new(AtomicU64::new(0)),
@@ -186,6 +198,8 @@ pub struct Engine {
     region: RegionConfig,
     /// 私有 Tick 保留窗口（纳秒）。`0` 表示不按时间丢掉。
     tick_retention_ns: i64,
+    /// 私有数据集字节上限。`0` 表示不限制。不含共享内存区域。
+    maxmemory: u64,
     group_limit: u64,
     group_interval_ns: u64,
     group_started_ns: u64,
@@ -324,6 +338,7 @@ impl Engine {
             tables: table::TableSet::default(),
             region: region.clone(),
             tick_retention_ns: TICK_RETENTION_NS,
+            maxmemory: 0,
             group_limit: 1,
             group_interval_ns: 0,
             group_started_ns: 0,
@@ -1475,6 +1490,7 @@ impl Engine {
         payload: &[u8],
         flags: u16,
     ) -> Result<u64, StoreError> {
+        self.ensure_memory(msg_type)?;
         let seq = self.next_seq;
         let record = WalRecord {
             seq,
@@ -1548,6 +1564,43 @@ impl Engine {
     /// 最近一次 [`Engine::set_tick_retention_ns`] 的值，打开时缺省为 [`TICK_RETENTION_NS`]。
     pub fn tick_retention_ns(&self) -> i64 {
         self.tick_retention_ns
+    }
+
+    /// 设置私有数据集的字节上限。
+    ///
+    /// 只统计逐笔、K 线、发布帧和调用方表载荷的估算，不含 `region.bin`。达到上限后，会再占内存的写入返回 [`StoreError::MaxMemory`]，已有数据保留。删除、丢表和清空仍允许，用来把占用降回去。
+    ///
+    /// # Arguments
+    ///
+    /// * `bytes` - 上限字节。`0` 表示不限制，这是缺省。
+    pub fn set_maxmemory(&mut self, bytes: u64) {
+        self.maxmemory = bytes;
+        self.metrics.maxmemory.store(bytes, Ordering::Release);
+        self.sync_metrics();
+    }
+
+    /// 当前 `maxmemory`。`0` 表示不限制。
+    ///
+    /// # Returns
+    ///
+    /// 最近一次 [`Engine::set_maxmemory`] 的值。
+    pub fn maxmemory(&self) -> u64 {
+        self.maxmemory
+    }
+
+    /// 私有数据集的估算字节。
+    ///
+    /// 不是进程 RSS，也不含共享内存文件。同一份数据在分配器里通常更大。
+    ///
+    /// # Returns
+    ///
+    /// 逐笔、K 线体、发布帧和调用方表载荷的合计。
+    pub fn dataset_bytes(&self) -> u64 {
+        let ticks: usize = self.ticks.values().map(Vec::len).sum();
+        let tick_bytes = ticks * std::mem::size_of::<TickRow>();
+        let bars = self.agg.bar_count() * std::mem::size_of::<qdb_abi::KlineBody>();
+        let frames = self.frames.len() * std::mem::size_of::<Frame>();
+        (tick_bytes + bars + frames) as u64 + self.tables.payload_bytes()
     }
 
     /// 已经完成的 `fsync` 次数。
@@ -2489,6 +2542,19 @@ impl Engine {
         }
     }
 
+    /// `noeviction`：估算已到顶时，拒绝还会长大的写入。重放不走这里。
+    fn ensure_memory(&mut self, msg_type: MsgType) -> Result<(), StoreError> {
+        if self.maxmemory == 0 || shrinks_dataset(msg_type) {
+            return Ok(());
+        }
+        if self.dataset_bytes() >= self.maxmemory {
+            self.metrics.rejected_oom.fetch_add(1, Ordering::Relaxed);
+            self.sync_metrics();
+            return Err(StoreError::MaxMemory);
+        }
+        Ok(())
+    }
+
     fn sync_metrics(&self) {
         let applied = if self.wait_majority {
             self.published_seq
@@ -2502,7 +2568,20 @@ impl Engine {
         self.metrics
             .late_tick_total
             .store(self.agg.late_tick_total, Ordering::Release);
+        self.metrics
+            .used_memory
+            .store(self.dataset_bytes(), Ordering::Release);
+        self.metrics
+            .maxmemory
+            .store(self.maxmemory, Ordering::Release);
     }
+}
+
+fn shrinks_dataset(msg_type: MsgType) -> bool {
+    matches!(
+        msg_type,
+        MsgType::RowDelete | MsgType::TableDrop | MsgType::TableTruncate
+    )
 }
 
 fn bar_frame(seq: u64, ts: i64, event: &BarEvent, out_idx: u16) -> Frame {

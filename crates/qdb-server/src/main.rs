@@ -27,6 +27,7 @@ struct Databases {
     catalog: Catalog,
     region: qdb_shm::RegionConfig,
     tick_retention_ns: i64,
+    maxmemory: u64,
     engines: Mutex<HashMap<String, Arc<Mutex<Engine>>>>,
 }
 
@@ -51,6 +52,7 @@ impl Databases {
             .open_database_with(name, &self.region)
             .map_err(|err| err.to_string())?;
         opened.set_tick_retention_ns(self.tick_retention_ns);
+        opened.set_maxmemory(self.maxmemory);
         let engine = Arc::new(Mutex::new(opened));
         engines.insert(name.to_string(), engine.clone());
         Ok(engine)
@@ -71,6 +73,37 @@ fn tick_retention_from_env() -> Result<i64, String> {
             Ok(secs.saturating_mul(1_000_000_000))
         }
     }
+}
+
+/// 读 `QDB_MAXMEMORY`。未设置或 `0` 表示不限制私有数据集。
+///
+/// 接受纯数字字节，或带 `kb` / `mb` / `gb` 后缀（1024 进制，大小写不敏感）。
+fn maxmemory_from_env() -> Result<u64, String> {
+    match std::env::var("QDB_MAXMEMORY") {
+        Err(_) => Ok(0),
+        Ok(raw) => parse_maxmemory(&raw),
+    }
+}
+
+fn parse_maxmemory(raw: &str) -> Result<u64, String> {
+    let text = raw.trim().to_ascii_lowercase();
+    if text.is_empty() {
+        return Err(String::from("QDB_MAXMEMORY must be a size"));
+    }
+    let (number, factor) = if let Some(rest) = text.strip_suffix("gb") {
+        (rest, 1024 * 1024 * 1024u64)
+    } else if let Some(rest) = text.strip_suffix("mb") {
+        (rest, 1024 * 1024)
+    } else if let Some(rest) = text.strip_suffix("kb") {
+        (rest, 1024)
+    } else {
+        (text.as_str(), 1)
+    };
+    let value: u64 = number
+        .trim()
+        .parse()
+        .map_err(|_| String::from("QDB_MAXMEMORY must be a size"))?;
+    Ok(value.saturating_mul(factor))
 }
 
 fn main() {
@@ -99,18 +132,27 @@ fn main() {
             std::process::exit(1);
         }
     };
+    let maxmemory = match maxmemory_from_env() {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            eprintln!("{err}");
+            std::process::exit(1);
+        }
+    };
     eprintln!(
-        "region max_symbols={} ring={} (~{} MiB); tick_retention_secs={}",
+        "region max_symbols={} ring={} (~{} MiB); tick_retention_secs={}; maxmemory={}",
         region.max_symbols,
         region.ring_capacity,
         (region.byte_len() + 512 * 1024) / (1024 * 1024),
-        tick_retention_ns / 1_000_000_000
+        tick_retention_ns / 1_000_000_000,
+        maxmemory
     );
     let catalog = Catalog::open(std::path::Path::new(&root)).expect("open qdb");
     let databases = Databases {
         catalog,
         region,
         tick_retention_ns,
+        maxmemory,
         engines: Mutex::new(HashMap::new()),
     };
     let engine = databases.get("default").expect("open default database");
@@ -1143,13 +1185,16 @@ fn health_ok(metrics: &Metrics) -> bool {
 
 fn metrics_text(metrics: &Metrics) -> String {
     format!(
-        "qdb_durable_seq {}\nqdb_applied_seq {}\nqdb_write_seq {}\nqdb_gap_total {}\nqdb_late_tick_total {}\nqdb_subscriber_count {}\n",
+        "qdb_durable_seq {}\nqdb_applied_seq {}\nqdb_write_seq {}\nqdb_gap_total {}\nqdb_late_tick_total {}\nqdb_subscriber_count {}\nqdb_used_memory {}\nqdb_maxmemory {}\nqdb_rejected_oom {}\n",
         metrics.durable_seq.load(Ordering::Acquire),
         metrics.applied_seq.load(Ordering::Acquire),
         metrics.write_seq.load(Ordering::Acquire),
         metrics.gap_total.load(Ordering::Acquire),
         metrics.late_tick_total.load(Ordering::Acquire),
         metrics.subscriber_count.load(Ordering::Acquire),
+        metrics.used_memory.load(Ordering::Acquire),
+        metrics.maxmemory.load(Ordering::Acquire),
+        metrics.rejected_oom.load(Ordering::Acquire),
     )
 }
 
@@ -1172,6 +1217,9 @@ mod tests {
             write_seq: Arc::new(AtomicU64::new(4)),
             gap_total: Arc::new(AtomicU64::new(0)),
             late_tick_total: Arc::new(AtomicU64::new(0)),
+            used_memory: Arc::new(AtomicU64::new(0)),
+            maxmemory: Arc::new(AtomicU64::new(0)),
+            rejected_oom: Arc::new(AtomicU64::new(0)),
             crc_failed: Arc::new(AtomicBool::new(false)),
             heartbeat_ns: Arc::new(AtomicU64::new(0)),
             subscriber_count: Arc::new(AtomicU64::new(1)),
@@ -1226,5 +1274,17 @@ mod tests {
         assert!(text.contains("qdb_durable_seq 4"));
         assert!(text.contains("qdb_applied_seq 4"));
         assert!(text.contains("qdb_subscriber_count 1"));
+        assert!(text.contains("qdb_used_memory 0"));
+        assert!(text.contains("qdb_maxmemory 0"));
+    }
+
+    #[test]
+    fn maxmemory_accepts_bytes_and_binary_units() {
+        assert_eq!(parse_maxmemory("0").unwrap(), 0);
+        assert_eq!(parse_maxmemory("1024").unwrap(), 1024);
+        assert_eq!(parse_maxmemory("2kb").unwrap(), 2048);
+        assert_eq!(parse_maxmemory("1MB").unwrap(), 1024 * 1024);
+        assert_eq!(parse_maxmemory("1gb").unwrap(), 1024 * 1024 * 1024);
+        assert!(parse_maxmemory("nope").is_err());
     }
 }

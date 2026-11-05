@@ -117,6 +117,29 @@ pub struct TableSet {
 }
 
 impl TableSet {
+    /// 调用方表单元格载荷的近似字节数。
+    ///
+    /// 整数按 8 字节、布尔按 1 字节、字符串按 UTF-8 长度计。不含哈希表和分配器碎片。
+    ///
+    /// # Returns
+    ///
+    /// 全部行槽（含墓碑槽）的载荷合计。
+    pub fn payload_bytes(&self) -> u64 {
+        let mut total = 0u64;
+        for rows in self.rows.values() {
+            for row in rows {
+                for cell in row {
+                    total += match cell {
+                        Cell::Int64(_) => 8,
+                        Cell::Bool(_) => 1,
+                        Cell::String(text) => text.len() as u64,
+                    };
+                }
+            }
+        }
+        total
+    }
+
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::new();
         let names: Vec<String> = self

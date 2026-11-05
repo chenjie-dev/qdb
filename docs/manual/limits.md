@@ -13,7 +13,8 @@
 | `qdb` 进程打开时的共享内存 | 缺省 8192 个符号槽，16384 帧（约 12.5 MiB）；`QDB_MAX_SYMBOLS` / `QDB_RING_CAPACITY`（2 的幂）/ 可选 `QDB_READER_SLOTS` 可改；全市场常用 `65536` / `65536`（约 84 MiB） |
 | 引擎私有发布帧 | 与当前 `ring_capacity` 同窗（由环境变量配置） |
 | Tick 内存保留 | 缺省按事件时间最近 2 小时；`QDB_TICK_RETENTION_SECS` 可改，`0` 表示不剪枝 |
-| 已闭合 K 线内存 | 只追加，不设条数硬上限；靠机器与区域配置控内存 |
+| 已闭合 K 线内存 | 只追加，不设条数硬上限 |
+| 私有数据集预算 | `QDB_MAXMEMORY`，缺省 `0`（不限制）。估算不含 `region.bin`。到顶拒绝再增长的写入，文案 `maxmemory reached`。删除、丢表、清空仍可执行 |
 | SQL 默认行数 | 1000 |
 | SQL 最大行数 | 100000 |
 | 报价档位 | 五档价格和数量写入 WAL。`SELECT` 可用 `bid_px1` 到 `bid_px5` |

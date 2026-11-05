@@ -370,6 +370,31 @@ fn ticks_older_than_retention_window_are_dropped() {
 }
 
 #[test]
+fn maxmemory_rejects_growth_and_keeps_the_rows_already_stored() {
+    let dir = temp("maxmem");
+    let mut engine = Engine::open(&dir).unwrap();
+    engine
+        .write_trade("SSE", "600000", utc(0), 10, 1)
+        .unwrap();
+    let used = engine.dataset_bytes();
+    assert!(used > 0);
+    engine.set_maxmemory(used);
+    let err = engine
+        .write_trade("SSE", "600000", utc(1), 11, 1)
+        .unwrap_err();
+    assert!(matches!(err, StoreError::MaxMemory));
+    let id = engine.resolve("SSE:600000").unwrap();
+    assert_eq!(engine.ticks(id).len(), 1);
+    assert_eq!(engine.ticks(id)[0].price, 10);
+    engine.set_maxmemory(0);
+    engine
+        .write_trade("SSE", "600000", utc(1), 11, 1)
+        .unwrap();
+    assert_eq!(engine.ticks(id).len(), 2);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn zero_tick_retention_keeps_old_prints() {
     let dir = temp("tick-keep");
     let mut engine = Engine::open(&dir).unwrap();

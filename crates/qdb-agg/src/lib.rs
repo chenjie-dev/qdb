@@ -111,6 +111,20 @@ impl KlineAggregator {
         self.sealed = state.sealed.into_iter().collect();
     }
 
+    /// 内存里未闭合加已闭合 K 线的根数，供数据集字节估算。
+    ///
+    /// # Returns
+    ///
+    /// 当前打开的桶加上全部分段里已闭合桶的根数。
+    pub fn bar_count(&self) -> usize {
+        self.open.len()
+            + self
+                .sealed
+                .values()
+                .map(|rows| rows.len())
+                .sum::<usize>()
+    }
+
     pub fn sealed(&self, symbol_id: u32, period: Period) -> &[KlineBody] {
         self.sealed
             .get(&(symbol_id, period.id()))

@@ -10,14 +10,14 @@ cargo run -p qdb-server --bin qdb -- data
 
 数据目录是第一个参数，缺省为 `data`。监听地址由 `QDB_HTTP_ADDR` 决定，缺省 `127.0.0.1`。端口由 `QDB_HTTP_PORT` 决定，缺省 9090。
 
-共享内存容量按机器配置，不在引擎里写死一份全市场规模。缺省 8192 个符号槽、16384 帧（逻辑约 12.5 MiB）。用 `QDB_MAX_SYMBOLS`、`QDB_RING_CAPACITY`（必须是 2 的幂）和可选的 `QDB_READER_SLOTS` 改大或改小。内存里的逐笔保留用 `QDB_TICK_RETENTION_SECS`（秒）；缺省 7200，`0` 表示不按时间丢掉。全市场可设：
+共享内存容量按机器配置，不在引擎里写死一份全市场规模。缺省 8192 个符号槽、16384 帧（逻辑约 12.5 MiB）。用 `QDB_MAX_SYMBOLS`、`QDB_RING_CAPACITY`（必须是 2 的幂）和可选的 `QDB_READER_SLOTS` 改大或改小。内存里的逐笔保留用 `QDB_TICK_RETENTION_SECS`（秒）；缺省 7200，`0` 表示不按时间丢掉。私有数据集字节预算用 `QDB_MAXMEMORY`，缺省 `0`（不限制）。可写纯数字，或 `kb` / `mb` / `gb`（1024 进制）。到顶后新的增长写入失败，已有数据还在；`DELETE`、`DROP TABLE`、`TRUNCATE` 仍可用来腾出空间。全市场可设：
 
 ```bash
 QDB_MAX_SYMBOLS=65536 QDB_RING_CAPACITY=65536 QDB_TICK_RETENTION_SECS=7200 \
   cargo run -p qdb-server --bin qdb -- data
 ```
 
-启动时向标准错误打一行当前区域容量、大约的 MiB 数和 Tick 保留秒数。每次打开库都会按该配置重建 `region.bin`；改环境变量后重启即生效，不必手工删文件。未写入的页不预清零，常驻集只随实际写入增长。
+启动时向标准错误打一行当前区域容量、大约的 MiB 数、Tick 保留秒数和 `maxmemory` 字节。每次打开库都会按该配置重建 `region.bin`；改环境变量后重启即生效，不必手工删文件。未写入的页不预清零，常驻集只随实际写入增长。
 
 采集默认开启，约每秒拉一批公开快照并 `write_quote` / 增量 `write_trade`。`QDB_FEED=0` 关闭。`QDB_FEED_CODES` 是逗号分隔的 6 位代码，缺省为内置种子。`QDB_FEED_MS` 是间隔毫秒数，缺省 1000。价格按 10000 倍写入整数。依赖本机 `curl`。
 
@@ -132,7 +132,12 @@ qdb_write_seq 4
 qdb_gap_total 0
 qdb_late_tick_total 0
 qdb_subscriber_count 0
+qdb_used_memory 0
+qdb_maxmemory 0
+qdb_rejected_oom 0
 ```
+
+`qdb_used_memory` 是逐笔、K 线、发布帧和调用方表载荷的估算，不是进程 RSS，也不含 `region.bin`。`qdb_maxmemory` 为 0 表示不限制。`qdb_rejected_oom` 是因达到预算被拒绝的写入次数。
 
 ## 基准
 
