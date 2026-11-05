@@ -19,7 +19,7 @@
 | 容量约束 | 2 的幂 |
 | 逻辑长度 | 约 2 MiB |
 
-`qdb` 缺省 `RegionConfig::desk`（8192 / 16384，约 12.5 MiB）。全市场预设 `RegionConfig::market`（65536 / 65536，约 84 MiB），由环境变量选中，见 [限制](limits.md) 与 [服务进程](server.md)。
+`qdb` 与库接口缺省都是 `RegionConfig::dev`（1024 / 4096，约 2 MiB）。`desk`（8192 / 16384，约 12.5 MiB）和 `market`（65536 / 65536，约 84 MiB）是可选预设，由环境变量选中，见 [限制](limits.md) 与 [服务进程](server.md)。
 
 头页里的原子计数：
 

@@ -59,11 +59,11 @@ pub struct RegionConfig {
 }
 
 impl RegionConfig {
-    /// 开发规模：1024 个符号槽、4096 帧、64 个读者槽。
+    /// 通用规模：1024 个符号槽、4096 帧、64 个读者槽。
     ///
     /// # Returns
     ///
-    /// 库接口默认打开库时用这份配置。逻辑长度约 2 MiB。不适合全市场。
+    /// 库接口和 `qdb` 未设置环境变量时的配置。逻辑长度约 2 MiB。符号槽只是热总线上的定长名额，不是库的数据模型。
     pub fn dev() -> Self {
         Self {
             max_symbols: 1024,
@@ -72,11 +72,11 @@ impl RegionConfig {
         }
     }
 
-    /// 单机席位缺省：8192 个符号槽、16384 帧、64 个读者槽。
+    /// 较大的热总线预设：8192 个符号槽、16384 帧、64 个读者槽。
     ///
     /// # Returns
     ///
-    /// `qdb` 未设置环境变量时的配置。逻辑长度约 12.5 MiB，覆盖常见 A 股代码量。
+    /// 逻辑长度约 12.5 MiB。不是进程缺省。需要这么多槽时设置 `QDB_MAX_SYMBOLS` 和 `QDB_RING_CAPACITY`。
     pub fn desk() -> Self {
         Self {
             max_symbols: 8_192,
@@ -85,12 +85,11 @@ impl RegionConfig {
         }
     }
 
-    /// 行情中心规模：65536 个符号槽、65536 帧、64 个读者槽。
+    /// 最大的内置预设：65536 个符号槽、65536 帧、64 个读者槽。
     ///
     /// # Returns
     ///
-    /// 全市场预设。逻辑长度约 84 MiB。`qdb` 用 `QDB_MAX_SYMBOLS=65536` 与
-    /// `QDB_RING_CAPACITY=65536` 选这份规模。
+    /// 逻辑长度约 84 MiB。`qdb` 用 `QDB_MAX_SYMBOLS=65536` 与 `QDB_RING_CAPACITY=65536` 选中。
     pub fn market() -> Self {
         Self {
             max_symbols: 65_536,
@@ -114,7 +113,7 @@ impl RegionConfig {
 
     /// 从环境变量读出 `qdb` 进程要用的区域容量。
     ///
-    /// 缺省是 [`Self::desk`]。可读 `QDB_MAX_SYMBOLS`、`QDB_RING_CAPACITY`（须为 2 的幂）、
+    /// 缺省是 [`Self::dev`]。可读 `QDB_MAX_SYMBOLS`、`QDB_RING_CAPACITY`（须为 2 的幂）、
     /// 可选 `QDB_READER_SLOTS`。
     ///
     /// # Returns
@@ -126,7 +125,7 @@ impl RegionConfig {
     /// * [`ShmError::BadCapacity`] - 帧槽不是 2 的幂，或符号槽 / 读者槽为 0。
     /// * [`ShmError::Io`] - 环境变量不是无符号整数。
     pub fn from_env() -> Result<Self, ShmError> {
-        let mut cfg = Self::desk();
+        let mut cfg = Self::dev();
         if let Ok(raw) = std::env::var("QDB_MAX_SYMBOLS") {
             cfg.max_symbols = parse_u32_env("QDB_MAX_SYMBOLS", &raw)?;
         }
@@ -728,6 +727,29 @@ mod tests {
         assert!(desk < 16 * 1024 * 1024, "desk={desk}");
         assert!(market > 80 * 1024 * 1024, "market={market}");
         assert!(desk * 4 < market);
+    }
+
+    #[test]
+    fn from_env_defaults_to_the_small_region() {
+        let saved = [
+            ("QDB_MAX_SYMBOLS", std::env::var("QDB_MAX_SYMBOLS").ok()),
+            ("QDB_RING_CAPACITY", std::env::var("QDB_RING_CAPACITY").ok()),
+            ("QDB_READER_SLOTS", std::env::var("QDB_READER_SLOTS").ok()),
+        ];
+        for (name, _) in &saved {
+            std::env::remove_var(name);
+        }
+        let cfg = RegionConfig::from_env().unwrap();
+        for (name, value) in saved {
+            match value {
+                Some(text) => std::env::set_var(name, text),
+                None => std::env::remove_var(name),
+            }
+        }
+        let dev = RegionConfig::dev();
+        assert_eq!(cfg.max_symbols, dev.max_symbols);
+        assert_eq!(cfg.ring_capacity, dev.ring_capacity);
+        assert!(cfg.byte_len() < RegionConfig::desk().byte_len());
     }
 
     #[test]
