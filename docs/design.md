@@ -115,7 +115,7 @@ flowchart LR
 
 `qdb` 和库接口缺省都是 [`RegionConfig::dev`]，逻辑长度约 2 MiB。`QDB_MAX_SYMBOLS`、`QDB_RING_CAPACITY`（须为 2 的幂）、可选 `QDB_READER_SLOTS` 按机器把热总线放大。`desk` 约 12.5 MiB，`market` 约 84 MiB，都是可选预设，不是数据库的缺省形态。创建区域时不整文件预清零，未写入的页保持按需分配。引擎私有的发布帧列表长度与当前 `ring_capacity` 对齐。已闭合 K 线在内存里只追加，不设硬上限。调用方表的行数不受符号槽限制，受 `maxmemory` 和机器内存限制。
 
-私有堆另有字节预算 `maxmemory`（`Engine::set_maxmemory` / `QDB_MAXMEMORY`）。`0` 表示不限制，这是缺省，对齐 Redis 64 位。预算只覆盖逐笔、K 线、发布帧和调用方表载荷的估算，不含 `region.bin`。达到预算后策略固定为 `noeviction`：不删已有行，再增长的写入返回 `maxmemory reached`。单条写入可以让估算暂时超过预算，超限从下一条增长写入开始拒绝。`DELETE`、`DROP TABLE`、`TRUNCATE` 仍可执行，用来把占用降回去。重放 WAL 不受这个预算拦截，否则恢复会停在半路。
+私有堆另有字节预算 `maxmemory`（`Engine::set_maxmemory` / `QDB_MAXMEMORY`）。`0` 表示不限制，这是缺省，对齐 Redis 64 位。预算只覆盖逐笔、K 线、发布帧和调用方表载荷的估算，不含 `region.bin`。达到预算后策略固定为 `noeviction`：不删已有行，再增长的写入返回 `maxmemory reached`。单条写入可以让估算暂时超过预算，超限从下一条增长写入开始拒绝。`DELETE` 抽掉内存行槽并保持其余可见行的相对顺序，`DROP TABLE`、`TRUNCATE` 清掉整表内存。这三者和 Redis 的 `DEL`、PostgreSQL 的 `VACUUM` 一样，用来把占用降回去；已经 `fsync` 的 WAL 不改。重放 WAL 不受这个预算拦截，否则恢复会停在半路。
 
 逻辑布局：
 

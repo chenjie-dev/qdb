@@ -1339,7 +1339,7 @@ impl TableSet {
 
     /// 应用一条墓碑，使主键从查询和二级索引里消失。
     ///
-    /// 行的字节留在表槽里，只从主键索引去掉，并记入不可见集合。重放时键已经不可见就失败，避免同一条墓碑被应用两次。
+    /// WAL 里的旧行不改。内存里的这一槽被抽掉，后面的可见行保持相对顺序，主键和二级索引里的下标跟着减一。重放时键已经不可见就失败，避免同一条墓碑被应用两次。
     ///
     /// # Arguments
     ///
@@ -1401,8 +1401,57 @@ impl TableSet {
                 list.retain(|item| *item != row_index);
             }
         }
-        self.deleted.entry(table).or_default().insert(row_index);
+        self.reclaim_row(&table, row_index);
         Ok(())
+    }
+
+    /// 抽掉一行，并让更高的下标减一。可见行的先后顺序不变。
+    fn reclaim_row(&mut self, table: &str, row_index: usize) {
+        if let Some(rows) = self.rows.get_mut(table) {
+            if row_index < rows.len() {
+                rows.remove(row_index);
+            }
+        }
+        if let Some(seqs) = self.seqs.get_mut(table) {
+            if row_index < seqs.len() {
+                seqs.remove(row_index);
+            }
+        }
+        if let Some(expires) = self.expires.get_mut(table) {
+            if row_index < expires.len() {
+                expires.remove(row_index);
+            }
+        }
+        if let Some(dead) = self.deleted.get_mut(table) {
+            dead.remove(&row_index);
+            let shifted: Vec<usize> = dead
+                .iter()
+                .copied()
+                .filter(|index| *index > row_index)
+                .collect();
+            for index in shifted {
+                dead.remove(&index);
+                dead.insert(index - 1);
+            }
+        }
+        if let Some(index) = self.primary.get_mut(table) {
+            for slot in index.values_mut() {
+                if *slot > row_index {
+                    *slot -= 1;
+                }
+            }
+        }
+        if let Some(columns) = self.secondary.get_mut(table) {
+            for column in columns.values_mut() {
+                for list in column.values_mut() {
+                    for slot in list.iter_mut() {
+                        if *slot > row_index {
+                            *slot -= 1;
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn is_deleted(&self, table: &str, index: usize) -> bool {

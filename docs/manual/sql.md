@@ -556,7 +556,7 @@ row = "(" value { "," value } ")"
 
 不是 `CREATE TABLE` 建成的表返回 `syntax: reserved table`。表不存在返回 `symbol not found`。
 
-`SELECT` 看不到墓碑之后的这些行。重新打开库之后仍然看不到，直到再次插入。
+`SELECT` 看不到墓碑之后的这些行。重新打开库之后仍然看不到，直到再次插入。内存里的这一行会马上抽掉，后面的可见行保持原来的相对顺序。已经 `fsync` 的字节留在 WAL 里。
 
 ### 示例
 

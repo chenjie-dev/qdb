@@ -370,6 +370,43 @@ fn ticks_older_than_retention_window_are_dropped() {
 }
 
 #[test]
+fn delete_reclaims_the_row_and_keeps_the_order_of_the_rest() {
+    let dir = temp("reclaim");
+    let mut engine = Engine::open(&dir).unwrap();
+    engine
+        .create_table(TableSchema {
+            name: "notes".into(),
+            columns: vec![
+                col("id", ColumnType::Int64, true),
+                col("body", ColumnType::String, false),
+            ],
+            indexes: Vec::new(),
+        })
+        .unwrap();
+    let fat = "y".repeat(400);
+    engine
+        .insert_row("notes", &[Cell::Int64(1), Cell::String(fat)])
+        .unwrap();
+    engine
+        .insert_row("notes", &[Cell::Int64(2), Cell::String("keep".into())])
+        .unwrap();
+    let before = engine.dataset_bytes();
+    engine.delete_row("notes", &[Cell::Int64(1)]).unwrap();
+    assert!(engine.dataset_bytes() < before);
+    let (_columns, rows) = engine.scan_table("notes", None, None, 10).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], "2");
+    engine
+        .insert_row("notes", &[Cell::Int64(3), Cell::String("next".into())])
+        .unwrap();
+    drop(engine);
+    let restored = Engine::open(&dir).unwrap();
+    let (_columns, rows) = restored.scan_table("notes", None, None, 10).unwrap();
+    assert_eq!(rows.iter().map(|row| row[0].as_str()).collect::<Vec<_>>(), ["2", "3"]);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
 fn maxmemory_rejects_growth_and_keeps_the_rows_already_stored() {
     let dir = temp("maxmem");
     let mut engine = Engine::open(&dir).unwrap();
