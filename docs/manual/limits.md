@@ -14,6 +14,7 @@
 | Tick 内存保留 | 缺省按事件时间最近 2 小时；`QDB_TICK_RETENTION_SECS` 可改，`0` 表示不剪枝 |
 | 已闭合 K 线内存 | 只追加，不设条数硬上限 |
 | 私有数据集预算 | `QDB_MAXMEMORY`，缺省 `0`（不限制）。估算不含 `region.bin`。到顶拒绝再增长的写入，文案 `maxmemory reached`。删除、丢表、清空仍可执行 |
+| `qdb` 组提交 | 缺省 256 条或 1 毫秒，先到先刷。`QDB_GROUP_RECORDS`（至少 1）、`QDB_GROUP_MS`（`0` 表示不按时间刷）。库接口仍是每条 `fsync` |
 | SQL 默认行数 | 1000 |
 | SQL 最大行数 | 100000 |
 | 报价档位 | 五档价格和数量写入 WAL。`SELECT` 可用 `bid_px1` 到 `bid_px5` |

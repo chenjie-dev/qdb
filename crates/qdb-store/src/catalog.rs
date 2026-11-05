@@ -195,14 +195,14 @@ impl Catalog {
         Ok(Engine::open(&self.path(name)?)?)
     }
 
-    /// 以写入者打开库，并打开行情中心用的组提交。
+    /// 以写入者打开库，并打开进程用的组提交。
     ///
-    /// 共享内存按 `region` 重建。组提交是 256 条或 1 毫秒，内存先更新，`fsync` 和共享内存发布在 [`Engine::flush`]。
+    /// 共享内存按 `region` 重建。组提交是 256 条或 1 毫秒；`qdb` 进程随后按 `QDB_GROUP_RECORDS` 和 `QDB_GROUP_MS` 覆盖。内存先更新，`fsync` 和共享内存发布在 [`Engine::flush`]。
     ///
     /// # Arguments
     ///
     /// * `name` - 已存在的库名。
-    /// * `region` - 符号槽数和帧容量。`qdb` 进程传入 [`RegionConfig::market`]。
+    /// * `region` - 符号槽数和帧容量。`qdb` 进程传入当前区域配置。
     ///
     /// # Errors
     ///

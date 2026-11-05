@@ -136,10 +136,20 @@ fn group_commit_fsyncs_once_for_the_batch_and_hides_it_until_flush() {
     assert_eq!(engine.flush_count(), before);
     engine.flush().unwrap();
     assert_eq!(engine.flush_count(), before + 1);
+    engine.set_group_commit(100, 50_000_000);
+    let waiting = engine.flush_count();
+    engine
+        .write_trade("SSE", "600000", utc(1, 0, 2), 12, 1)
+        .unwrap();
+    engine.flush_if_due().unwrap();
+    assert_eq!(engine.flush_count(), waiting);
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    engine.flush_if_due().unwrap();
+    assert_eq!(engine.flush_count(), waiting + 1);
     drop(engine);
     let restored = Engine::open_read(&dir).unwrap();
     let id = restored.resolve("SSE:600000").unwrap();
-    assert_eq!(restored.ticks(id).len(), 2);
+    assert_eq!(restored.ticks(id).len(), 3);
     let _ = std::fs::remove_dir_all(dir);
 }
 

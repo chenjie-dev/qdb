@@ -10,14 +10,14 @@ cargo run -p qdb-server --bin qdb -- data
 
 数据目录是第一个参数，缺省为 `data`。监听地址由 `QDB_HTTP_ADDR` 决定，缺省 `127.0.0.1`。端口由 `QDB_HTTP_PORT` 决定，缺省 9090。
 
-共享内存是热总线的定长容量，不是表能存多少行。缺省 1024 个符号槽、4096 帧（逻辑约 2 MiB），和库接口相同。用 `QDB_MAX_SYMBOLS`、`QDB_RING_CAPACITY`（必须是 2 的幂）和可选的 `QDB_READER_SLOTS` 按机器改大或改小。调用方表不受符号槽限制。内存里的逐笔保留用 `QDB_TICK_RETENTION_SECS`（秒）；缺省 7200，`0` 表示不按时间丢掉。私有数据集字节预算用 `QDB_MAXMEMORY`，缺省 `0`（不限制）。可写纯数字，或 `kb` / `mb` / `gb`（1024 进制）。到顶后新的增长写入失败，已有数据还在；`DELETE`、`DROP TABLE`、`TRUNCATE` 仍可用来腾出空间。把热总线放大可设：
+共享内存是热总线的定长容量，不是表能存多少行。缺省 1024 个符号槽、4096 帧（逻辑约 2 MiB），和库接口相同。用 `QDB_MAX_SYMBOLS`、`QDB_RING_CAPACITY`（必须是 2 的幂）和可选的 `QDB_READER_SLOTS` 按机器改大或改小。调用方表不受符号槽限制。内存里的逐笔保留用 `QDB_TICK_RETENTION_SECS`（秒）；缺省 7200，`0` 表示不按时间丢掉。私有数据集字节预算用 `QDB_MAXMEMORY`，缺省 `0`（不限制）。可写纯数字，或 `kb` / `mb` / `gb`（1024 进制）。到顶后新的增长写入失败，已有数据还在；`DELETE`、`DROP TABLE`、`TRUNCATE` 仍可用来腾出空间。组提交缺省 256 条或 1 毫秒，先到先刷，用 `QDB_GROUP_RECORDS` 和 `QDB_GROUP_MS` 调整。`QDB_GROUP_MS=0` 时只按条数刷。没有新写入时，进程按这个间隔把已经等到的一批刷下去。一批成交仍在应答前 `fsync` 一次。把热总线放大可设：
 
 ```bash
 QDB_MAX_SYMBOLS=65536 QDB_RING_CAPACITY=65536 QDB_TICK_RETENTION_SECS=7200 \
   cargo run -p qdb-server --bin qdb -- data
 ```
 
-启动时向标准错误打一行当前区域容量、大约的 MiB 数、Tick 保留秒数和 `maxmemory` 字节。每次打开库都会按该配置重建 `region.bin`；改环境变量后重启即生效，不必手工删文件。未写入的页不预清零，常驻集只随实际写入增长。
+启动时向标准错误打一行当前区域容量、大约的 MiB 数、Tick 保留秒数、`maxmemory` 字节和组提交条数与毫秒。每次打开库都会按该配置重建 `region.bin`；改环境变量后重启即生效，不必手工删文件。未写入的页不预清零，常驻集只随实际写入增长。
 
 采集默认开启，约每秒拉一批公开快照并 `write_quote` / 增量 `write_trade`。`QDB_FEED=0` 关闭。`QDB_FEED_CODES` 是逗号分隔的 6 位代码，缺省为内置种子。`QDB_FEED_MS` 是间隔毫秒数，缺省 1000。价格按 10000 倍写入整数。依赖本机 `curl`。
 

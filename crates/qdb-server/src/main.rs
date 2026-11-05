@@ -28,6 +28,8 @@ struct Databases {
     region: qdb_shm::RegionConfig,
     tick_retention_ns: i64,
     maxmemory: u64,
+    group_records: u64,
+    group_interval_ns: u64,
     engines: Mutex<HashMap<String, Arc<Mutex<Engine>>>>,
 }
 
@@ -53,9 +55,22 @@ impl Databases {
             .map_err(|err| err.to_string())?;
         opened.set_tick_retention_ns(self.tick_retention_ns);
         opened.set_maxmemory(self.maxmemory);
+        opened.set_group_commit(self.group_records, self.group_interval_ns);
         let engine = Arc::new(Mutex::new(opened));
         engines.insert(name.to_string(), engine.clone());
         Ok(engine)
+    }
+
+    /// 没有新连接时，把已经等到组提交间隔的记录刷下去。
+    fn flush_if_due(&self) {
+        let Ok(engines) = self.engines.lock() else {
+            return;
+        };
+        for engine in engines.values() {
+            if let Ok(mut guard) = engine.lock() {
+                let _ = guard.flush_if_due();
+            }
+        }
     }
 }
 
@@ -106,6 +121,27 @@ fn parse_maxmemory(raw: &str) -> Result<u64, String> {
     Ok(value.saturating_mul(factor))
 }
 
+/// 读组提交条数和间隔。缺省 256 条或 1 毫秒，先到先刷。
+fn group_commit_from_env() -> Result<(u64, u64), String> {
+    let records = match std::env::var("QDB_GROUP_RECORDS") {
+        Err(_) => 256,
+        Ok(raw) => raw
+            .parse::<u64>()
+            .map_err(|_| String::from("QDB_GROUP_RECORDS must be an integer"))?
+            .max(1),
+    };
+    let millis = match std::env::var("QDB_GROUP_MS") {
+        Err(_) => 1,
+        Ok(raw) => {
+            let value: u64 = raw
+                .parse()
+                .map_err(|_| String::from("QDB_GROUP_MS must be an integer"))?;
+            value
+        }
+    };
+    Ok((records, millis.saturating_mul(1_000_000)))
+}
+
 fn main() {
     qdb_shm::watch_shutdown();
     let lock_path =
@@ -139,13 +175,22 @@ fn main() {
             std::process::exit(1);
         }
     };
+    let (group_records, group_interval_ns) = match group_commit_from_env() {
+        Ok(group) => group,
+        Err(err) => {
+            eprintln!("{err}");
+            std::process::exit(1);
+        }
+    };
     eprintln!(
-        "region max_symbols={} ring={} (~{} MiB); tick_retention_secs={}; maxmemory={}",
+        "region max_symbols={} ring={} (~{} MiB); tick_retention_secs={}; maxmemory={}; group={} or {} ms",
         region.max_symbols,
         region.ring_capacity,
         (region.byte_len() + 512 * 1024) / (1024 * 1024),
         tick_retention_ns / 1_000_000_000,
-        maxmemory
+        maxmemory,
+        group_records,
+        group_interval_ns / 1_000_000
     );
     let catalog = Catalog::open(std::path::Path::new(&root)).expect("open qdb");
     let databases = Databases {
@@ -153,6 +198,8 @@ fn main() {
         region,
         tick_retention_ns,
         maxmemory,
+        group_records,
+        group_interval_ns,
         engines: Mutex::new(HashMap::new()),
     };
     let engine = databases.get("default").expect("open default database");
@@ -226,7 +273,13 @@ fn main() {
                 });
             }
             Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                std::thread::sleep(Duration::from_millis(50));
+                databases.flush_if_due();
+                let pause = if databases.group_interval_ns == 0 {
+                    50
+                } else {
+                    1
+                };
+                std::thread::sleep(Duration::from_millis(pause));
             }
             Err(_) => break,
         }
@@ -1286,5 +1339,29 @@ mod tests {
         assert_eq!(parse_maxmemory("1MB").unwrap(), 1024 * 1024);
         assert_eq!(parse_maxmemory("1gb").unwrap(), 1024 * 1024 * 1024);
         assert!(parse_maxmemory("nope").is_err());
+    }
+
+    #[test]
+    fn group_commit_defaults_and_honors_env() {
+        let saved_records = std::env::var("QDB_GROUP_RECORDS").ok();
+        let saved_ms = std::env::var("QDB_GROUP_MS").ok();
+        std::env::remove_var("QDB_GROUP_RECORDS");
+        std::env::remove_var("QDB_GROUP_MS");
+        assert_eq!(group_commit_from_env().unwrap(), (256, 1_000_000));
+        std::env::set_var("QDB_GROUP_RECORDS", "32");
+        std::env::set_var("QDB_GROUP_MS", "0");
+        assert_eq!(group_commit_from_env().unwrap(), (32, 0));
+        std::env::set_var("QDB_GROUP_RECORDS", "0");
+        assert_eq!(group_commit_from_env().unwrap().0, 1);
+        std::env::set_var("QDB_GROUP_MS", "nope");
+        assert!(group_commit_from_env().is_err());
+        match saved_records {
+            Some(value) => std::env::set_var("QDB_GROUP_RECORDS", value),
+            None => std::env::remove_var("QDB_GROUP_RECORDS"),
+        }
+        match saved_ms {
+            Some(value) => std::env::set_var("QDB_GROUP_MS", value),
+            None => std::env::remove_var("QDB_GROUP_MS"),
+        }
     }
 }

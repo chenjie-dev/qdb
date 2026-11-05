@@ -1777,6 +1777,17 @@ impl Engine {
         self.flush_pending()
     }
 
+    /// 若组提交的条数或间隔已经到了，就 [`Engine::flush`]。
+    ///
+    /// 没到时什么也不做。`qdb` 在没有新写入时用它把已经等待够久的一批刷下去。
+    ///
+    /// # Errors
+    ///
+    /// 与 [`Engine::flush`] 相同。
+    pub fn flush_if_due(&mut self) -> Result<(), StoreError> {
+        self.maybe_flush()
+    }
+
     /// 当前任期。单机从 1 开始。
     ///
     /// # Returns
